@@ -6,6 +6,7 @@
 
 BIN            := target/release/rless
 REFERENCE      ?= /usr/bin/less
+PREFIX         ?= $(HOME)/.cargo
 SCENARIOS      := parity/scenarios
 BASELINE       := parity/baseline
 HARNESS        := parity/harness
@@ -34,6 +35,18 @@ release: ## Release build (what parity verifies)
 .PHONY: test
 test: ## Unit + integration tests
 	cargo test
+
+# Installs to $(PREFIX)/bin. `--locked` builds the dependency versions this
+# clone was parity-verified against; a resolver-picked newer set has not been
+# through the harness. Run `make parity` before installing.
+.PHONY: install
+install: ## Install rless into $(PREFIX)/bin (default ~/.cargo/bin)
+	cargo install --path . --locked --force --root $(PREFIX)
+	@echo "installed: $(PREFIX)/bin/rless"
+
+.PHONY: uninstall
+uninstall: ## Remove rless from $(PREFIX)/bin
+	cargo uninstall --root $(PREFIX) rust-less
 
 .PHONY: fmt
 fmt: ## Format sources
