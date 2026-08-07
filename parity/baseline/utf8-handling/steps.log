@@ -1,0 +1,4 @@
+LAUNCH session=parity-utf8-handling-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/utf8-mixed.txt; echo $? > parity/baseline/utf8-handling/exit_code
+CAPTURE utf8-view
+SEND quit_keys='q'
+EXIT_CODE 0

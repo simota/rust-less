@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "search-backward"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

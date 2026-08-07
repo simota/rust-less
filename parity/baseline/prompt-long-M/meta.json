@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "prompt-byte-percent-rules"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

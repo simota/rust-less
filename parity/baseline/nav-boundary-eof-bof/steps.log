@@ -1,0 +1,10 @@
+LAUNCH session=parity-nav-boundary-eof-bof-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-boundary-eof-bof/exit_code
+CAPTURE initial
+SEND keys='k'
+CAPTURE k-at-bof-noop
+SEND keys='300j'
+CAPTURE after-300j-clamped-to-eof
+SEND keys='j'
+CAPTURE j-at-eof-noop
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,24 @@
+multi file 2 - line 1
+multi file 2 - line 2
+multi file 2 - line 3
+multi file 2 - line 4
+multi file 2 - line 5
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[1m[38;5;214m~[0m
+[38;5;235m[48;5;214mity/fixtures/multi-2.txt (file 2 of 3) (END) - Next: parity/fixtures/multi-3.txt

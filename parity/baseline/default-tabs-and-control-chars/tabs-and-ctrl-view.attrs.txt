@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        indented with one leading tab
+before  after   tab-separated fields
+a       b       c       d       four tabs
+ctrl:[[38;5;235m[48;5;214m^A[39m[49m][[38;5;235m[48;5;214m^B[39m[49m][[38;5;235m[48;5;214m^G[39m[49m][[38;5;235m[48;5;214m^_[39m[49m]end
+plain line with no special characters
+[38;5;235m[48;5;214mparity/fixtures/tabs-ctrl.txt (END)[39m[49m

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "multifile-next-prev"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

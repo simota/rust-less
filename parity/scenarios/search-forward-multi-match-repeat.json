@@ -1,0 +1,37 @@
+{
+  "id": "search-forward-multi-match-repeat",
+  "feature_ids": [
+    "search-forward",
+    "search-repeat",
+    "search-repeat-reverse",
+    "search-highlight-matches"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "compare_attrs": true,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "/ALPHA_TOKEN",
+      "key_after": "Enter",
+      "capture": "after-first-match"
+    },
+    {
+      "keys": "n",
+      "capture": "after-n-second-match"
+    },
+    {
+      "keys": "n",
+      "capture": "after-n-third-match"
+    },
+    {
+      "keys": "N",
+      "capture": "after-N-reverse-back-to-second"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

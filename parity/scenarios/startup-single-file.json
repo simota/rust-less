@@ -1,0 +1,16 @@
+{
+  "id": "startup-single-file",
+  "feature_ids": [
+    "startup-file-arg"
+  ],
+  "fixture": "parity/fixtures/short.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "first-screen"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

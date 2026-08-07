@@ -1,0 +1,20 @@
+{
+  "id": "prompt-error-bell-default",
+  "feature_ids": [
+    "prompt-error-bell"
+  ],
+  "fixture": "parity/fixtures/short.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-already-at-eof"
+    },
+    {
+      "keys": "j",
+      "capture": "after-j-past-eof"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

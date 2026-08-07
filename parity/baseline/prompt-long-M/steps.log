@@ -1,0 +1,8 @@
+LAUNCH session=parity-prompt-long-M-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less -M parity/fixtures/lines200.txt; echo $? > parity/baseline/prompt-long-M/exit_code
+CAPTURE initial-long-prompt
+SEND keys='50g'
+CAPTURE mid-file-long-prompt
+SEND keys='G'
+CAPTURE eof-long-prompt
+SEND quit_keys='q'
+EXIT_CODE 0

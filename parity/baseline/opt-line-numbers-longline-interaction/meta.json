@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "opt-line-numbers-N"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

@@ -1,0 +1,46 @@
+{
+  "id": "startup-multi-file",
+  "feature_ids": [
+    "startup-multi-file-args",
+    "multifile-prompt-indicator",
+    "multifile-next-prev"
+  ],
+  "fixture": "parity/fixtures/multi-1.txt",
+  "extra_fixtures": [
+    "parity/fixtures/multi-2.txt",
+    "parity/fixtures/multi-3.txt"
+  ],
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "file1-initial"
+    },
+    {
+      "keys": ":n",
+      "capture": "after-colon-n-to-file2"
+    },
+    {
+      "keys": ":n",
+      "capture": "after-colon-n-to-file3"
+    },
+    {
+      "keys": ":n",
+      "capture": "after-colon-n-at-last-boundary"
+    },
+    {
+      "keys": ":p",
+      "capture": "after-colon-p-back-to-file2"
+    },
+    {
+      "keys": ":p",
+      "capture": "after-colon-p-back-to-file1"
+    },
+    {
+      "keys": ":p",
+      "capture": "after-colon-p-at-first-boundary"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

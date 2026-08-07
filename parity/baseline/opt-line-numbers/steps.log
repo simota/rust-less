@@ -1,0 +1,6 @@
+LAUNCH session=parity-opt-line-numbers-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less -N parity/fixtures/lines200.txt; echo $? > parity/baseline/opt-line-numbers/exit_code
+CAPTURE initial-with-line-numbers
+SEND keys='50g'
+CAPTURE mid-file-with-line-numbers
+SEND quit_keys='q'
+EXIT_CODE 0

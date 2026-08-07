@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "exit-codes"
+  ],
+  "compare_attrs": false,
+  "expect_exit": null
+}

@@ -1,0 +1,19 @@
+{
+  "id": "opt-chop-long-lines",
+  "feature_ids": [
+    "opt-chop-long-lines-S",
+    "default-display-formatting"
+  ],
+  "fixture": "parity/fixtures/longlines.txt",
+  "args": [
+    "-S"
+  ],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "chopped-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

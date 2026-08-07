@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "search-forward",
+    "search-highlight-matches"
+  ],
+  "compare_attrs": true,
+  "expect_exit": 0
+}

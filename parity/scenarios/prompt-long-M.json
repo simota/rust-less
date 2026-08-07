@@ -1,0 +1,26 @@
+{
+  "id": "prompt-long-M",
+  "feature_ids": [
+    "prompt-byte-percent-rules"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [
+    "-M"
+  ],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-long-prompt"
+    },
+    {
+      "keys": "50g",
+      "capture": "mid-file-long-prompt"
+    },
+    {
+      "keys": "G",
+      "capture": "eof-long-prompt"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

@@ -1,0 +1,24 @@
+{
+  "id": "nav-numeric-prefix-edge",
+  "feature_ids": [
+    "nav-numeric-prefix"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "0g",
+      "capture": "after-0g-zero-edge-case"
+    },
+    {
+      "keys": "999999999999g",
+      "capture": "after-huge-number-g"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

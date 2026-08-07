@@ -1,0 +1,22 @@
+{
+  "id": "prompt-initial-filename",
+  "feature_ids": [
+    "prompt-initial-filename",
+    "prompt-short-colon"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "compare_attrs": true,
+  "steps": [
+    {
+      "capture": "first-prompt-with-filename"
+    },
+    {
+      "keys": "j",
+      "capture": "second-prompt-no-filename"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

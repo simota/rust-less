@@ -1,0 +1,6 @@
+LAUNCH session=parity-prompt-error-bell-full-quiet-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less -Q parity/fixtures/short.txt; echo $? > parity/baseline/prompt-error-bell-full-quiet/exit_code
+CAPTURE initial-already-at-eof
+SEND keys='j'
+CAPTURE after-j-past-eof
+SEND quit_keys='q'
+EXIT_CODE 0

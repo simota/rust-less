@@ -1,0 +1,10 @@
+{
+  "feature_ids": [
+    "search-forward",
+    "search-repeat",
+    "search-repeat-reverse",
+    "search-highlight-matches"
+  ],
+  "compare_attrs": true,
+  "expect_exit": 0
+}

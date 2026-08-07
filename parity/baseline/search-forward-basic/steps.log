@@ -1,0 +1,7 @@
+LAUNCH session=parity-search-forward-basic-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/search-forward-basic/exit_code
+CAPTURE initial
+SEND keys='/SOLO_NEEDLE'
+SEND key_after=Enter
+CAPTURE after-search-single-match
+SEND quit_keys='q'
+EXIT_CODE 0

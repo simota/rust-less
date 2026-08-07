@@ -1,0 +1,24 @@
+      [1m[38;5;214m1[0m 001 line 1 of 200 :: plain filler content
+      [1m[38;5;214m2[0m 002 line 2 of 200 :: plain filler content
+      [1m[38;5;214m3[0m 003 line 3 of 200 :: plain filler content
+      [1m[38;5;214m4[0m 004 line 4 of 200 :: plain filler content
+      [1m[38;5;214m5[0m 005 line 5 of 200 :: plain filler content
+      [1m[38;5;214m6[0m 006 line 6 of 200 :: plain filler content
+      [1m[38;5;214m7[0m 007 line 7 of 200 :: plain filler content
+      [1m[38;5;214m8[0m 008 line 8 of 200 :: plain filler content
+      [1m[38;5;214m9[0m 009 line 9 of 200 :: plain filler content
+     [1m[38;5;214m10[0m 010 line 10 of 200 :: plain filler content
+     [1m[38;5;214m11[0m 011 line 11 of 200 :: plain filler content
+     [1m[38;5;214m12[0m 012 line 12 of 200 :: plain filler content
+     [1m[38;5;214m13[0m 013 line 13 of 200 :: plain filler content
+     [1m[38;5;214m14[0m 014 line 14 of 200 :: plain filler content
+     [1m[38;5;214m15[0m 015 line 15 of 200 :: plain filler content
+     [1m[38;5;214m16[0m 016 line 16 of 200 :: plain filler content
+     [1m[38;5;214m17[0m 017 line 17 of 200 :: plain filler content
+     [1m[38;5;214m18[0m 018 line 18 of 200 :: plain filler content
+     [1m[38;5;214m19[0m 019 line 19 of 200 :: plain filler content
+     [1m[38;5;214m20[0m 020 line 20 of 200 :: ALPHA_TOKEN appears here
+     [1m[38;5;214m21[0m 021 line 21 of 200 :: plain filler content
+     [1m[38;5;214m22[0m 022 line 22 of 200 :: plain filler content
+     [1m[38;5;214m23[0m 023 line 23 of 200 :: plain filler content
+[38;5;235m[48;5;214mparity/fixtures/lines200.txt[39m[49m

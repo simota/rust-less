@@ -1,0 +1,24 @@
+00001 large file line 1 of 5000 :: filler content
+00002 large file line 2 of 5000 :: filler content
+00003 large file line 3 of 5000 :: filler content
+00004 large file line 4 of 5000 :: filler content
+00005 large file line 5 of 5000 :: filler content
+00006 large file line 6 of 5000 :: filler content
+00007 large file line 7 of 5000 :: filler content
+00008 large file line 8 of 5000 :: filler content
+00009 large file line 9 of 5000 :: filler content
+00010 large file line 10 of 5000 :: filler content
+00011 large file line 11 of 5000 :: filler content
+00012 large file line 12 of 5000 :: filler content
+00013 large file line 13 of 5000 :: filler content
+00014 large file line 14 of 5000 :: filler content
+00015 large file line 15 of 5000 :: filler content
+00016 large file line 16 of 5000 :: filler content
+00017 large file line 17 of 5000 :: filler content
+00018 large file line 18 of 5000 :: filler content
+00019 large file line 19 of 5000 :: filler content
+00020 large file line 20 of 5000 :: filler content
+00021 large file line 21 of 5000 :: filler content
+00022 large file line 22 of 5000 :: filler content
+00023 large file line 23 of 5000 :: filler content
+[38;5;235m[48;5;214mparity/fixtures/large.txt[39m[49m

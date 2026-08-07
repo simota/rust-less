@@ -1,0 +1,6 @@
+LAUNCH session=parity-prompt-initial-filename-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/prompt-initial-filename/exit_code
+CAPTURE first-prompt-with-filename
+SEND keys='j'
+CAPTURE second-prompt-no-filename
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,16 @@
+{
+  "id": "utf8-handling",
+  "feature_ids": [
+    "utf8-handling"
+  ],
+  "fixture": "parity/fixtures/utf8-mixed.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "utf8-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

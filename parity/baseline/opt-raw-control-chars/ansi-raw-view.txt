@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Red text normal
+Bold Green and Blue
+Magenta start (unclosed)
+next line after unclosed color (should reset per-line under -R)
+non-color esc sequence: non-color-esc-seq-here end
+osc8 esc-terminated: link text trailing
+osc8 bel-terminated: link2 trailing2
+parity/fixtures/ansi.txt (END)

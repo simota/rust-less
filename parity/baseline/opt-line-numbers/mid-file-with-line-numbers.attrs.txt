@@ -1,0 +1,24 @@
+     [1m[38;5;214m50[0m 050 line 50 of 200 :: plain filler content
+     [1m[38;5;214m51[0m 051 line 51 of 200 :: plain filler content
+     [1m[38;5;214m52[0m 052 line 52 of 200 :: plain filler content
+     [1m[38;5;214m53[0m 053 line 53 of 200 :: plain filler content
+     [1m[38;5;214m54[0m 054 line 54 of 200 :: plain filler content
+     [1m[38;5;214m55[0m 055 line 55 of 200 :: plain filler content
+     [1m[38;5;214m56[0m 056 line 56 of 200 :: plain filler content
+     [1m[38;5;214m57[0m 057 line 57 of 200 :: plain filler content
+     [1m[38;5;214m58[0m 058 line 58 of 200 :: plain filler content
+     [1m[38;5;214m59[0m 059 line 59 of 200 :: plain filler content
+     [1m[38;5;214m60[0m 060 line 60 of 200 :: regex sample cat bat hat sat mat
+     [1m[38;5;214m61[0m 061 line 61 of 200 :: regex sample foobar123 foobaz456
+     [1m[38;5;214m62[0m 062 line 62 of 200 :: plain filler content
+     [1m[38;5;214m63[0m 063 line 63 of 200 :: plain filler content
+     [1m[38;5;214m64[0m 064 line 64 of 200 :: plain filler content
+     [1m[38;5;214m65[0m 065 line 65 of 200 :: plain filler content
+     [1m[38;5;214m66[0m 066 line 66 of 200 :: plain filler content
+     [1m[38;5;214m67[0m 067 line 67 of 200 :: plain filler content
+     [1m[38;5;214m68[0m 068 line 68 of 200 :: plain filler content
+     [1m[38;5;214m69[0m 069 line 69 of 200 :: plain filler content
+     [1m[38;5;214m70[0m 070 line 70 of 200 :: plain filler content
+     [1m[38;5;214m71[0m 071 line 71 of 200 :: plain filler content
+     [1m[38;5;214m72[0m 072 line 72 of 200 :: plain filler content
+:

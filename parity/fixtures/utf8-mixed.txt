@@ -1,0 +1,6 @@
+こんにちは世界 (Japanese greeting)
+emoji line: 🎉🚀✅ end
+hello 世界 world (mixed ascii + CJK)
+café résumé naïve (accented latin, narrow width)
+漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢
+plain ascii tail line

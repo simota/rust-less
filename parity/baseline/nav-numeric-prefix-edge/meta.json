@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "nav-numeric-prefix"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

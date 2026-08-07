@@ -1,0 +1,4 @@
+LAUNCH session=parity-exit-code-file-not-found-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/does-not-exist.txt; echo $? > parity/baseline/exit-code-file-not-found/exit_code
+WARN capture 'error-view' failed (pane/session likely gone): no server running on /var/folders/tq/2kxd7ywd2wz2k8bt5m3h684c0000gn/T/rust-less-parity.sock
+SEND quit_keys='q'
+EXIT_CODE 1

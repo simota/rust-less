@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "exit-commands",
+    "exit-codes"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

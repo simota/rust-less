@@ -1,0 +1,10 @@
+LAUNCH session=parity-search-not-found-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/search-not-found/exit_code
+CAPTURE initial
+SEND keys='/NOPE_NOT_PRESENT_XYZ'
+SEND key_after=Enter
+CAPTURE after-forward-search-fail
+SEND keys='?NOPE_NOT_PRESENT_XYZ'
+SEND key_after=Enter
+CAPTURE after-backward-search-fail
+SEND quit_keys='q'
+EXIT_CODE 0

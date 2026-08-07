@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[31mRed text[39m normal
+[1m[32mBold Green[0m and [34mBlue[39m
+[35mMagenta start (unclosed)[39m
+next line after unclosed color (should reset per-line under -R)
+non-color esc sequence: non-color-esc-seq-here end
+osc8 esc-terminated: ]8;;https://example.invalid/\link text]8;;\ trailing
+osc8 bel-terminated: ]8;;https://example.invalid/\link2]8;;\ trailing2
+[38;5;235m[48;5;214mparity/fixtures/ansi.txt (END)[39m[49m

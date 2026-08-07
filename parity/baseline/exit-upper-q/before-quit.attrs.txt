@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+short file - line 1 of 5
+short file - line 2 of 5
+short file - line 3 of 5
+short file - line 4 of 5
+short file - line 5 of 5
+[38;5;235m[48;5;214mparity/fixtures/short.txt (END)[39m[49m

@@ -1,0 +1,28 @@
+{
+  "id": "multi-file-count-nav",
+  "feature_ids": [
+    "multifile-next-prev"
+  ],
+  "fixture": "parity/fixtures/multi-1.txt",
+  "extra_fixtures": [
+    "parity/fixtures/multi-2.txt",
+    "parity/fixtures/multi-3.txt"
+  ],
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-file1"
+    },
+    {
+      "keys": "2:n",
+      "capture": "after-2colon-n-to-file3"
+    },
+    {
+      "keys": "2:p",
+      "capture": "after-2colon-p-to-file1"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

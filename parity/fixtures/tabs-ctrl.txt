@@ -1,0 +1,5 @@
+	indented with one leading tab
+before	after	tab-separated fields
+a	b	c	d	four tabs
+ctrl:[][][][]end
+plain line with no special characters

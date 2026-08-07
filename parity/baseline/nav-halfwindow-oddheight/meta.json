@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "nav-forward-halfwindow",
+    "nav-backward-halfwindow"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

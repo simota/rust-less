@@ -1,0 +1,8 @@
+LAUNCH session=parity-multi-file-count-nav-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/multi-1.txt parity/fixtures/multi-2.txt parity/fixtures/multi-3.txt; echo $? > parity/baseline/multi-file-count-nav/exit_code
+CAPTURE initial-file1
+SEND keys='2:n'
+CAPTURE after-2colon-n-to-file3
+SEND keys='2:p'
+CAPTURE after-2colon-p-to-file1
+SEND quit_keys='q'
+EXIT_CODE 0

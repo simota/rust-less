@@ -1,0 +1,45 @@
+{
+  "id": "nav-line-forward-backward",
+  "feature_ids": [
+    "nav-forward-line",
+    "nav-backward-line"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "jjj",
+      "capture": "after-3-single-j"
+    },
+    {
+      "keys": "kk",
+      "capture": "after-2-single-k"
+    },
+    {
+      "key": "Enter",
+      "capture": "after-enter-forward-1"
+    },
+    {
+      "keys": "5j",
+      "capture": "after-5j"
+    },
+    {
+      "keys": "3k",
+      "capture": "after-3k"
+    },
+    {
+      "keys": "50j",
+      "capture": "after-50j-exceeds-window-height"
+    },
+    {
+      "keys": "20k",
+      "capture": "after-20k"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

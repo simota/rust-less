@@ -1,0 +1,16 @@
+LAUNCH session=parity-nav-halfwindow-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-halfwindow/exit_code
+CAPTURE initial
+SEND keys='d'
+CAPTURE after-d-default-half
+SEND keys='d'
+CAPTURE after-d-again
+SEND keys='u'
+CAPTURE after-u-back-half
+SEND keys='5d'
+CAPTURE after-5d-sets-new-sticky-default
+SEND keys='d'
+CAPTURE after-bare-d-uses-sticky-5
+SEND keys='u'
+CAPTURE after-bare-u-uses-sticky-5
+SEND quit_keys='q'
+EXIT_CODE 0

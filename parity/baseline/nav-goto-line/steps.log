@@ -1,0 +1,16 @@
+LAUNCH session=parity-nav-goto-line-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-goto-line/exit_code
+CAPTURE initial
+SEND keys='G'
+CAPTURE after-G-goto-last
+SEND keys='g'
+CAPTURE after-g-goto-first
+SEND keys='10g'
+CAPTURE after-10g-mid-file
+SEND keys='100g'
+CAPTURE after-100g-mid-file
+SEND keys='9999g'
+CAPTURE after-9999g-beyond-eof-clamped
+SEND keys='50G'
+CAPTURE after-50G-mid-file
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,9 @@
+{
+  "feature_ids": [
+    "startup-multi-file-args",
+    "multifile-prompt-indicator",
+    "multifile-next-prev"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

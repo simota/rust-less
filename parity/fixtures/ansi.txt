@@ -1,0 +1,7 @@
+[31mRed text[0m normal
+[1;32mBold Green[0m and [34mBlue[0m
+[35mMagenta start (unclosed)
+next line after unclosed color (should reset per-line under -R)
+non-color esc sequence: [2;5Hnon-color-esc-seq-here end
+osc8 esc-terminated: ]8;;https://example.invalid/\link text]8;;\ trailing
+osc8 bel-terminated: ]8;;https://example.invalid/link2]8;; trailing2

@@ -1,0 +1,10 @@
+LAUNCH session=parity-nav-halfwindow-oddheight-86817 size=80x25 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-halfwindow-oddheight/exit_code
+CAPTURE initial-25rows
+SEND keys='d'
+CAPTURE after-d-odd-height
+SEND keys='d'
+CAPTURE after-d-again-odd-height
+SEND keys='u'
+CAPTURE after-u-odd-height
+SEND quit_keys='q'
+EXIT_CODE 0

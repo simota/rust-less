@@ -1,0 +1,26 @@
+{
+  "id": "prompt-medium-M",
+  "feature_ids": [
+    "prompt-byte-percent-rules"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [
+    "-m"
+  ],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-medium-prompt"
+    },
+    {
+      "keys": "50g",
+      "capture": "mid-file-medium-prompt"
+    },
+    {
+      "keys": "G",
+      "capture": "eof-medium-prompt"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

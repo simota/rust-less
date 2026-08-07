@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "opt-raw-control-chars-R",
+    "ansi-escape-handling"
+  ],
+  "compare_attrs": true,
+  "expect_exit": 0
+}

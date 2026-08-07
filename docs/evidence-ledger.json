@@ -1,0 +1,438 @@
+{
+  "target": "GNU less 668 (Darwin 25.5.0, /usr/bin/less)",
+  "generated": "2026-08-08",
+  "entries": [
+    {
+      "claim": "less displays the contents of a file given as a command-line argument in a terminal.",
+      "source": "man less (less 668, local), NAME/SYNOPSIS",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "less accepts multiple filename arguments on the command line; they are examined sequentially and can be switched between using :n/:p/:x.",
+      "source": "man less (less 668, local), SYNOPSIS + COMMANDS 'CHANGING FILES'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "less can read input from a pipe (stdin); several options and prompt codes (-o/-O, %f) explicitly distinguish pipe input from an ordinary file, confirming pipe/stdin is a supported input mode.",
+      "source": "man less (less 668, local), OPTIONS '-o or --log-file', PROMPTS '%f'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "SPACE, ^V, f, ^F scroll forward N lines, default one window; if N exceeds the screen size only the final screenful is displayed.",
+      "source": "man less (less 668, local), COMMANDS 'SPACE or ^V or f or ^F'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "z behaves like SPACE (forward window), but if N is given it becomes the new window size, persisting for subsequent window-scroll commands.",
+      "source": "man less (less 668, local), COMMANDS 'z'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "ENTER/RETURN/^N/e/^E/j/^J scroll forward N lines, default 1; the entire N lines are displayed even if N exceeds the screen size.",
+      "source": "man less (less 668, local), COMMANDS 'ENTER or RETURN or ^N or e or ^E or j or ^J'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "d/^D scroll forward N lines, default one half of the screen size; if N is given it becomes the new default for both subsequent d and u commands.",
+      "source": "man less (less 668, local), COMMANDS 'd or ^D'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "b/^B/ESC-v scroll backward N lines, default one window; if N exceeds the screen size only the final screenful is displayed.",
+      "source": "man less (less 668, local), COMMANDS 'b or ^B or ESC-v'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "w behaves like ESC-v (backward window), but if N is given it becomes the new window size.",
+      "source": "man less (less 668, local), COMMANDS 'w'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "y/^Y/^P/k/^K scroll backward N lines, default 1.",
+      "source": "man less (less 668, local), COMMANDS 'y or ^Y or ^P or k or ^K'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "u/^U scroll backward N lines, default one half of the screen size; if N is given it becomes the new default for both subsequent d and u commands.",
+      "source": "man less (less 668, local), COMMANDS 'u or ^U'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The default 'window' size equals the full screen height, and the default 'half-window' size equals half of the screen height.",
+      "source": "less --help (less 668, local), MOVING section footer",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "g/</ESC-< go to line N in the file, default line 1 (beginning of file); may be slow if N is large.",
+      "source": "man less (less 668, local), COMMANDS 'g or < or ESC-<'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "G/>/ESC-> go to line N in the file, default the last line (end of file).",
+      "source": "man less (less 668, local), COMMANDS 'G or > or ESC->'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "Commands marked with * in the help summary (movement, search, jump commands) accept a preceding decimal number N that parameterizes the command per its own rule.",
+      "source": "less --help (less 668, local), SUMMARY OF LESS COMMANDS header note",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "Neither the man page COMMANDS section nor --help explicitly enumerates UpArrow/DownArrow/PageUp/PageDown as key bindings for the j/k/f/b (line/window scroll) actions; these terminfo-driven bindings are not textually documented and must be confirmed by direct terminal capture.",
+      "source": "man less (less 668, local), COMMANDS section (absence); less --help (less 668, local) (absence)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "/pattern searches forward for the N-th line matching a regular-expression pattern (N defaults to 1); search is case-sensitive by default and starts at the first displayed line (subject to -a/-j).",
+      "source": "man less (less 668, local), COMMANDS '/pattern'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "?pattern searches backward for the N-th matching line, starting at the last displayed line (subject to -a/-j).",
+      "source": "man less (less 668, local), COMMANDS '?pattern'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "n repeats the previous search for the N-th next occurrence, in the same direction and with the same modifiers as the original search.",
+      "source": "man less (less 668, local), COMMANDS 'n'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "N repeats the previous search but in the reverse direction.",
+      "source": "man less (less 668, local), COMMANDS 'N'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "By default less highlights ALL strings on screen matching the last search command; the -g option restricts highlighting to only the single found match.",
+      "source": "man less (less 668, local), OPTIONS '-g or --hilite-search'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The -G/--HILITE-SEARCH option suppresses all search-match highlighting.",
+      "source": "man less (less 668, local), OPTIONS '-G or --HILITE-SEARCH'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The man page does not state the literal text of the 'no match found' style message shown after an unsuccessful search (e.g. a 'Pattern not found' string); its exact wording must be captured empirically from the running binary.",
+      "source": "man less (less 668, local), COMMANDS/OPTIONS sections (absence)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "-N/--LINE-NUMBERS displays a line number at the beginning of every displayed line; -n/--line-numbers is the inverse (suppress numbers), which is the default.",
+      "source": "man less (less 668, local), OPTIONS '-n or --line-numbers' / '-N or --LINE-NUMBERS'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "-S/--chop-long-lines truncates lines longer than the screen width instead of wrapping (revealed only via RIGHT-ARROW/horizontal scroll); the default behavior without -S is to wrap long lines onto the next display line.",
+      "source": "man less (less 668, local), OPTIONS '-S or --chop-long-lines'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "-R/--RAW-CONTROL-CHARS passes ANSI color escape sequences (ESC[...m) and OSC 8 hyperlink sequences through to the terminal in raw form while keeping less's internal screen-appearance tracking correct, provided no other escape sequences appear in the file; the beginning of each line is assumed non-colored regardless of prior lines' sequences.",
+      "source": "man less (less 668, local), OPTIONS '-R or --RAW-CONTROL-CHARS'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "By default (no -u/-U), control characters are displayed using caret notation (e.g. control-A as '^A') when inverting the 0100 bit yields a printable character, otherwise as a hex code in angle brackets; the format is overridable via LESSBINFMT, whose default is '*s<%02X>'.",
+      "source": "man less (less 668, local), NATIONAL CHARACTER SETS",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "Default tab-stop width is 8 columns (equivalent to -x8); tabs are expanded to spaces by default unless -U (or --PROC-TAB) causes tabs to be treated as control characters.",
+      "source": "man less (less 668, local), OPTIONS '-xn,... or --tabs=n,...'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "--line-num-width sets the minimum width of the -N line-number field; its default is 7 characters.",
+      "source": "man less (less 668, local), OPTIONS '--line-num-width=n'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": ":n examines the next file from the command-line file list (or the N-th next file if a count is given); :p examines the previous file (or N-th previous).",
+      "source": "man less (less 668, local), COMMANDS ':n' / ':p'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The prompt escape sequence '?m(%T %i of %m).' produces a '(file N of M)' style indicator whenever more than one input file is open; %T supplies the word 'file' (or 'tag' when using -t).",
+      "source": "man less (less 668, local), PROMPTS '%i', '%m', '%T', '?m'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "q, Q, :q, :Q, and ZZ all exit less.",
+      "source": "man less (less 668, local), COMMANDS 'q or Q or :q or :Q or ZZ'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "feature-inventory",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "-K/--quit-on-intr causes less to exit immediately with status (exit) code 2 when an interrupt character (usually ^C) is typed; this is the only exit-status value documented anywhere in the man page.",
+      "source": "man less (less 668, local), OPTIONS '-K or --quit-on-intr'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The man page does not document the exit status code produced by normal quit commands (q/Q/:q/:Q/ZZ) or by reaching EOF with -e/-E/-F; these must be captured empirically.",
+      "source": "man less (less 668, local), COMMANDS/OPTIONS sections (absence)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The default (short/colon) prompt format string is: '?n?f%f .?m(%T %i of %m) ..?e(END) ?x- Next\\: %x..%t' — filename on first prompt of a file, '(file N of M)' if multiple files, '(END)' at end-of-file, next filename if another file follows, trailing spaces trimmed.",
+      "source": "man less (less 668, local), PROMPTS ('This is the default prompt.')",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The default medium prompt (-m/--long-prompt) format string is: '?n?f%f .?m(%T %i of %m) ..?e(END) ?x- Next\\: %x.:?pB%pB\\%:byte %bB?s/%s...%t' — adds a percent-into-file or byte-offset fallback after the short-prompt content.",
+      "source": "man less (less 668, local), PROMPTS (defaults for -m prompt)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The default long prompt (-M/--LONG-PROMPT) format string is: '?f%f .?n?m(%T %i of %m) ..?ltlines %lt-%lb?L/%L. :byte %bB?s/%s. .?e(END) ?x- Next\\: %x.:?pB%pB\\%..%t' — adds a line-range display 'lines A-B/L'.",
+      "source": "man less (less 668, local), PROMPTS (defaults for -M prompt)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The default message printed by the '=' command (file info) is: '?f%f .?m(%T %i of %m) .?ltlines %lt-%lb?L/%L. .byte %bB?s/%s. ?e(END) :?pB%pB\\%..%t'.",
+      "source": "man less (less 668, local), PROMPTS ('the default message produced by the = command')",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The man page documents the prompt's textual content precisely via %/? escape codes, but does not state whether the interactive prompt line is rendered in reverse video/standout by default; standout is documented for control/binary character display and is configurable via the -D 'P' color slot, but is not asserted as the prompt's default rendering. Must be confirmed by capture.",
+      "source": "man less (less 668, local), PROMPTS + OPTIONS '-Dxcolor' (absence of explicit default-rendering statement)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "less rings the terminal bell by default on errors (e.g. attempting to scroll past EOF/BOF, typing an invalid character); -q/--quiet silences the bell only for the EOF/BOF-scroll case (other errors still ring, using visual bell if available), and -Q/--QUIET silences the bell in all cases.",
+      "source": "man less (less 668, local), OPTIONS '-q or --quiet or --silent' / '-Q or --QUIET or --SILENT'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The default scrolling window size equals the current screen height and auto-adjusts on terminal resize; e.g. with -z-4 on a 24-line screen the window is 20 lines, and if the terminal is resized to 40 lines the window automatically becomes 36 lines.",
+      "source": "man less (less 668, local), OPTIONS '-zn or --window=n'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "A window size or shift amount specified as a fraction of the screen (via -j or -#) is automatically recalculated if the terminal window is resized.",
+      "source": "man less (less 668, local), OPTIONS '-jn or --jump-target=n', '-# or --shift'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "LESS_LINES/LESS_COLUMNS environment variables can override the detected screen size (taking precedence over the system's own size detection); when set, less repaints the entire screen on every movement command, which may slow scrolling.",
+      "source": "man less (less 668, local), ENVIRONMENT VARIABLES 'LESS_LINES'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "The precise low-level repaint mechanism/timing that less uses when the terminal is resized while a file is displayed (e.g. reacting to SIGWINCH) is not spelled out procedurally beyond 'the scrolling window automatically changes'; the exact redraw sequence must be observed via capture.",
+      "source": "man less (less 668, local), OPTIONS '-zn' (absence of procedural detail)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "behavior-semantics",
+      "verification": "capture-determined"
+    },
+    {
+      "claim": "less determines UTF-8 mode via LESSCHARSET/LESSCHARDEF; if neither is set, less checks LC_ALL/LC_CTYPE/LANG for the substring 'UTF-8'/'UTF8'/'utf-8'/'utf8', else falls back to setlocale(), and if that is unavailable the default character set is utf-8. UTF-8 is documented as the only character set supporting multi-byte characters.",
+      "source": "man less (less 668, local), NATIONAL CHARACTER SETS",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "For -R raw control-char mode, an ANSI color escape sequence is recognized by default as ESC [ ... m; the terminator character set is configurable via LESSANSIENDCHARS (default 'm') and the allowed mid-sequence characters via LESSANSIMIDCHARS (default '0123456789:;[?!\"'#%()*+ ').",
+      "source": "man less (less 668, local), OPTIONS '-R' + ENVIRONMENT VARIABLES 'LESSANSIENDCHARS'/'LESSANSIMIDCHARS'",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "confirmed-by-capture"
+    },
+    {
+      "claim": "The locally installed binary identifies itself as 'less 668 (POSIX regular expressions)', Copyright 1984-2024 Mark Nudelman; the man page footer confirms 'Version 668: 06 Oct 2024'.",
+      "source": "less --version (less 668, local) + man less (less 668, local) footer",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T1",
+      "describes_version": "668",
+      "category": "exact-value",
+      "verification": "unconfirmed-lead"
+    },
+    {
+      "claim": "Per upstream release notes, less-668 was a general release on 2024-10-17 ('fixes bugs found in less-661 but introduces no new features'); the latest upstream release at fetch time is less-704 (2026-06-06), with upgrading from less-702 to less-704 recommended due to three security fixes — the locally installed 668 is many releases and roughly 20 months behind upstream HEAD, and post-668 security fixes exist upstream that are not reflected locally.",
+      "source": "https://greenwoodsoftware.com/less/ (WebFetch)",
+      "retrieved": "2026-08-08",
+      "trust_tier": "T2",
+      "describes_version": "668 (local) vs 704 (upstream HEAD)",
+      "category": "version-drift",
+      "verification": "unconfirmed-lead"
+    }
+  ]
+}

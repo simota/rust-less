@@ -1,0 +1,30 @@
+{
+  "id": "nav-halfwindow-oddheight",
+  "feature_ids": [
+    "nav-forward-halfwindow",
+    "nav-backward-halfwindow"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "initial_size": [80, 25],
+  "steps": [
+    {
+      "capture": "initial-25rows"
+    },
+    {
+      "keys": "d",
+      "capture": "after-d-odd-height"
+    },
+    {
+      "keys": "d",
+      "capture": "after-d-again-odd-height"
+    },
+    {
+      "keys": "u",
+      "capture": "after-u-odd-height"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

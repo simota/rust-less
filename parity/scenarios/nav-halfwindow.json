@@ -1,0 +1,41 @@
+{
+  "id": "nav-halfwindow",
+  "feature_ids": [
+    "nav-forward-halfwindow",
+    "nav-backward-halfwindow"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "d",
+      "capture": "after-d-default-half"
+    },
+    {
+      "keys": "d",
+      "capture": "after-d-again"
+    },
+    {
+      "keys": "u",
+      "capture": "after-u-back-half"
+    },
+    {
+      "keys": "5d",
+      "capture": "after-5d-sets-new-sticky-default"
+    },
+    {
+      "keys": "d",
+      "capture": "after-bare-d-uses-sticky-5"
+    },
+    {
+      "keys": "u",
+      "capture": "after-bare-u-uses-sticky-5"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

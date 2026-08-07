@@ -1,0 +1,17 @@
+{
+  "id": "exit-colon-upper-q",
+  "feature_ids": [
+    "exit-commands",
+    "exit-codes"
+  ],
+  "fixture": "parity/fixtures/short.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "before-quit"
+    }
+  ],
+  "quit_keys": ":Q",
+  "expect_exit": 0
+}

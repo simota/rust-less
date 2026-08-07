@@ -1,0 +1,22 @@
+{
+  "id": "search-backward-basic",
+  "feature_ids": [
+    "search-backward"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "keys": "G",
+      "capture": "initial-at-eof"
+    },
+    {
+      "keys": "?SOLO_NEEDLE",
+      "key_after": "Enter",
+      "capture": "after-backward-search"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

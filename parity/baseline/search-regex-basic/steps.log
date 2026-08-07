@@ -1,0 +1,10 @@
+LAUNCH session=parity-search-regex-basic-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/search-regex-basic/exit_code
+CAPTURE initial
+SEND keys='/[cb]at'
+SEND key_after=Enter
+CAPTURE after-charclass-regex
+SEND keys='/foo.*456'
+SEND key_after=Enter
+CAPTURE after-dotstar-regex
+SEND quit_keys='q'
+EXIT_CODE 0

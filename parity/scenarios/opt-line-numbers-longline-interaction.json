@@ -1,0 +1,18 @@
+{
+  "id": "opt-line-numbers-longline-interaction",
+  "feature_ids": [
+    "opt-line-numbers-N"
+  ],
+  "fixture": "parity/fixtures/longlines.txt",
+  "args": [
+    "-N"
+  ],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-longline-with-numbers"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

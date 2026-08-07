@@ -1,0 +1,20 @@
+{
+  "id": "opt-raw-control-chars",
+  "feature_ids": [
+    "opt-raw-control-chars-R",
+    "ansi-escape-handling"
+  ],
+  "fixture": "parity/fixtures/ansi.txt",
+  "args": [
+    "-R"
+  ],
+  "stdin": false,
+  "compare_attrs": true,
+  "steps": [
+    {
+      "capture": "ansi-raw-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

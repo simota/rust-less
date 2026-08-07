@@ -1,0 +1,16 @@
+{
+  "id": "startup-large-file",
+  "feature_ids": [
+    "startup-file-arg"
+  ],
+  "fixture": "parity/fixtures/large.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "first-screen"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

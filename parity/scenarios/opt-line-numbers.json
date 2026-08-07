@@ -1,0 +1,22 @@
+{
+  "id": "opt-line-numbers",
+  "feature_ids": [
+    "opt-line-numbers-N"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [
+    "-N"
+  ],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial-with-line-numbers"
+    },
+    {
+      "keys": "50g",
+      "capture": "mid-file-with-line-numbers"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "startup-stdin-pipe"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

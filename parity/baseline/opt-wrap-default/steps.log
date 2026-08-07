@@ -1,0 +1,4 @@
+LAUNCH session=parity-opt-wrap-default-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/longlines.txt; echo $? > parity/baseline/opt-wrap-default/exit_code
+CAPTURE wrapped-view
+SEND quit_keys='q'
+EXIT_CODE 0

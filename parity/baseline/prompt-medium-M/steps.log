@@ -1,0 +1,8 @@
+LAUNCH session=parity-prompt-medium-M-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less -m parity/fixtures/lines200.txt; echo $? > parity/baseline/prompt-medium-M/exit_code
+CAPTURE initial-medium-prompt
+SEND keys='50g'
+CAPTURE mid-file-medium-prompt
+SEND keys='G'
+CAPTURE eof-medium-prompt
+SEND quit_keys='q'
+EXIT_CODE 0

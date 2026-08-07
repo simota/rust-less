@@ -1,0 +1,16 @@
+{
+  "id": "startup-stdin-pipe",
+  "feature_ids": [
+    "startup-stdin-pipe"
+  ],
+  "fixture": "parity/fixtures/short.txt",
+  "args": [],
+  "stdin": true,
+  "steps": [
+    {
+      "capture": "first-screen"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

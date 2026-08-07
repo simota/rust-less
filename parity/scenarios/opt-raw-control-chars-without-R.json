@@ -1,0 +1,16 @@
+{
+  "id": "opt-raw-control-chars-without-R",
+  "feature_ids": [
+    "opt-raw-control-chars-R"
+  ],
+  "fixture": "parity/fixtures/ansi.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "ansi-without-R-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

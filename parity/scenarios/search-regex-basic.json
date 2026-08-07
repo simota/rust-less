@@ -1,0 +1,26 @@
+{
+  "id": "search-regex-basic",
+  "feature_ids": [
+    "search-forward"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "/[cb]at",
+      "key_after": "Enter",
+      "capture": "after-charclass-regex"
+    },
+    {
+      "keys": "/foo.*456",
+      "key_after": "Enter",
+      "capture": "after-dotstar-regex"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

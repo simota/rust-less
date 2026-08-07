@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "startup-file-arg"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

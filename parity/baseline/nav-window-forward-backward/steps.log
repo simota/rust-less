@@ -1,0 +1,18 @@
+LAUNCH session=parity-nav-window-forward-backward-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-window-forward-backward/exit_code
+CAPTURE initial
+SEND key=Space
+CAPTURE after-space-fwd-1window
+SEND key=Space
+CAPTURE after-space-fwd-2window
+SEND keys='b'
+CAPTURE after-b-back-1window
+SEND keys='10f'
+CAPTURE after-10f-lt-window
+SEND keys='50f'
+CAPTURE after-50f-gt-window
+SEND keys='10b'
+CAPTURE after-10b-lt-window
+SEND keys='50b'
+CAPTURE after-50b-gt-window
+SEND quit_keys='q'
+EXIT_CODE 0

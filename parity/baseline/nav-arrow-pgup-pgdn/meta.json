@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "nav-arrow-pgup-pgdn-bindings"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

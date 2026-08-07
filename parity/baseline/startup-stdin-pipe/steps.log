@@ -1,0 +1,4 @@
+LAUNCH session=parity-startup-stdin-pipe-76688 size=80x24 cmd=cat parity/fixtures/short.txt | env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less; echo $? > parity/baseline/startup-stdin-pipe/exit_code
+CAPTURE first-screen
+SEND quit_keys='q'
+EXIT_CODE 0

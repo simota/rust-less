@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+line before
+[38;5;235m[48;5;214m<E4><B8>[39m[49m
+line after
+[38;5;235m[48;5;214mparity/fixtures/utf8-malformed.txt (END)[39m[49m

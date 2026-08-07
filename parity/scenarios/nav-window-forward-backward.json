@@ -1,0 +1,45 @@
+{
+  "id": "nav-window-forward-backward",
+  "feature_ids": [
+    "nav-forward-window",
+    "nav-backward-window"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "key": "Space",
+      "capture": "after-space-fwd-1window"
+    },
+    {
+      "key": "Space",
+      "capture": "after-space-fwd-2window"
+    },
+    {
+      "keys": "b",
+      "capture": "after-b-back-1window"
+    },
+    {
+      "keys": "10f",
+      "capture": "after-10f-lt-window"
+    },
+    {
+      "keys": "50f",
+      "capture": "after-50f-gt-window"
+    },
+    {
+      "keys": "10b",
+      "capture": "after-10b-lt-window"
+    },
+    {
+      "keys": "50b",
+      "capture": "after-50b-gt-window"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

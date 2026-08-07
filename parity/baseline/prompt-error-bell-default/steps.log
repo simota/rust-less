@@ -1,0 +1,6 @@
+LAUNCH session=parity-prompt-error-bell-default-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/short.txt; echo $? > parity/baseline/prompt-error-bell-default/exit_code
+CAPTURE initial-already-at-eof
+SEND keys='j'
+CAPTURE after-j-past-eof
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "prompt-error-bell"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

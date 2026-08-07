@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "utf8-handling"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

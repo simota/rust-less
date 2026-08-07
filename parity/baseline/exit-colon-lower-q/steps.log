@@ -1,0 +1,4 @@
+LAUNCH session=parity-exit-colon-lower-q-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/short.txt; echo $? > parity/baseline/exit-colon-lower-q/exit_code
+CAPTURE before-quit
+SEND quit_keys=':q'
+EXIT_CODE 0

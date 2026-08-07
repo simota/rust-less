@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "nav-forward-window",
+    "nav-backward-window"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

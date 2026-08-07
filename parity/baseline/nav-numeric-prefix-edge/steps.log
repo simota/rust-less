@@ -1,0 +1,8 @@
+LAUNCH session=parity-nav-numeric-prefix-edge-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-numeric-prefix-edge/exit_code
+CAPTURE initial
+SEND keys='0g'
+CAPTURE after-0g-zero-edge-case
+SEND keys='999999999999g'
+CAPTURE after-huge-number-g
+SEND quit_keys='q'
+EXIT_CODE 0

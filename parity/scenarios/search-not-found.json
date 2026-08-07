@@ -1,0 +1,26 @@
+{
+  "id": "search-not-found",
+  "feature_ids": [
+    "search-not-found-message"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "/NOPE_NOT_PRESENT_XYZ",
+      "key_after": "Enter",
+      "capture": "after-forward-search-fail"
+    },
+    {
+      "keys": "?NOPE_NOT_PRESENT_XYZ",
+      "key_after": "Enter",
+      "capture": "after-backward-search-fail"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

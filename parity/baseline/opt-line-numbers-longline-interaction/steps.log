@@ -1,0 +1,4 @@
+LAUNCH session=parity-opt-line-numbers-longline-interaction-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less -N parity/fixtures/longlines.txt; echo $? > parity/baseline/opt-line-numbers-longline-interaction/exit_code
+CAPTURE initial-longline-with-numbers
+SEND quit_keys='q'
+EXIT_CODE 0

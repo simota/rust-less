@@ -1,0 +1,28 @@
+{
+  "id": "terminal-resize-redraw",
+  "feature_ids": [
+    "terminal-resize-redraw"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "keys": "50g",
+      "capture": "before-resize-mid-file"
+    },
+    {
+      "resize": {
+        "cols": 100,
+        "rows": 30
+      },
+      "capture": "after-resize-100x30"
+    },
+    {
+      "keys": "j",
+      "capture": "after-resize-then-scroll"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

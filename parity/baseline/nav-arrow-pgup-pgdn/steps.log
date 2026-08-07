@@ -1,0 +1,13 @@
+LAUNCH session=parity-nav-arrow-pgup-pgdn-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/nav-arrow-pgup-pgdn/exit_code
+SEND keys='50g'
+CAPTURE initial-at-line-50
+SEND key=Down
+CAPTURE after-down-arrow
+SEND key=Up
+CAPTURE after-up-arrow
+SEND key=NPage
+CAPTURE after-pagedown
+SEND key=PPage
+CAPTURE after-pageup
+SEND quit_keys='q'
+EXIT_CODE 0

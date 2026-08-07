@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        indented with one leading tab
+before  after   tab-separated fields
+a       b       c       d       four tabs
+ctrl:[^A][^B][^G][^_]end
+plain line with no special characters
+parity/fixtures/tabs-ctrl.txt (END)

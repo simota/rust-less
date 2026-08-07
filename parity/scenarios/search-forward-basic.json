@@ -1,0 +1,23 @@
+{
+  "id": "search-forward-basic",
+  "feature_ids": [
+    "search-forward",
+    "search-highlight-matches"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "compare_attrs": true,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "/SOLO_NEEDLE",
+      "key_after": "Enter",
+      "capture": "after-search-single-match"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

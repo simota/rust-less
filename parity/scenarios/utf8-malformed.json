@@ -1,0 +1,16 @@
+{
+  "id": "utf8-malformed",
+  "feature_ids": [
+    "utf8-handling"
+  ],
+  "fixture": "parity/fixtures/utf8-malformed.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "malformed-utf8-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "search-forward"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

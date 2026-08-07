@@ -1,0 +1,4 @@
+LAUNCH session=parity-startup-large-file-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/large.txt; echo $? > parity/baseline/startup-large-file/exit_code
+CAPTURE first-screen
+SEND quit_keys='q'
+EXIT_CODE 0

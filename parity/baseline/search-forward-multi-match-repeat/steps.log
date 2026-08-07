@@ -1,0 +1,13 @@
+LAUNCH session=parity-search-forward-multi-match-repeat-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/search-forward-multi-match-repeat/exit_code
+CAPTURE initial
+SEND keys='/ALPHA_TOKEN'
+SEND key_after=Enter
+CAPTURE after-first-match
+SEND keys='n'
+CAPTURE after-n-second-match
+SEND keys='n'
+CAPTURE after-n-third-match
+SEND keys='N'
+CAPTURE after-N-reverse-back-to-second
+SEND quit_keys='q'
+EXIT_CODE 0

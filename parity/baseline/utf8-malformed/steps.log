@@ -1,0 +1,4 @@
+LAUNCH session=parity-utf8-malformed-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/utf8-malformed.txt; echo $? > parity/baseline/utf8-malformed/exit_code
+CAPTURE malformed-utf8-view
+SEND quit_keys='q'
+EXIT_CODE 0

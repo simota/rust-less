@@ -1,0 +1,24 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+こんにちは世界 (Japanese greeting)
+emoji line: 🎉🚀✅ end
+hello 世界 world (mixed ascii + CJK)
+café résumé naïve (accented latin, narrow width)
+漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢
+漢漢漢漢漢
+plain ascii tail line
+[38;5;235m[48;5;214mparity/fixtures/utf8-mixed.txt (END)[39m[49m

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "opt-raw-control-chars-R"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

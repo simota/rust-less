@@ -1,0 +1,9 @@
+LAUNCH session=parity-terminal-resize-redraw-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/lines200.txt; echo $? > parity/baseline/terminal-resize-redraw/exit_code
+SEND keys='50g'
+CAPTURE before-resize-mid-file
+RESIZE 100x30
+CAPTURE after-resize-100x30
+SEND keys='j'
+CAPTURE after-resize-then-scroll
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,17 @@
+{
+  "id": "exit-code-file-not-found",
+  "feature_ids": [
+    "exit-codes"
+  ],
+  "fixture": "parity/fixtures/does-not-exist.txt",
+  "expect_fixture_missing": true,
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "error-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": null
+}

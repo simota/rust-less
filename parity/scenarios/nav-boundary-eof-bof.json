@@ -1,0 +1,30 @@
+{
+  "id": "nav-boundary-eof-bof",
+  "feature_ids": [
+    "nav-forward-line",
+    "nav-backward-line",
+    "prompt-end-marker"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "k",
+      "capture": "k-at-bof-noop"
+    },
+    {
+      "keys": "300j",
+      "capture": "after-300j-clamped-to-eof"
+    },
+    {
+      "keys": "j",
+      "capture": "j-at-eof-noop"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

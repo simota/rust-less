@@ -1,0 +1,9 @@
+{
+  "feature_ids": [
+    "nav-forward-line",
+    "nav-backward-line",
+    "prompt-end-marker"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

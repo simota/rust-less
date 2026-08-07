@@ -1,0 +1,21 @@
+[package]
+name = "rust-less"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A clean-room Rust reimplementation of the core pager behavior of less, verified by differential parity against GNU less 668"
+
+[dependencies]
+# `use-dev-tty`: crossterm's default (mio-based) Unix event source still
+# calls tty_fd() internally, but only this feature's poll()-based source
+# (event/source/unix/tty.rs) is exercised in practice for the
+# read-stdin-for-content / read-keys-from-tty split that `startup-stdin-pipe`
+# needs. Pulls in `filedescriptor` as a transitive dependency (already
+# present in the offline registry cache; no network fetch required).
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+unicode-width = "0.2"
+
+[profile.release]
+debug = true

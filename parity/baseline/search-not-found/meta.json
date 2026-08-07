@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "search-not-found-message"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

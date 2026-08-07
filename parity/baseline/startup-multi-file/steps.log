@@ -1,0 +1,16 @@
+LAUNCH session=parity-startup-multi-file-76688 size=80x24 cmd=env -u LESS -u LESSOPEN -u LESSCLOSE LESSHISTFILE=- LANG=C.UTF-8 /usr/bin/less parity/fixtures/multi-1.txt parity/fixtures/multi-2.txt parity/fixtures/multi-3.txt; echo $? > parity/baseline/startup-multi-file/exit_code
+CAPTURE file1-initial
+SEND keys=':n'
+CAPTURE after-colon-n-to-file2
+SEND keys=':n'
+CAPTURE after-colon-n-to-file3
+SEND keys=':n'
+CAPTURE after-colon-n-at-last-boundary
+SEND keys=':p'
+CAPTURE after-colon-p-back-to-file2
+SEND keys=':p'
+CAPTURE after-colon-p-back-to-file1
+SEND keys=':p'
+CAPTURE after-colon-p-at-first-boundary
+SEND quit_keys='q'
+EXIT_CODE 0

@@ -1,0 +1,33 @@
+{
+  "id": "nav-arrow-pgup-pgdn",
+  "feature_ids": [
+    "nav-arrow-pgup-pgdn-bindings"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "keys": "50g",
+      "capture": "initial-at-line-50"
+    },
+    {
+      "key": "Down",
+      "capture": "after-down-arrow"
+    },
+    {
+      "key": "Up",
+      "capture": "after-up-arrow"
+    },
+    {
+      "key": "NPage",
+      "capture": "after-pagedown"
+    },
+    {
+      "key": "PPage",
+      "capture": "after-pageup"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

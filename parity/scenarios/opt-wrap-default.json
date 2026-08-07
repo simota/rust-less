@@ -1,0 +1,16 @@
+{
+  "id": "opt-wrap-default",
+  "feature_ids": [
+    "default-display-formatting"
+  ],
+  "fixture": "parity/fixtures/longlines.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "wrapped-view"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}

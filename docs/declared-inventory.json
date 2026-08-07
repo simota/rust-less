@@ -1,0 +1,336 @@
+{
+  "target": "GNU less 668 (Darwin 25.5.0, /usr/bin/less)",
+  "generated": "2026-08-08",
+  "scope_note": "Core pager scope only, per Phase 0.5 brief. Denominator for the future completeness gate.",
+  "features": [
+    {
+      "feature_id": "startup-file-arg",
+      "name": "Startup: display file given as argument",
+      "keys_or_flags": ["less <file>"],
+      "behavior_summary": "less opens and displays the contents of a named file, reading incrementally so large files start up fast.",
+      "exact_values": {},
+      "fixture_needs": ["single small text file", "large file (startup speed not exact-value critical, but confirm no full-read block)"],
+      "capture_notes": "Baseline case; confirm first screen matches file head exactly (no extra banner)."
+    },
+    {
+      "feature_id": "startup-stdin-pipe",
+      "name": "Startup: display piped stdin",
+      "keys_or_flags": ["cmd | less"],
+      "behavior_summary": "less reads and displays input from a pipe when no filename is given; several options (-o/-O, %f prompt code) special-case pipe input vs a regular file.",
+      "exact_values": {},
+      "fixture_needs": ["small piped input", "piped input larger than one screen"],
+      "capture_notes": "Man page does not enumerate this as a distinct top-level feature; existence inferred from -o/-O and %f wording. Confirm prompt differences (no filename) via capture."
+    },
+    {
+      "feature_id": "startup-multi-file-args",
+      "name": "Startup: multiple file arguments",
+      "keys_or_flags": ["less <file1> <file2> ..."],
+      "behavior_summary": "Multiple filenames on the command line are loaded into an ordered list; the first is displayed and the rest are reachable via :n/:p/:x.",
+      "exact_values": {},
+      "fixture_needs": ["2 files", "3+ files to test :n/:p wraparound-vs-error at list ends"],
+      "capture_notes": "Also feeds multifile-prompt-indicator and multifile-next-prev."
+    },
+    {
+      "feature_id": "nav-forward-line",
+      "name": "Scroll forward one line (default N=1)",
+      "keys_or_flags": ["e", "^E", "j", "^N", "CR (ENTER/RETURN)", "^J"],
+      "behavior_summary": "Scrolls forward N lines, default 1. The entire N lines are displayed even if N exceeds the screen size.",
+      "exact_values": {"default_N": 1},
+      "fixture_needs": ["Nj with N > window height", "j at last line (EOF boundary)"],
+      "capture_notes": "man vs --help key-list differs slightly (--help omits ^J); trust man page COMMANDS as canonical enumeration."
+    },
+    {
+      "feature_id": "nav-backward-line",
+      "name": "Scroll backward one line (default N=1)",
+      "keys_or_flags": ["y", "^Y", "^P", "k", "^K"],
+      "behavior_summary": "Scrolls backward N lines, default 1.",
+      "exact_values": {"default_N": 1},
+      "fixture_needs": ["Nk with N > window height", "k at first line (BOF boundary)"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "nav-forward-window",
+      "name": "Scroll forward one window (default N=one window)",
+      "keys_or_flags": ["SPACE", "^V", "f", "^F"],
+      "behavior_summary": "Scrolls forward N lines, default one window (screen height). If N exceeds the screen size, only the final screenful is displayed.",
+      "exact_values": {"default_N": "window height (screen height, or as set by -z/z)"},
+      "fixture_needs": ["SPACE at various window heights", "Nf where N < window and N > window"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "nav-backward-window",
+      "name": "Scroll backward one window (default N=one window)",
+      "keys_or_flags": ["b", "^B", "ESC-v"],
+      "behavior_summary": "Scrolls backward N lines, default one window. If N exceeds the screen size, only the final screenful is displayed.",
+      "exact_values": {"default_N": "window height"},
+      "fixture_needs": ["b at various window heights", "b at BOF boundary"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "nav-forward-halfwindow",
+      "name": "Scroll forward one half-window (default N=half window)",
+      "keys_or_flags": ["d", "^D"],
+      "behavior_summary": "Scrolls forward N lines, default one half of the screen size. If N is specified, it becomes the new default for subsequent d and u commands.",
+      "exact_values": {"default_N": "floor(window_height / 2) — exact rounding rule unconfirmed"},
+      "fixture_needs": ["d on odd-height window to determine rounding", "Nd then bare d/u to confirm 'sticky' default"],
+      "capture_notes": "Exact half-window rounding (floor vs ceil vs round) for odd window heights is not stated in the man page; capture-determined."
+    },
+    {
+      "feature_id": "nav-backward-halfwindow",
+      "name": "Scroll backward one half-window (default N=half window)",
+      "keys_or_flags": ["u", "^U"],
+      "behavior_summary": "Scrolls backward N lines, default one half of the screen size. If N is specified, it becomes the new default for subsequent d and u commands.",
+      "exact_values": {"default_N": "floor(window_height / 2) — exact rounding rule unconfirmed"},
+      "fixture_needs": ["u on odd-height window", "shared-default interaction test with d"],
+      "capture_notes": "Same rounding ambiguity as nav-forward-halfwindow; d and u share one 'half-window' default value per man page."
+    },
+    {
+      "feature_id": "nav-goto-first-line",
+      "name": "Go to line N (default: first line)",
+      "keys_or_flags": ["g", "<", "ESC-<"],
+      "behavior_summary": "Goes to line N in the file, default 1 (beginning of file). May be slow if N is large.",
+      "exact_values": {"default_N": 1},
+      "fixture_needs": ["g", "Ng mid-file", "Ng beyond EOF"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "nav-goto-last-line",
+      "name": "Go to line N (default: last line)",
+      "keys_or_flags": ["G", ">", "ESC->"],
+      "behavior_summary": "Goes to line N in the file, default the end of the file.",
+      "exact_values": {"default_N": "last line"},
+      "fixture_needs": ["G", "NG mid-file"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "nav-numeric-prefix",
+      "name": "Numeric prefix N for scroll/jump commands",
+      "keys_or_flags": ["N<cmd> for j k e y d u f b g G etc."],
+      "behavior_summary": "Commands marked with * accept a preceding decimal number N which parameterizes that specific command per its own documented rule.",
+      "exact_values": {},
+      "fixture_needs": ["multi-digit N", "N=0 edge case", "invalid/garbage N handling"],
+      "capture_notes": "General mechanism; per-command exact effect captured under each nav-* feature."
+    },
+    {
+      "feature_id": "nav-arrow-pgup-pgdn-bindings",
+      "name": "UpArrow/DownArrow/PageUp/PageDown key bindings",
+      "keys_or_flags": ["UpArrow", "DownArrow", "PageUp", "PageDown"],
+      "behavior_summary": "Expected to alias to k/j (line) and b/f (window) respectively via terminfo, but this mapping is not explicitly documented in man less or --help.",
+      "exact_values": {},
+      "fixture_needs": ["send raw terminfo escape sequences for each key and observe resulting scroll amount"],
+      "capture_notes": "Not documented in man page or --help at all; fully capture-determined."
+    },
+    {
+      "feature_id": "search-forward",
+      "name": "Forward search",
+      "keys_or_flags": ["/pattern"],
+      "behavior_summary": "Searches forward for the N-th line (default 1) matching a regular-expression pattern; case-sensitive by default; starts at the first displayed line (subject to -a/-j).",
+      "exact_values": {"default_N": 1},
+      "fixture_needs": ["single match", "no match", "Nth match with N>1", "regex metacharacters"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "search-backward",
+      "name": "Backward search",
+      "keys_or_flags": ["?pattern"],
+      "behavior_summary": "Searches backward for the N-th line matching a pattern, starting at the last displayed line (subject to -a/-j).",
+      "exact_values": {"default_N": 1},
+      "fixture_needs": ["single match", "no match", "Nth match with N>1"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "search-repeat",
+      "name": "Repeat last search (same direction)",
+      "keys_or_flags": ["n"],
+      "behavior_summary": "Repeats the previous search for the N-th next occurrence, same direction and modifiers as the original.",
+      "exact_values": {},
+      "fixture_needs": ["n after / and after ?"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "search-repeat-reverse",
+      "name": "Repeat last search (reverse direction)",
+      "keys_or_flags": ["N"],
+      "behavior_summary": "Repeats the previous search but in the reverse direction.",
+      "exact_values": {},
+      "fixture_needs": ["N after / and after ?"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "search-highlight-matches",
+      "name": "Search match highlighting",
+      "keys_or_flags": ["(automatic after /,?,n,N)"],
+      "behavior_summary": "By default, ALL strings on screen matching the last search command are highlighted (not just the found occurrence).",
+      "exact_values": {},
+      "fixture_needs": ["screen with multiple matches, verify all are highlighted", "capture exact SGR/standout sequence used"],
+      "capture_notes": "Exact terminal rendering (standout vs color) of highlight is capture-determined."
+    },
+    {
+      "feature_id": "search-not-found-message",
+      "name": "Search failure message",
+      "keys_or_flags": ["/pattern (no match)", "?pattern (no match)"],
+      "behavior_summary": "less shows a status message when a search pattern is not found in the file.",
+      "exact_values": {"message_text": "not documented in man page"},
+      "fixture_needs": ["/ for a pattern guaranteed absent", "? for a pattern guaranteed absent"],
+      "capture_notes": "Literal message text is fully capture-determined; man page never states it."
+    },
+    {
+      "feature_id": "opt-line-numbers-N",
+      "name": "-N / --LINE-NUMBERS (line numbers)",
+      "keys_or_flags": ["-N", "--LINE-NUMBERS", "-n", "--line-numbers"],
+      "behavior_summary": "-N displays a line number at the start of every line; -n (default) suppresses them.",
+      "exact_values": {"line_num_field_min_width_default": 7},
+      "fixture_needs": ["-N on multi-line file", "line numbers vs long-line wrap interaction"],
+      "capture_notes": "Field width default of 7 is from --line-num-width doc; confirm actual left-padding format."
+    },
+    {
+      "feature_id": "opt-chop-long-lines-S",
+      "name": "-S / --chop-long-lines",
+      "keys_or_flags": ["-S", "--chop-long-lines"],
+      "behavior_summary": "Truncates lines longer than the screen width instead of wrapping; default (no -S) wraps long lines onto the next display line.",
+      "exact_values": {},
+      "fixture_needs": ["line longer than terminal width, with and without -S", "RIGHT-ARROW reveal of chopped portion"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "opt-raw-control-chars-R",
+      "name": "-R / --RAW-CONTROL-CHARS (ANSI passthrough)",
+      "keys_or_flags": ["-R", "--RAW-CONTROL-CHARS"],
+      "behavior_summary": "Passes ANSI color escape sequences (ESC[...m) and OSC 8 hyperlink sequences through raw; other control chars still use caret notation. Color resets to normal at the start of every line.",
+      "exact_values": {"ansi_end_chars_default": "m", "ansi_mid_chars_default": "0123456789:;[?!\"'#%()*+ "},
+      "fixture_needs": ["ANSI-colored input with -R", "ANSI color spanning multiple lines to confirm per-line reset", "non-color ESC sequence with -R (should not be raw)"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "default-display-formatting",
+      "name": "Default wrap / tab expansion / control-char caret notation",
+      "keys_or_flags": ["(defaults, no flag)"],
+      "behavior_summary": "Default: long lines wrap to next display line; tabs expand to 8-column stops; control characters shown in caret notation (e.g. ^A) or hex-in-angle-brackets fallback (LESSBINFMT default '*s<%02X>').",
+      "exact_values": {"tab_stop_default": 8, "lessbinfmt_default": "*s<%02X>"},
+      "fixture_needs": ["tab characters at various columns", "control chars 0x00-0x1F", "line requiring wrap at exact terminal width boundary"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "multifile-next-prev",
+      "name": ":n / :p (next/previous file)",
+      "keys_or_flags": [":n", ":p"],
+      "behavior_summary": ":n examines the next file from the command-line list (or N-th next); :p examines the previous file (or N-th previous).",
+      "exact_values": {},
+      "fixture_needs": [":n at last file (error/no-op behavior)", ":p at first file (error/no-op behavior)", "N:n / N:p with count"],
+      "capture_notes": "Exact message/behavior at list boundaries is capture-determined (man page doesn't state it)."
+    },
+    {
+      "feature_id": "multifile-prompt-indicator",
+      "name": "'(file N of M)' prompt indicator",
+      "keys_or_flags": ["(automatic in prompt when >1 file open)"],
+      "behavior_summary": "Prompt escape '?m(%T %i of %m).' shows '(file N of M)' whenever more than one input file is open; %T is 'file' unless using -t tags mode.",
+      "exact_values": {},
+      "fixture_needs": ["2-file and 3-file sessions, capture literal prompt text at each position"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "exit-commands",
+      "name": "Exit commands",
+      "keys_or_flags": ["q", "Q", ":q", ":Q", "ZZ"],
+      "behavior_summary": "All exit less.",
+      "exact_values": {},
+      "fixture_needs": ["each of the 5 forms individually"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "exit-codes",
+      "name": "Exit status codes",
+      "keys_or_flags": ["(process exit code)"],
+      "behavior_summary": "Only documented value is -K/--quit-on-intr producing exit code 2 on interrupt. Normal quit (q/Q/:q/:Q/ZZ) exit code is not documented.",
+      "exact_values": {"quit_on_intr_exit_code": 2, "normal_quit_exit_code": "not documented, assumed 0 pending capture"},
+      "fixture_needs": ["echo $? after q/Q/ZZ", "echo $? after -K + ^C", "exit code after file-not-found error"],
+      "capture_notes": "Normal-quit and error-path exit codes are fully capture-determined."
+    },
+    {
+      "feature_id": "prompt-initial-filename",
+      "name": "Initial-screen filename display",
+      "keys_or_flags": ["(automatic, first prompt of a file)"],
+      "behavior_summary": "Prompt escape '?n?f%f.' shows the filename only on the first prompt shown for a newly opened file.",
+      "exact_values": {},
+      "fixture_needs": ["first screen of a freshly opened file, capture exact prompt line text/position"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "prompt-short-colon",
+      "name": "Default short ':' prompt",
+      "keys_or_flags": ["(default interactive prompt)"],
+      "behavior_summary": "Default prompt format: '?n?f%f .?m(%T %i of %m) ..?e(END) ?x- Next\\: %x..%t'.",
+      "exact_values": {"format_string": "?n?f%f .?m(%T %i of %m) ..?e(END) ?x- Next\\: %x..%t"},
+      "fixture_needs": ["mid-file prompt (should render as bare ':')", "prompt at various file/line states"],
+      "capture_notes": "Whether the prompt line uses reverse video/standout by default is not documented; capture-determined."
+    },
+    {
+      "feature_id": "prompt-end-marker",
+      "name": "'(END)' marker at end-of-file",
+      "keys_or_flags": ["(automatic at EOF)"],
+      "behavior_summary": "Prompt escape '?e(END).' displays literal '(END)' when the display has reached end-of-file.",
+      "exact_values": {"marker_text": "(END)"},
+      "fixture_needs": ["scroll to EOF and capture prompt line"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "prompt-byte-percent-rules",
+      "name": "Byte offset / percent-into-file display rules",
+      "keys_or_flags": ["%b", "%p", "%P", "%B", "-m/-M prompts"],
+      "behavior_summary": "Medium/long prompts include byte offset and/or percent-into-file, computed from the top/middle/bottom/target line depending on the escape's suffix character.",
+      "exact_values": {"medium_prompt_format": "?n?f%f .?m(%T %i of %m) ..?e(END) ?x- Next\\: %x.:?pB%pB\\%:byte %bB?s/%s...%t", "long_prompt_format": "?f%f .?n?m(%T %i of %m) ..?ltlines %lt-%lb?L/%L. :byte %bB?s/%s. .?e(END) ?x- Next\\: %x.:?pB%pB\\%..%t"},
+      "fixture_needs": ["-m and -M sessions across several scroll positions, capture literal byte/percent numbers vs actual file offsets"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "prompt-error-bell",
+      "name": "Error message display + bell behavior",
+      "keys_or_flags": ["-q", "-Q", "(default: bell on)"],
+      "behavior_summary": "less rings the terminal bell by default on errors (e.g. scroll past EOF/BOF, invalid key); -q silences only the EOF/BOF-scroll bell, -Q silences all bells (visual bell substituted if available).",
+      "exact_values": {},
+      "fixture_needs": ["trigger scroll-past-EOF with default/−q/−Q", "trigger invalid-key error, capture message text"],
+      "capture_notes": "Exact error message strings are capture-determined; only the bell-ringing rule is documented."
+    },
+    {
+      "feature_id": "terminal-resize-redraw",
+      "name": "Redraw on terminal resize",
+      "keys_or_flags": ["(automatic on SIGWINCH/resize)"],
+      "behavior_summary": "Default window size (screen height, or screen-height-minus-offset via -z-N) auto-adjusts on resize; fractional -j/-# values are recalculated on resize; LESS_LINES/LESS_COLUMNS can override detected size and force full repaint on every movement.",
+      "exact_values": {"resize_example": "24-line screen with -z-4 => 20-line window; resized to 40 lines => 36-line window"},
+      "fixture_needs": ["tmux pane resize mid-session, capture full repaint sequence", "resize while mid-file (not at top) to see recentering behavior"],
+      "capture_notes": "Procedural redraw sequence/timing is not documented; capture-determined."
+    },
+    {
+      "feature_id": "ansi-escape-handling",
+      "name": "ESC sequence handling",
+      "keys_or_flags": ["ESC-prefixed commands", "-R ANSI passthrough"],
+      "behavior_summary": "ESC is the escape-key prefix for two-character commands (e.g. ESC-v); under -R, only ANSI color (ESC[...m) and OSC 8 (ESC]8;...BEL/ESC\\\\) sequences are passed raw, governed by LESSANSIENDCHARS/LESSANSIMIDCHARS.",
+      "exact_values": {"ansi_end_chars_default": "m", "ansi_mid_chars_default": "0123456789:;[?!\"'#%()*+ "},
+      "fixture_needs": ["OSC 8 hyperlink sequence with -R", "non-standard ANSI mid/end chars via env override"],
+      "capture_notes": null
+    },
+    {
+      "feature_id": "utf8-handling",
+      "name": "UTF-8 character set handling",
+      "keys_or_flags": ["LESSCHARSET=utf-8", "(auto-detect via locale)"],
+      "behavior_summary": "UTF-8 mode is selected via LESSCHARSET/LESSCHARDEF, or auto-detected from LC_ALL/LC_CTYPE/LANG containing 'UTF-8'/'UTF8'/'utf-8'/'utf8', else via setlocale(), else defaults to utf-8. UTF-8 is the only charset supporting multi-byte characters.",
+      "exact_values": {"utf8_bin_fmt_default": "<U+%04lX> (LESSUTFBINFMT; applies to problematic VALID Unicode codepoints only)", "malformed_utf8_byte_format": "per-byte LESSBINFMT '<%02X>' e.g. '<E4><B8>' — capture-confirmed 2026-08-08; man page interpretation corrected by hub"},
+      "fixture_needs": ["multi-byte UTF-8 text file", "malformed/truncated UTF-8 sequence to trigger LESSUTFBINFMT fallback", "wide (CJK) characters for column-width handling"],
+      "capture_notes": null
+    }
+  ],
+  "deferred": [
+    "mark (m / ')",
+    "follow (F)",
+    "filter (&)",
+    "-i",
+    "-I",
+    "+cmd",
+    "help screen (h)",
+    "editor (v)",
+    "horizontal scroll (ESC-( / ESC-))",
+    "-p",
+    "-F",
+    "-X"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "feature_ids": [
+    "nav-goto-first-line",
+    "nav-goto-last-line",
+    "nav-numeric-prefix"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

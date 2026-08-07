@@ -1,0 +1,8 @@
+{
+  "feature_ids": [
+    "prompt-initial-filename",
+    "prompt-short-colon"
+  ],
+  "compare_attrs": true,
+  "expect_exit": 0
+}

@@ -1,0 +1,7 @@
+{
+  "feature_ids": [
+    "terminal-resize-redraw"
+  ],
+  "compare_attrs": false,
+  "expect_exit": 0
+}

@@ -1,0 +1,42 @@
+{
+  "id": "nav-goto-line",
+  "feature_ids": [
+    "nav-goto-first-line",
+    "nav-goto-last-line",
+    "nav-numeric-prefix"
+  ],
+  "fixture": "parity/fixtures/lines200.txt",
+  "args": [],
+  "stdin": false,
+  "steps": [
+    {
+      "capture": "initial"
+    },
+    {
+      "keys": "G",
+      "capture": "after-G-goto-last"
+    },
+    {
+      "keys": "g",
+      "capture": "after-g-goto-first"
+    },
+    {
+      "keys": "10g",
+      "capture": "after-10g-mid-file"
+    },
+    {
+      "keys": "100g",
+      "capture": "after-100g-mid-file"
+    },
+    {
+      "keys": "9999g",
+      "capture": "after-9999g-beyond-eof-clamped"
+    },
+    {
+      "keys": "50G",
+      "capture": "after-50G-mid-file"
+    }
+  ],
+  "quit_keys": "q",
+  "expect_exit": 0
+}
