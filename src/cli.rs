@@ -4,7 +4,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "rust-less", about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668")]
+#[command(
+    name = "rust-less",
+    about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668"
+)]
 struct Cli {
     /// -N / --LINE-NUMBERS: display a line number at the start of every line.
     #[arg(short = 'N', long = "LINE-NUMBERS")]

@@ -51,7 +51,7 @@ enum KeyOutcome {
 /// count, not the content-row count (§3 item 2/8): confirmed on an even
 /// (24 -> 12) and an odd (25 -> 13) pane height.
 pub fn default_half_window(total_rows: u16) -> u64 {
-    ((total_rows as u64) + 1) / 2
+    (total_rows as u64).div_ceil(2)
 }
 
 pub struct App {
@@ -72,11 +72,15 @@ pub struct App {
 impl App {
     pub fn new(opts: Options) -> Self {
         let files: Vec<FileEntry> = if opts.files.is_empty() {
-            vec![FileEntry { buffer: Buffer::new(Source::Stdin) }]
+            vec![FileEntry {
+                buffer: Buffer::new(Source::Stdin),
+            }]
         } else {
             opts.files
                 .iter()
-                .map(|p: &PathBuf| FileEntry { buffer: Buffer::new(Source::File(p.clone())) })
+                .map(|p: &PathBuf| FileEntry {
+                    buffer: Buffer::new(Source::File(p.clone())),
+                })
                 .collect()
         };
         App {
@@ -105,7 +109,8 @@ impl App {
     }
 
     fn half_window(&self) -> u64 {
-        self.sticky_half.unwrap_or_else(|| default_half_window(self.height))
+        self.sticky_half
+            .unwrap_or_else(|| default_half_window(self.height))
     }
 
     fn render_opts(&self) -> RenderOpts {
@@ -180,7 +185,12 @@ impl App {
     /// a `pending_message` (any key dismisses it; a non-Enter key is also
     /// fed through as the start of the next command — see the inline note
     /// below), decodes and applies the resulting action, and redraws.
-    fn handle_key<W: Write>(&mut self, out: &mut W, code: KeyCode, modifiers: KeyModifiers) -> io::Result<KeyOutcome> {
+    fn handle_key<W: Write>(
+        &mut self,
+        out: &mut W,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> io::Result<KeyOutcome> {
         if self.pending_message.is_some() {
             // Any key dismisses a "(press RETURN)" message; per
             // `nav-goto-line/after-50G-mid-file` (baseline top lands on 50
@@ -202,7 +212,9 @@ impl App {
             Decoded::Action(action) => {
                 let was_scroll = matches!(
                     action,
-                    Action::ScrollLines(_) | Action::ScrollWindow(_, _) | Action::ScrollHalfWindow(_, _)
+                    Action::ScrollLines(_)
+                        | Action::ScrollWindow(_, _)
+                        | Action::ScrollHalfWindow(_, _)
                 );
                 let old_top = self.top;
                 match self.apply(action) {
@@ -276,7 +288,11 @@ impl App {
                 None => {
                     let total = self.current().buffer.total_lines()?;
                     let content_rows = self.content_rows();
-                    self.top = if total > content_rows { total - content_rows + 1 } else { 1 };
+                    self.top = if total > content_rows {
+                        total - content_rows + 1
+                    } else {
+                        1
+                    };
                 }
             },
             Action::SearchInput(pattern, dir, count) => {
@@ -307,12 +323,18 @@ impl App {
     /// scroll clamps silently, unlike `g`/`G`).
     fn clamp_relative(&mut self, proposed: usize) -> Result<usize, String> {
         let content_rows = self.content_rows();
-        let lookahead = proposed.saturating_add(content_rows.saturating_sub(1)).max(1);
+        let lookahead = proposed
+            .saturating_add(content_rows.saturating_sub(1))
+            .max(1);
         let buffer = &mut self.current().buffer;
         buffer.ensure_lines_read(lookahead)?;
         if buffer.is_eof() {
             let total = buffer.lines_cached();
-            let max_top = if total > content_rows { total - content_rows + 1 } else { 1 };
+            let max_top = if total > content_rows {
+                total - content_rows + 1
+            } else {
+                1
+            };
             Ok(proposed.max(1).min(max_top))
         } else {
             Ok(proposed.max(1))
@@ -334,7 +356,13 @@ impl App {
         }
     }
 
-    fn run_search(&mut self, pattern_src: &str, dir: Direction, count: u64, fresh: bool) -> Result<(), String> {
+    fn run_search(
+        &mut self,
+        pattern_src: &str,
+        dir: Direction,
+        count: u64,
+        fresh: bool,
+    ) -> Result<(), String> {
         let pattern = Regex::new(pattern_src).map_err(|_| "Invalid pattern".to_string())?;
         self.run_search_regex(&pattern, dir, count, fresh)
     }
@@ -347,7 +375,13 @@ impl App {
     /// `search-forward-multi-match-repeat`'s chain (20 -> 80 -> 140 -> 80),
     /// which only reproduces if the repeat's start point is the previous
     /// match's line, not a re-derived window bottom.
-    fn run_search_regex(&mut self, pattern: &Regex, dir: Direction, count: u64, fresh: bool) -> Result<(), String> {
+    fn run_search_regex(
+        &mut self,
+        pattern: &Regex,
+        dir: Direction,
+        count: u64,
+        fresh: bool,
+    ) -> Result<(), String> {
         let start = if fresh {
             match dir {
                 Direction::Forward => self.top,
@@ -412,8 +446,14 @@ impl App {
         let top = self.top;
 
         let buffer = &mut self.current().buffer;
-        let win = screen::render_window(buffer, top, content_rows, &render_opts, last_search.as_ref().map(|(p, _)| p))
-            .map_err(io::Error::other)?;
+        let win = screen::render_window(
+            buffer,
+            top,
+            content_rows,
+            &render_opts,
+            last_search.as_ref().map(|(p, _)| p),
+        )
+        .map_err(io::Error::other)?;
 
         // NOT consumed here: only `apply()` retires this flag, and only once
         // the view actually moves (see its doc comment). A redraw that
@@ -427,7 +467,11 @@ impl App {
         // `blank_above` rows untouched before the content starts is enough.
         queue!(out, Clear(ClearType::All))?;
 
-        let blank_above = if short_content && is_first_draw { content_rows - win.rows.len() } else { 0 };
+        let blank_above = if short_content && is_first_draw {
+            content_rows - win.rows.len()
+        } else {
+            0
+        };
         let mut row_idx = blank_above;
         for row in &win.rows {
             queue!(out, MoveTo(0, row_idx as u16))?;
@@ -498,7 +542,8 @@ impl App {
             byte_offset,
             total_bytes,
         };
-        let (text, highlighted) = prompt::render(self.pending_message.as_deref(), mode, &ctx, width);
+        let (text, highlighted) =
+            prompt::render(self.pending_message.as_deref(), mode, &ctx, width);
         self.filename_shown = false;
         (text, highlighted)
     }
@@ -564,7 +609,11 @@ mod tests {
 
     fn temp_file(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("rust-less-cmd-test-{}-{}.txt", std::process::id(), rand_suffix()));
+        path.push(format!(
+            "rust-less-cmd-test-{}-{}.txt",
+            std::process::id(),
+            rand_suffix()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -572,7 +621,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -594,17 +646,20 @@ mod tests {
     fn rows_from_output(bytes: &[u8]) -> std::collections::BTreeMap<u16, String> {
         let s = String::from_utf8_lossy(bytes);
         let move_re = Regex::new(r"\x1b\[(\d+);(\d+)H").unwrap();
-        let mut rows = std::collections::BTreeMap::new();
+        let sgr_re = Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        let mut rows: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
         let matches: Vec<_> = move_re.captures_iter(&s).collect();
         for (i, caps) in matches.iter().enumerate() {
             let full = caps.get(0).unwrap();
             let row: u16 = caps[1].parse::<u16>().unwrap() - 1;
             let seg_start = full.end();
-            let seg_end = matches.get(i + 1).map(|m| m.get(0).unwrap().start()).unwrap_or(s.len());
+            let seg_end = matches
+                .get(i + 1)
+                .map(|m| m.get(0).unwrap().start())
+                .unwrap_or(s.len());
             let raw_segment = &s[seg_start..seg_end];
-            let sgr_re = Regex::new(r"\x1b\[[0-9;]*m").unwrap();
             let clean: String = sgr_re.replace_all(raw_segment, "").into_owned();
-            rows.entry(row).or_insert_with(String::new).push_str(&clean);
+            rows.entry(row).or_default().push_str(&clean);
         }
         rows
     }
@@ -626,7 +681,11 @@ mod tests {
         // content_rows = 23 (rows 0..22), prompt on row 23.
         // 5 content lines bottom-anchored -> blank rows 0..17, content on 18..22.
         for r in 0..18u16 {
-            assert_eq!(rows.get(&r).map(String::as_str).unwrap_or(""), "", "row {r} should be blank");
+            assert_eq!(
+                rows.get(&r).map(String::as_str).unwrap_or(""),
+                "",
+                "row {r} should be blank"
+            );
         }
         assert_eq!(rows[&18], "short file - line 1 of 5");
         assert_eq!(rows[&22], "short file - line 5 of 5");
@@ -667,7 +726,11 @@ mod tests {
         let rows = rows_from_output(&second);
 
         for r in 0..18u16 {
-            assert_eq!(rows.get(&r).map(String::as_str).unwrap_or(""), "", "row {r} should still be blank");
+            assert_eq!(
+                rows.get(&r).map(String::as_str).unwrap_or(""),
+                "",
+                "row {r} should still be blank"
+            );
         }
         assert_eq!(rows[&18], "short file - line 1 of 5");
         assert!(
@@ -709,7 +772,10 @@ mod tests {
     fn lines_fixture(total: usize) -> PathBuf {
         let mut content = String::new();
         for n in 1..=total {
-            content.push_str(&format!("{:03} line {} of {} :: plain filler content\n", n, n, total));
+            content.push_str(&format!(
+                "{:03} line {} of {} :: plain filler content\n",
+                n, n, total
+            ));
         }
         temp_file(&content)
     }
@@ -724,7 +790,10 @@ mod tests {
         app.apply(Action::ScrollLines(300)).unwrap();
         assert_eq!(app.top, 178);
         app.apply(Action::ScrollLines(1)).unwrap();
-        assert_eq!(app.top, 178, "j at EOF must be a silent no-op, not an error");
+        assert_eq!(
+            app.top, 178,
+            "j at EOF must be a silent no-op, not an error"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -735,7 +804,10 @@ mod tests {
         app.set_size(80, 24);
         let err = app.apply(Action::GotoLine(Some(9999))).unwrap_err();
         assert_eq!(err, "Cannot seek to line number 9999");
-        assert_eq!(app.top, 1, "position must be unchanged after a failed absolute jump");
+        assert_eq!(
+            app.top, 1,
+            "position must be unchanged after a failed absolute jump"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -766,7 +838,11 @@ mod tests {
         let mut app = App::new(test_opts(vec![path.clone()]));
         app.set_size(80, 24);
         let err = app
-            .apply(Action::SearchInput("NOPE_NOT_PRESENT".to_string(), Direction::Forward, 1))
+            .apply(Action::SearchInput(
+                "NOPE_NOT_PRESENT".to_string(),
+                Direction::Forward,
+                1,
+            ))
             .unwrap_err();
         assert_eq!(err, "Pattern not found");
         assert_eq!(app.top, 1);
@@ -794,7 +870,10 @@ mod tests {
         assert_eq!(rows[&23], ":");
         let s2 = String::from_utf8_lossy(&out2);
         let prompt_part = &s2[s2.rfind("24;1H").unwrap()..];
-        assert!(!prompt_part.contains("\x1b[38;5;235m"), "bare ':' prompt must carry zero attrs");
+        assert!(
+            !prompt_part.contains("\x1b[38;5;235m"),
+            "bare ':' prompt must carry zero attrs"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -826,7 +905,10 @@ mod tests {
             let outcome = app.handle_key(&mut out, code, m).unwrap();
             assert_eq!(outcome, KeyOutcome::Continue);
         }
-        assert!(app.pending_message.is_none(), "message must be dismissed by the first non-Enter key");
+        assert!(
+            app.pending_message.is_none(),
+            "message must be dismissed by the first non-Enter key"
+        );
         let (code, m) = key('G');
         app.handle_key(&mut out, code, m).unwrap();
         assert_eq!(app.top, 50);
@@ -846,10 +928,15 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         app.pending_message = Some("Pattern not found  (press RETURN)".to_string());
         let top_before = app.top;
-        let outcome = app.handle_key(&mut out, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+        let outcome = app
+            .handle_key(&mut out, KeyCode::Enter, KeyModifiers::NONE)
+            .unwrap();
         assert_eq!(outcome, KeyOutcome::Continue);
         assert!(app.pending_message.is_none());
-        assert_eq!(app.top, top_before, "Enter must only dismiss the message, not also scroll");
+        assert_eq!(
+            app.top, top_before,
+            "Enter must only dismiss the message, not also scroll"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

@@ -53,7 +53,11 @@ enum Mode {
     EscPending,
     ZPending,
     Colon,
-    Pattern { dir: Direction, buf: String, count: u64 },
+    Pattern {
+        dir: Direction,
+        buf: String,
+        count: u64,
+    },
 }
 
 pub struct Decoder {
@@ -63,7 +67,10 @@ pub struct Decoder {
 
 impl Default for Decoder {
     fn default() -> Self {
-        Decoder { prefix: String::new(), mode: Mode::Normal }
+        Decoder {
+            prefix: String::new(),
+            mode: Mode::Normal,
+        }
     }
 }
 
@@ -116,33 +123,33 @@ impl Decoder {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         match &mut self.mode {
-            Mode::Pattern { .. } => {
-                match code {
-                    KeyCode::Enter => {
-                        let Mode::Pattern { dir, buf, count } = std::mem::replace(&mut self.mode, Mode::Normal) else {
-                            unreachable!()
-                        };
-                        return Decoded::Action(Action::SearchInput(buf, dir, count));
-                    }
-                    KeyCode::Esc => {
-                        self.mode = Mode::Normal;
-                        return Decoded::Redraw;
-                    }
-                    KeyCode::Backspace => {
-                        if let Mode::Pattern { buf, .. } = &mut self.mode {
-                            buf.pop();
-                        }
-                        return Decoded::Redraw;
-                    }
-                    KeyCode::Char(c) => {
-                        if let Mode::Pattern { buf, .. } = &mut self.mode {
-                            buf.push(c);
-                        }
-                        return Decoded::Redraw;
-                    }
-                    _ => return Decoded::Redraw,
+            Mode::Pattern { .. } => match code {
+                KeyCode::Enter => {
+                    let Mode::Pattern { dir, buf, count } =
+                        std::mem::replace(&mut self.mode, Mode::Normal)
+                    else {
+                        unreachable!()
+                    };
+                    return Decoded::Action(Action::SearchInput(buf, dir, count));
                 }
-            }
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    return Decoded::Redraw;
+                }
+                KeyCode::Backspace => {
+                    if let Mode::Pattern { buf, .. } = &mut self.mode {
+                        buf.pop();
+                    }
+                    return Decoded::Redraw;
+                }
+                KeyCode::Char(c) => {
+                    if let Mode::Pattern { buf, .. } = &mut self.mode {
+                        buf.push(c);
+                    }
+                    return Decoded::Redraw;
+                }
+                _ => return Decoded::Redraw,
+            },
             Mode::Colon => {
                 self.mode = Mode::Normal;
                 let count = self.take_count();
@@ -156,9 +163,15 @@ impl Decoder {
             Mode::EscPending => {
                 self.mode = Mode::Normal;
                 return match code {
-                    KeyCode::Char('v') => Decoded::Action(Action::ScrollWindow(self.take_optional_count(), false)),
-                    KeyCode::Char('<') => Decoded::Action(Action::GotoLine(self.take_optional_count())),
-                    KeyCode::Char('>') => Decoded::Action(Action::GotoLast(self.take_optional_count())),
+                    KeyCode::Char('v') => {
+                        Decoded::Action(Action::ScrollWindow(self.take_optional_count(), false))
+                    }
+                    KeyCode::Char('<') => {
+                        Decoded::Action(Action::GotoLine(self.take_optional_count()))
+                    }
+                    KeyCode::Char('>') => {
+                        Decoded::Action(Action::GotoLast(self.take_optional_count()))
+                    }
                     _ => Decoded::Redraw,
                 };
             }
@@ -172,49 +185,56 @@ impl Decoder {
             Mode::Normal => {}
         }
 
-        if let KeyCode::Char(c) = code {
-            if c.is_ascii_digit() && !ctrl {
-                self.prefix.push(c);
-                return Decoded::Redraw;
-            }
+        if let KeyCode::Char(c) = code
+            && c.is_ascii_digit()
+            && !ctrl
+        {
+            self.prefix.push(c);
+            return Decoded::Redraw;
         }
 
-        if ctrl {
-            if let KeyCode::Char(c) = code {
-                let action = match c {
-                    'n' | 'e' | 'j' => Some(Action::ScrollLines(self.take_count() as i64)),
-                    'y' | 'p' | 'k' => Some(Action::ScrollLines(-(self.take_count() as i64))),
-                    'v' | 'f' => Some(Action::ScrollWindow(self.take_optional_count(), true)),
-                    'b' => Some(Action::ScrollWindow(self.take_optional_count(), false)),
-                    'd' => Some(Action::ScrollHalfWindow(self.take_optional_count(), true)),
-                    'u' => Some(Action::ScrollHalfWindow(self.take_optional_count(), false)),
-                    _ => None,
-                };
-                return match action {
-                    Some(a) => Decoded::Action(a),
-                    None => {
-                        self.prefix.clear();
-                        Decoded::Nothing
-                    }
-                };
-            }
+        if ctrl && let KeyCode::Char(c) = code {
+            let action = match c {
+                'n' | 'e' | 'j' => Some(Action::ScrollLines(self.take_count() as i64)),
+                'y' | 'p' | 'k' => Some(Action::ScrollLines(-(self.take_count() as i64))),
+                'v' | 'f' => Some(Action::ScrollWindow(self.take_optional_count(), true)),
+                'b' => Some(Action::ScrollWindow(self.take_optional_count(), false)),
+                'd' => Some(Action::ScrollHalfWindow(self.take_optional_count(), true)),
+                'u' => Some(Action::ScrollHalfWindow(self.take_optional_count(), false)),
+                _ => None,
+            };
+            return match action {
+                Some(a) => Decoded::Action(a),
+                None => {
+                    self.prefix.clear();
+                    Decoded::Nothing
+                }
+            };
         }
 
         let result = match code {
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => {
                 Some(Action::ScrollLines(self.take_count() as i64))
             }
-            KeyCode::Char('k') | KeyCode::Up => Some(Action::ScrollLines(-(self.take_count() as i64))),
+            KeyCode::Char('k') | KeyCode::Up => {
+                Some(Action::ScrollLines(-(self.take_count() as i64)))
+            }
             KeyCode::Char('e') => Some(Action::ScrollLines(self.take_count() as i64)),
             KeyCode::Char('y') => Some(Action::ScrollLines(-(self.take_count() as i64))),
             KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Char('f') => {
                 Some(Action::ScrollWindow(self.take_optional_count(), true))
             }
-            KeyCode::Char('b') | KeyCode::PageUp => Some(Action::ScrollWindow(self.take_optional_count(), false)),
+            KeyCode::Char('b') | KeyCode::PageUp => {
+                Some(Action::ScrollWindow(self.take_optional_count(), false))
+            }
             KeyCode::Char('d') => Some(Action::ScrollHalfWindow(self.take_optional_count(), true)),
             KeyCode::Char('u') => Some(Action::ScrollHalfWindow(self.take_optional_count(), false)),
-            KeyCode::Char('g') | KeyCode::Char('<') => Some(Action::GotoLine(self.take_optional_count())),
-            KeyCode::Char('G') | KeyCode::Char('>') => Some(Action::GotoLast(self.take_optional_count())),
+            KeyCode::Char('g') | KeyCode::Char('<') => {
+                Some(Action::GotoLine(self.take_optional_count()))
+            }
+            KeyCode::Char('G') | KeyCode::Char('>') => {
+                Some(Action::GotoLast(self.take_optional_count()))
+            }
             KeyCode::Char('n') => Some(Action::RepeatSearch(self.take_count())),
             KeyCode::Char('N') => Some(Action::RepeatSearchReverse(self.take_count())),
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
@@ -227,12 +247,20 @@ impl Decoder {
         match code {
             KeyCode::Char('/') => {
                 let count = self.take_count();
-                self.mode = Mode::Pattern { dir: Direction::Forward, buf: String::new(), count };
+                self.mode = Mode::Pattern {
+                    dir: Direction::Forward,
+                    buf: String::new(),
+                    count,
+                };
                 Decoded::Redraw
             }
             KeyCode::Char('?') => {
                 let count = self.take_count();
-                self.mode = Mode::Pattern { dir: Direction::Backward, buf: String::new(), count };
+                self.mode = Mode::Pattern {
+                    dir: Direction::Backward,
+                    buf: String::new(),
+                    count,
+                };
                 Decoded::Redraw
             }
             KeyCode::Char(':') => {
@@ -296,9 +324,15 @@ mod tests {
             d.feed(c, m);
         }
         let (c, m) = key('d');
-        assert_eq!(d.feed(c, m), Decoded::Action(Action::ScrollHalfWindow(Some(5), true)));
+        assert_eq!(
+            d.feed(c, m),
+            Decoded::Action(Action::ScrollHalfWindow(Some(5), true))
+        );
         let (c, m) = key('u');
-        assert_eq!(d.feed(c, m), Decoded::Action(Action::ScrollHalfWindow(None, false)));
+        assert_eq!(
+            d.feed(c, m),
+            Decoded::Action(Action::ScrollHalfWindow(None, false))
+        );
     }
 
     #[test]
@@ -318,7 +352,10 @@ mod tests {
             d.feed(c, m);
         }
         let (c, m) = key('g');
-        assert_eq!(d.feed(c, m), Decoded::Action(Action::GotoLine(Some(999999999999))));
+        assert_eq!(
+            d.feed(c, m),
+            Decoded::Action(Action::GotoLine(Some(999999999999)))
+        );
     }
 
     #[test]
@@ -363,15 +400,25 @@ mod tests {
         let (c, m) = (KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             d.feed(c, m),
-            Decoded::Action(Action::SearchInput("SOLO_NEEDLE".to_string(), Direction::Forward, 1))
+            Decoded::Action(Action::SearchInput(
+                "SOLO_NEEDLE".to_string(),
+                Direction::Forward,
+                1
+            ))
         );
     }
 
     #[test]
     fn arrow_and_pgup_pgdn_alias_j_k_b_f() {
         let mut d = Decoder::new();
-        assert_eq!(d.feed(KeyCode::Down, KeyModifiers::NONE), Decoded::Action(Action::ScrollLines(1)));
-        assert_eq!(d.feed(KeyCode::Up, KeyModifiers::NONE), Decoded::Action(Action::ScrollLines(-1)));
+        assert_eq!(
+            d.feed(KeyCode::Down, KeyModifiers::NONE),
+            Decoded::Action(Action::ScrollLines(1))
+        );
+        assert_eq!(
+            d.feed(KeyCode::Up, KeyModifiers::NONE),
+            Decoded::Action(Action::ScrollLines(-1))
+        );
         assert_eq!(
             d.feed(KeyCode::PageDown, KeyModifiers::NONE),
             Decoded::Action(Action::ScrollWindow(None, true))
@@ -397,6 +444,9 @@ mod tests {
             d.feed(c, m);
         }
         let (c, m) = key('f');
-        assert_eq!(d.feed(c, m), Decoded::Action(Action::ScrollWindow(Some(10), true)));
+        assert_eq!(
+            d.feed(c, m),
+            Decoded::Action(Action::ScrollWindow(Some(10), true))
+        );
     }
 }

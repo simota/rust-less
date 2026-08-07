@@ -38,7 +38,11 @@ pub fn find(
     let mut last_match = None;
     match direction {
         Direction::Forward => {
-            let mut line = if inclusive { start_line } else { start_line + 1 };
+            let mut line = if inclusive {
+                start_line
+            } else {
+                start_line + 1
+            };
             loop {
                 buffer.ensure_lines_read(line)?;
                 let Some(raw) = buffer.line(line) else { break };
@@ -65,13 +69,13 @@ pub fn find(
             };
             let mut line = start;
             while line >= 1 {
-                if let Some(raw) = buffer.line(line) {
-                    if line_matches(raw, pattern) {
-                        found += 1;
-                        last_match = Some(line);
-                        if found >= count {
-                            break;
-                        }
+                if let Some(raw) = buffer.line(line)
+                    && line_matches(raw, pattern)
+                {
+                    found += 1;
+                    last_match = Some(line);
+                    if found >= count {
+                        break;
                     }
                 }
                 if line == 1 {
@@ -101,7 +105,11 @@ mod tests {
 
     fn temp_file(contents: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("rust-less-search-test-{}-{}.txt", std::process::id(), rand_suffix()));
+        path.push(format!(
+            "rust-less-search-test-{}-{}.txt",
+            std::process::id(),
+            rand_suffix()
+        ));
         let mut f = File::create(&path).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         path
@@ -110,7 +118,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -118,9 +129,15 @@ mod tests {
         let mut s = String::new();
         for n in 1..=200 {
             if n == 20 || n == 80 || n == 140 {
-                s.push_str(&format!("{:03} line {} of 200 :: ALPHA_TOKEN filler\n", n, n));
+                s.push_str(&format!(
+                    "{:03} line {} of 200 :: ALPHA_TOKEN filler\n",
+                    n, n
+                ));
             } else {
-                s.push_str(&format!("{:03} line {} of 200 :: plain filler content\n", n, n));
+                s.push_str(&format!(
+                    "{:03} line {} of 200 :: plain filler content\n",
+                    n, n
+                ));
             }
         }
         s
@@ -143,14 +160,22 @@ mod tests {
         let mut buf = Buffer::new(Source::File(path.clone()));
         let re = Regex::new("ALPHA_TOKEN").unwrap();
 
-        let m1 = find(&mut buf, &re, Direction::Forward, 1, true, 1).unwrap().unwrap();
+        let m1 = find(&mut buf, &re, Direction::Forward, 1, true, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(m1, 20);
-        let m2 = find(&mut buf, &re, Direction::Forward, m1, false, 1).unwrap().unwrap();
+        let m2 = find(&mut buf, &re, Direction::Forward, m1, false, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(m2, 80);
-        let m3 = find(&mut buf, &re, Direction::Forward, m2, false, 1).unwrap().unwrap();
+        let m3 = find(&mut buf, &re, Direction::Forward, m2, false, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(m3, 140);
         // N reverses direction relative to the original forward search.
-        let m4 = find(&mut buf, &re, Direction::Backward, m3, false, 1).unwrap().unwrap();
+        let m4 = find(&mut buf, &re, Direction::Backward, m3, false, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(m4, 80);
         let _ = std::fs::remove_file(path);
     }

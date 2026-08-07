@@ -37,7 +37,23 @@ struct Piece {
 /// LESSANSIMIDCHARS default set: digits, `:`, `;`, `[`, `?`, `!`, `"`, `'`,
 /// `#`, `%`, `(`, `)`, `*`, `+`, space. LESSANSIENDCHARS default: `m` only.
 fn is_ansi_midchar(b: u8) -> bool {
-    b.is_ascii_digit() || matches!(b, b':' | b';' | b'[' | b'?' | b'!' | b'"' | b'\'' | b'#' | b'%' | b'(' | b')' | b'*' | b'+' | b' ')
+    b.is_ascii_digit()
+        || matches!(
+            b,
+            b':' | b';'
+                | b'['
+                | b'?'
+                | b'!'
+                | b'"'
+                | b'\''
+                | b'#'
+                | b'%'
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b' '
+        )
 }
 
 /// Scans one ESC-prefixed sequence starting at `bytes[i]` (`bytes[i] ==
@@ -93,7 +109,11 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     if b == b'\t' {
         let amount = 8 - (col % 8);
         return (
-            Piece { text: " ".repeat(amount), width: amount, reverse: false },
+            Piece {
+                text: " ".repeat(amount),
+                width: amount,
+                reverse: false,
+            },
             1,
         );
     }
@@ -104,11 +124,22 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
             return (caret_piece(ch), len);
         }
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
-        return (Piece { text: ch.to_string(), width: w, reverse: false }, len);
+        return (
+            Piece {
+                text: ch.to_string(),
+                width: w,
+                reverse: false,
+            },
+            len,
+        );
     }
     // Malformed byte: LESSBINFMT per-byte hex fallback, e.g. `<E4>`.
     (
-        Piece { text: format!("<{:02X}>", b), width: 4, reverse: true },
+        Piece {
+            text: format!("<{:02X}>", b),
+            width: 4,
+            reverse: true,
+        },
         1,
     )
 }
@@ -116,7 +147,11 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
 fn caret_piece(ch: char) -> Piece {
     let code = ch as u32 as u8;
     let printable = code ^ 0x40; // 0x00->'@', 0x01->'A', ... 0x1f->'_', 0x7f->'?'
-    Piece { text: format!("^{}", printable as char), width: 2, reverse: true }
+    Piece {
+        text: format!("^{}", printable as char),
+        width: 2,
+        reverse: true,
+    }
 }
 
 /// Decodes a single UTF-8 scalar value at the start of `bytes`, if valid.
@@ -140,7 +175,11 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
     if bytes.len() < len {
         return None;
     }
-    std::str::from_utf8(&bytes[..len]).ok()?.chars().next().map(|c| (c, len))
+    std::str::from_utf8(&bytes[..len])
+        .ok()?
+        .chars()
+        .next()
+        .map(|c| (c, len))
 }
 
 /// Renders one logical line into one or more display rows.
@@ -155,18 +194,19 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
     let mut i = 0usize;
 
     'outer: while i < bytes.len() {
-        if opts.raw_ansi && bytes[i] == 0x1b {
-            if let Some((next_i, raw)) = scan_escape(bytes, i) {
-                if let Some(seq) = raw {
-                    current.push(Piece {
-                        text: String::from_utf8_lossy(seq).into_owned(),
-                        width: 0,
-                        reverse: false,
-                    });
-                }
-                i = next_i;
-                continue;
+        if opts.raw_ansi
+            && bytes[i] == 0x1b
+            && let Some((next_i, raw)) = scan_escape(bytes, i)
+        {
+            if let Some(seq) = raw {
+                current.push(Piece {
+                    text: String::from_utf8_lossy(seq).into_owned(),
+                    width: 0,
+                    reverse: false,
+                });
             }
+            i = next_i;
+            continue;
         }
         let (piece, consumed) = decode_piece(bytes, i, line_col);
         i += consumed;
@@ -178,7 +218,11 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
                 if row_col == content_width {
                     current.pop();
                 }
-                current.push(Piece { text: ">".to_string(), width: 1, reverse: false });
+                current.push(Piece {
+                    text: ">".to_string(),
+                    width: 1,
+                    reverse: false,
+                });
                 rows.push(std::mem::take(&mut current));
                 break 'outer;
             }
@@ -212,15 +256,24 @@ fn finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> Displa
         // terminal's SGR state otherwise persists across them regardless of
         // wrap vs. logical-line boundaries — reset unconditionally at the
         // start of every row (harmless no-op when already default).
-        spans.push(Span { text: "\x1b[0m".to_string(), reverse: false });
+        spans.push(Span {
+            text: "\x1b[0m".to_string(),
+            reverse: false,
+        });
     }
     if opts.line_numbers {
-        spans.push(Span { text: format!("{:>7} ", line_no), reverse: false });
+        spans.push(Span {
+            text: format!("{:>7} ", line_no),
+            reverse: false,
+        });
     }
     for piece in pieces {
         match spans.last_mut() {
             Some(last) if last.reverse == piece.reverse => last.text.push_str(&piece.text),
-            _ => spans.push(Span { text: piece.text, reverse: piece.reverse }),
+            _ => spans.push(Span {
+                text: piece.text,
+                reverse: piece.reverse,
+            }),
         }
     }
     spans
@@ -243,15 +296,24 @@ fn highlight_matches(row: DisplayRow, pattern: &Regex) -> DisplayRow {
         let mut last = 0;
         for m in pattern.find_iter(&span.text) {
             if m.start() > last {
-                out.push(Span { text: span.text[last..m.start()].to_string(), reverse: false });
+                out.push(Span {
+                    text: span.text[last..m.start()].to_string(),
+                    reverse: false,
+                });
             }
             if m.end() > m.start() {
-                out.push(Span { text: span.text[m.start()..m.end()].to_string(), reverse: true });
+                out.push(Span {
+                    text: span.text[m.start()..m.end()].to_string(),
+                    reverse: true,
+                });
             }
             last = m.end();
         }
         if last < span.text.len() {
-            out.push(Span { text: span.text[last..].to_string(), reverse: false });
+            out.push(Span {
+                text: span.text[last..].to_string(),
+                reverse: false,
+            });
         }
     }
     out
@@ -292,7 +354,10 @@ pub fn render_window(
         };
         let mut line_rows = render_logical_line(raw, line_no, opts);
         if let Some(pat) = highlight {
-            line_rows = line_rows.into_iter().map(|r| highlight_matches(r, pat)).collect();
+            line_rows = line_rows
+                .into_iter()
+                .map(|r| highlight_matches(r, pat))
+                .collect();
         }
         for r in line_rows {
             row_lines.push(line_no);
@@ -309,7 +374,10 @@ pub fn render_window(
         row_lines.truncate(content_rows);
         row_lines.last().copied().unwrap_or(top)
     } else {
-        row_lines.last().copied().unwrap_or(top.saturating_sub(1).max(1))
+        row_lines
+            .last()
+            .copied()
+            .unwrap_or(top.saturating_sub(1).max(1))
     };
 
     // The exact-fit case (the window filled to precisely `content_rows`
@@ -325,7 +393,11 @@ pub fn render_window(
         }
     }
 
-    Ok(WindowRender { rows, bottom_line, at_eof })
+    Ok(WindowRender {
+        rows,
+        bottom_line,
+        at_eof,
+    })
 }
 
 #[cfg(test)]
@@ -333,7 +405,12 @@ mod tests {
     use super::*;
 
     fn opts(width: usize) -> RenderOpts {
-        RenderOpts { width, line_numbers: false, chop: false, raw_ansi: false }
+        RenderOpts {
+            width,
+            line_numbers: false,
+            chop: false,
+            raw_ansi: false,
+        }
     }
 
     fn text_only(row: &DisplayRow) -> String {
@@ -396,7 +473,7 @@ mod tests {
 
     #[test]
     fn cjk_wraps_by_display_width_not_char_count() {
-        let line: String = std::iter::repeat('\u{6f22}').take(45).collect();
+        let line: String = "\u{6f22}".repeat(45);
         let rows = render_logical_line(line.as_bytes(), 1, &opts(80));
         assert_eq!(rows.len(), 2);
         assert_eq!(text_only(&rows[0]).chars().count(), 40);
@@ -452,7 +529,11 @@ mod tests {
         o.raw_ansi = true;
         let content = format!("\x1b[31m{}", "a".repeat(10));
         let rows = render_logical_line(content.as_bytes(), 1, &o);
-        assert_eq!(rows.len(), 1, "escape sequence must not count toward the 10-col wrap width");
+        assert_eq!(
+            rows.len(),
+            1,
+            "escape sequence must not count toward the 10-col wrap width"
+        );
     }
 
     #[test]
@@ -460,13 +541,21 @@ mod tests {
         let re = Regex::new("[cb]at").unwrap();
         let rows = render_logical_line(b"regex sample cat bat hat sat mat", 1, &opts(80));
         let highlighted = highlight_matches(rows[0].clone(), &re);
-        let reversed: Vec<&str> = highlighted.iter().filter(|s| s.reverse).map(|s| s.text.as_str()).collect();
+        let reversed: Vec<&str> = highlighted
+            .iter()
+            .filter(|s| s.reverse)
+            .map(|s| s.text.as_str())
+            .collect();
         assert_eq!(reversed, vec!["cat", "bat"]);
     }
 
     fn temp_file(contents: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("rust-less-screen-test-{}-{}.txt", std::process::id(), rand_suffix()));
+        path.push(format!(
+            "rust-less-screen-test-{}-{}.txt",
+            std::process::id(),
+            rand_suffix()
+        ));
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -474,7 +563,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -494,7 +586,10 @@ mod tests {
         let win = render_window(&mut buf, 178, 23, &opts(80), None).unwrap();
         assert_eq!(win.rows.len(), 23);
         assert_eq!(win.bottom_line, 200);
-        assert!(win.at_eof, "200 lines starting at top=178 with 23 content rows exactly reaches EOF");
+        assert!(
+            win.at_eof,
+            "200 lines starting at top=178 with 23 content rows exactly reaches EOF"
+        );
         let _ = std::fs::remove_file(path);
     }
 

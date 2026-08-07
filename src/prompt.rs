@@ -40,7 +40,12 @@ pub struct PromptContext<'a> {
 /// left-truncated to `width` if needed. `highlighted` is false only for the
 /// bare `:` fallback (`prompt-initial-filename`: the plain colon prompt
 /// carries zero attrs; every other row shown here does).
-pub fn render(pending: Option<&str>, mode: Mode, ctx: &PromptContext, width: usize) -> (String, bool) {
+pub fn render(
+    pending: Option<&str>,
+    mode: Mode,
+    ctx: &PromptContext,
+    width: usize,
+) -> (String, bool) {
     let (text, highlighted) = if let Some(msg) = pending {
         (msg.to_string(), true)
     } else {
@@ -91,7 +96,10 @@ fn build_segments(mode: Mode, ctx: &PromptContext) -> Vec<String> {
                 parts.push(format!("(file {} of {})", ctx.file_index, ctx.file_count));
             }
             if let Some(total) = ctx.total_lines {
-                parts.push(format!("lines {}-{}/{}", ctx.top_line, ctx.bottom_line, total));
+                parts.push(format!(
+                    "lines {}-{}/{}",
+                    ctx.top_line, ctx.bottom_line, total
+                ));
             }
             if ctx.at_eof {
                 parts.push("(END)".to_string());

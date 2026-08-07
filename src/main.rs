@@ -10,7 +10,9 @@ use std::io::stdout;
 
 use command::App;
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+};
 
 fn restore_terminal() {
     let mut out = stdout();

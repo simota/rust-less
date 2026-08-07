@@ -88,7 +88,8 @@ impl Buffer {
                 raw.pop();
             }
             let prev_total = self.byte_totals.last().copied().unwrap_or(0);
-            self.byte_totals.push(prev_total + raw.len() + if had_newline { 1 } else { 0 });
+            self.byte_totals
+                .push(prev_total + raw.len() + if had_newline { 1 } else { 0 });
             self.lines.push(raw);
         }
         Ok(())
@@ -177,7 +178,11 @@ mod tests {
 
     fn temp_file(contents: &[u8]) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("rust-less-test-{}-{}.txt", std::process::id(), rand_suffix()));
+        path.push(format!(
+            "rust-less-test-{}-{}.txt",
+            std::process::id(),
+            rand_suffix()
+        ));
         let mut f = File::create(&path).unwrap();
         f.write_all(contents).unwrap();
         path
@@ -187,7 +192,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -208,7 +216,9 @@ mod tests {
 
     #[test]
     fn missing_file_errors() {
-        let mut buf = Buffer::new(Source::File(PathBuf::from("/nonexistent/does-not-exist-rust-less")));
+        let mut buf = Buffer::new(Source::File(PathBuf::from(
+            "/nonexistent/does-not-exist-rust-less",
+        )));
         assert!(buf.ensure_lines_read(1).is_err());
     }
 
