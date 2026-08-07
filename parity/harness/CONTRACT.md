@@ -1,6 +1,6 @@
 # Parity Harness Contract(capture / verify 共有 — hub 発行、変更は hub 承認必須)
 
-同一ハーネスで `/usr/bin/less`(baseline)と `target/release/rust-less`(candidate)を駆動し、
+同一ハーネスで `/usr/bin/less`(baseline)と `target/release/rless`(candidate)を駆動し、
 canonicalize 済み画面状態を差分することでパリティを証明する。オラクルは captured(black-box)。
 
 ## 実行環境(canonicalization 契約)

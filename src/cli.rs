@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rust-less",
+    name = "rless",
     about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668"
 )]
 struct Cli {

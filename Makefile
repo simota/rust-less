@@ -1,10 +1,10 @@
-# rust-less — build, test, and differential-parity verification.
+# rust-less (binary: rless) — build, test, and differential-parity verification.
 #
 # Parity targets drive tmux, which needs a Unix socket. Agent sandboxes block
 # socket creation, so those targets must run outside the sandbox (a plain
 # terminal is fine). Targets are grouped below as sandbox-safe vs tmux.
 
-BIN            := target/release/rust-less
+BIN            := target/release/rless
 REFERENCE      ?= /usr/bin/less
 SCENARIOS      := parity/scenarios
 BASELINE       := parity/baseline
@@ -67,7 +67,7 @@ clean: ## Remove build output and parity scratch dirs (baseline is kept)
 # ----------------------------------------------------------- tmux (run unsandboxed)
 
 .PHONY: parity
-parity: $(BIN) ## Verify rust-less against the captured less baseline (the ship gate)
+parity: $(BIN) ## Verify rless against the captured less baseline (the ship gate)
 	rm -rf $(TMP)/candidate
 	bash $(HARNESS)/run.sh $(BIN) $(SCENARIOS) $(TMP)/candidate
 	bash $(HARNESS)/diff.sh $(BASELINE) $(TMP)/candidate

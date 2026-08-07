@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A clean-room Rust reimplementation of the core pager behavior of less, verified by differential parity against GNU less 668"
 
+[[bin]]
+name = "rless"
+path = "src/main.rs"
+
 [dependencies]
 # `use-dev-tty`: crossterm's default (mio-based) Unix event source still
 # calls tty_fd() internally, but only this feature's poll()-based source

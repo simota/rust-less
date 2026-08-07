@@ -1,4 +1,4 @@
-# Fidelity Report — rust-less v0.1.0
+# Fidelity Report — rust-less v0.1.0 (binary: `rless`)
 
 Clean-room Rust reimplementation of the core pager behavior of GNU less 668,
 verified by **differential parity against a captured baseline** (not by assertion).
@@ -99,7 +99,7 @@ decline), search highlight SGR pair `38;5;235`/`48;5;214` with `39`/`49` reset,
 `parity/` is a re-runnable differential suite:
 `bash parity/harness/run.sh <binary> parity/scenarios <outdir>` then
 `bash parity/harness/diff.sh parity/baseline <outdir>`. Any later change to
-rust-less must re-run it; a parity break is either a recorded deliberate
+rless must re-run it; a parity break is either a recorded deliberate
 divergence or a regression. tmux requires sandbox-exempt execution
 (Unix socket creation).
 
