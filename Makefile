@@ -10,7 +10,6 @@ SCENARIOS      := parity/scenarios
 BASELINE       := parity/baseline
 HARNESS        := parity/harness
 TMP            := parity/tmp
-SOURCES        := $(wildcard src/*.rs) Cargo.toml Cargo.lock
 
 .DEFAULT_GOAL := help
 
@@ -25,11 +24,12 @@ help: ## Show this help
 build: ## Debug build
 	cargo build
 
-$(BIN): $(SOURCES)
-	cargo build --release
-
+# Always delegate to cargo rather than declaring $(BIN) a file target: cargo
+# tracks staleness (sources, features, toolchain) more accurately than a
+# hand-written prerequisite list, and skips the work itself when up to date.
 .PHONY: release
-release: $(BIN) ## Release build (what parity verifies)
+release: ## Release build (what parity verifies)
+	cargo build --release
 
 .PHONY: test
 test: ## Unit + integration tests
@@ -67,7 +67,7 @@ clean: ## Remove build output and parity scratch dirs (baseline is kept)
 # ----------------------------------------------------------- tmux (run unsandboxed)
 
 .PHONY: parity
-parity: $(BIN) ## Verify rless against the captured less baseline (the ship gate)
+parity: release ## Verify rless against the captured less baseline (the ship gate)
 	rm -rf $(TMP)/candidate
 	bash $(HARNESS)/run.sh $(BIN) $(SCENARIOS) $(TMP)/candidate
 	bash $(HARNESS)/diff.sh $(BASELINE) $(TMP)/candidate
