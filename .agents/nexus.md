@@ -58,3 +58,24 @@
 - DEC-5: 分類器がサブエージェントへの sandbox-bypass 指示を拒否 → 役割分割(エージェント=成果物作成、ハブ=tmux 実行)。拒否の意図を尊重した再構成
 - DEC-6: capture-author の EXTENSIONS.md 11 点を承認(全て追加的)。#6 の scenario 全域 attrs 比較は偽陽性リスクとして記録。APFS 大文字小文字衝突の検出・修正(39→36 に無警告減少していた)は capture-author の成果
 - DEC-7: diff は expect_exit を参照せず baseline/candidate の実測 exit code 同士を比較(差分オラクルの純粋性維持)
+
+## Run: /nexus killer (2026-08-08)
+
+### Routing Decision Record
+- Input: bare subcommand `killer` → bare-subcommand exception → CLASSIFY GATE で対象を1問確認
+- 確定スコープ: rless 本体(ページャ)にとっての差別化
+- Chain: Compete ‖ Plea ‖ Flux(claude) ‖ Flux(codex) → Spark → [moat + 反証3名] → Magi → verdict card
+- Mode: AUTORUN_FULL(verdict card は契約上 interactive)
+
+### Outcome
+NO-GO(確信度 H)。候補 Session Ledger は却下。決定記録 → docs/DECISION-001-session-ledger.md
+ユーザー選択: No 分岐(監査可能な決定記録として保存、実装せず)
+
+### Decision Ledger
+- DEC-8: codex を Flux と懐疑者2に使用しモデル単一文化を回避。初回 2 回は失敗(サンドボックスのプロセス制限 → 無効化で解決、プロンプト位置引数 → stdin 渡しで解決)。以後 codex は stdin + `-o` artifact + フォアグラウンドで実行すること
+- DEC-9: Magi が集約規則の機械適用(refuted 1 / unproven 2 → GO-with-flag)を採らず NO-GO。理由は「survived ラベルの中身が全根拠を個別反証していた」— ラベルでなく内容で重み付けた判断としてハブも支持
+- DEC-10: ハブが load-bearing な反証2件(less -o の存在、diff.py の比較実体)を独立に検証。1件目は過大主張を含むことも判明し、その区別を決定記録に明記
+
+### 生き残った空白(将来の再評価の起点)
+- 対話セッション2本のセルグリッド差分ツールは市場に不在
+- 再生器忠実度の機械検証基盤は rless のみ保有(ただし現状は開発内部資産)
