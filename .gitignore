@@ -1,3 +1,4 @@
 target/
 parity/tmp/
 __pycache__/
+.nanika/
