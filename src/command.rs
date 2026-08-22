@@ -16,9 +16,12 @@ use regex::Regex;
 use crate::buffer::{Buffer, Source};
 use crate::cli::{BellMode, Options, PromptMode};
 use crate::input::{Action, Decoded, Decoder};
+use crate::projection::ProjectionEngine;
 use crate::prompt::{self, PromptContext};
 use crate::screen::{self, RenderOpts};
 use crate::search::{self, Direction};
+use crate::selector::Query;
+use crate::sniffer::{DetectedFormat, FormatSniffer};
 
 struct FileEntry {
     buffer: Buffer,
@@ -67,6 +70,11 @@ pub struct App {
     width: u16,
     height: u16,
     decoder: Decoder,
+    pub projection: ProjectionEngine,
+    pub tabular_view: bool,
+    pub active_filter: Option<Query>,
+    pub focused_column: usize,
+    pub sniffer_checked: bool,
 }
 
 impl App {
@@ -96,6 +104,11 @@ impl App {
             width: 80,
             height: 24,
             decoder: Decoder::new(),
+            projection: ProjectionEngine::new(DetectedFormat::PlainText),
+            tabular_view: false,
+            active_filter: None,
+            focused_column: 0,
+            sniffer_checked: false,
         }
     }
 
@@ -310,6 +323,69 @@ impl App {
                 };
                 self.run_search_regex(&pattern, dir.reversed(), count, false)?;
             }
+            Action::ToggleTabular => {
+                self.tabular_view = !self.tabular_view;
+                let mode_str = if self.tabular_view {
+                    "tabular"
+                } else {
+                    "raw stream"
+                };
+                self.pending_message = Some(format!("View mode: {}", mode_str));
+            }
+            Action::ToggleExpand => {
+                self.projection.toggle_expand(self.top);
+            }
+            Action::ToggleStickyHeader => {
+                self.projection.sticky_header = !self.projection.sticky_header;
+            }
+            Action::ToggleFormat => {
+                let next = self.projection.format.next_cycle();
+                self.projection.set_format(next);
+                self.pending_message = Some(format!("Format: {}", next.name()));
+            }
+            Action::ToggleColumnMode => {
+                self.focused_column = 0;
+            }
+            Action::PrevColumn => {
+                if self.focused_column > 0 {
+                    self.focused_column -= 1;
+                }
+            }
+            Action::NextColumn => {
+                if self.focused_column + 1 < self.projection.columns.len() {
+                    self.focused_column += 1;
+                }
+            }
+            Action::PinColumn => {
+                if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
+                    col.pinned = !col.pinned;
+                    self.pending_message =
+                        Some(format!("Column '{}' pinned: {}", col.name, col.pinned));
+                }
+            }
+            Action::HideColumn => {
+                if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
+                    col.hidden = !col.hidden;
+                    self.pending_message =
+                        Some(format!("Column '{}' hidden: {}", col.name, col.hidden));
+                }
+            }
+            Action::SortColumn => {
+                if let Some(col) = self.projection.columns.get(self.focused_column) {
+                    let col_name = col.name.clone();
+                    self.pending_message = Some(format!("[SORT: {} (snapshot)]", col_name));
+                }
+            }
+            Action::FilterInput(buf) => {
+                if buf.trim().is_empty() {
+                    self.active_filter = None;
+                    self.pending_message = Some("Filter cleared".to_string());
+                } else {
+                    let q = Query::parse(&buf);
+                    self.active_filter = Some(q);
+                    self.pending_message = Some(format!("Filter: &{}", buf));
+                }
+            }
             Action::NextFile(n) => self.switch_file(n as i64)?,
             Action::PrevFile(n) => self.switch_file(-(n as i64))?,
             Action::Quit => unreachable!("handled by caller"),
@@ -363,8 +439,76 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
+        let q = Query::parse(pattern_src);
+        if let Query::Structured(_) = q {
+            return self.run_search_query(&q, dir, count, fresh);
+        }
         let pattern = Regex::new(pattern_src).map_err(|_| "Invalid pattern".to_string())?;
         self.run_search_regex(&pattern, dir, count, fresh)
+    }
+
+    fn run_search_query(
+        &mut self,
+        query: &Query,
+        dir: Direction,
+        count: u64,
+        fresh: bool,
+    ) -> Result<(), String> {
+        let start = if fresh {
+            match dir {
+                Direction::Forward => self.top,
+                Direction::Backward => self.top + self.content_rows().saturating_sub(1),
+            }
+        } else {
+            self.top
+        };
+        let format = self.projection.format;
+        let buffer = &mut self.files[self.file_index].buffer;
+        let mut found = 0u64;
+        let mut last_match = None;
+
+        match dir {
+            Direction::Forward => {
+                let mut line = if fresh { start } else { start + 1 };
+                loop {
+                    buffer.ensure_lines_read(line)?;
+                    let Some(raw) = buffer.line(line) else { break };
+                    if query.matches_line(raw, format) {
+                        found += 1;
+                        last_match = Some(line);
+                        if found >= count {
+                            break;
+                        }
+                    }
+                    line += 1;
+                }
+            }
+            Direction::Backward => {
+                buffer.ensure_full_read()?;
+                let total = buffer.lines_cached();
+                let upper = start.min(total);
+                for line in (1..=upper).rev() {
+                    let Some(raw) = buffer.line(line) else {
+                        continue;
+                    };
+                    if query.matches_line(raw, format) {
+                        found += 1;
+                        last_match = Some(line);
+                        if found >= count {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        match last_match {
+            Some(line) => {
+                self.top = line;
+                Ok(())
+            }
+            None => Err("Pattern not found".to_string()),
+        }
     }
 
     /// Fresh `/`/`?` searches start at the top or bottom of the *currently
@@ -445,44 +589,138 @@ impl App {
         let last_search = self.last_search.clone();
         let top = self.top;
 
-        let buffer = &mut self.current().buffer;
-        let win = screen::render_window(
-            buffer,
-            top,
-            content_rows,
-            &render_opts,
-            last_search.as_ref().map(|(p, _)| p),
-        )
-        .map_err(io::Error::other)?;
+        if !self.sniffer_checked {
+            let buffer = &mut self.current().buffer;
+            let _ = buffer.ensure_lines_read(16);
+            let sample_lines: Vec<_> = (1..=16)
+                .filter_map(|i| buffer.line(i).map(|s| s.to_vec()))
+                .collect();
+            let sniffer = FormatSniffer::default();
+            let detected = sniffer.sniff(&sample_lines);
+            if detected.is_structured() {
+                self.projection.set_format(detected);
+                self.projection.update_columns_from_lines(&sample_lines);
+            }
+            self.sniffer_checked = true;
+        }
 
-        // NOT consumed here: only `apply()` retires this flag, and only once
-        // the view actually moves (see its doc comment). A redraw that
-        // changes nothing (e.g. a failed EOF-clamp scroll) must keep
-        // rendering bottom-anchored.
-        let is_first_draw = !self.first_render_done;
-        let short_content = win.rows.len() < content_rows;
+        let is_structured = self.projection.format.is_structured();
+        let use_projection = is_structured
+            && (self.tabular_view
+                || !self.projection.expanded_lines.is_empty()
+                || self.active_filter.is_some());
 
         // `Clear(All)` already blanks the whole pane, so the fresh-launch
         // bottom-anchor case (§3 item 1) needs no explicit fill: leaving
         // `blank_above` rows untouched before the content starts is enough.
         queue!(out, Clear(ClearType::All))?;
 
-        let blank_above = if short_content && is_first_draw {
-            content_rows - win.rows.len()
-        } else {
-            0
-        };
-        let mut row_idx = blank_above;
-        for row in &win.rows {
-            queue!(out, MoveTo(0, row_idx as u16))?;
-            write_spans(out, row)?;
-            row_idx += 1;
-        }
-        if short_content && !is_first_draw {
-            for r in row_idx..content_rows {
-                queue!(out, MoveTo(0, r as u16), Print("~"))?;
+        let win = if use_projection {
+            let mut raw_lines = Vec::new();
+            let mut cur_line = top;
+            let format = self.projection.format;
+            let filter = self.active_filter.clone();
+            let tabular = self.tabular_view;
+            let mut at_eof = false;
+
+            {
+                let buf = &mut self.files[self.file_index].buffer;
+                while raw_lines.len() < content_rows {
+                    if buf.ensure_lines_read(cur_line).is_err() {
+                        break;
+                    }
+                    let Some(raw) = buf.line(cur_line) else {
+                        at_eof = buf.is_eof();
+                        break;
+                    };
+
+                    let matches_filter = match &filter {
+                        Some(q) => q.matches_line(raw, format),
+                        None => true,
+                    };
+
+                    if matches_filter {
+                        raw_lines.push((cur_line, raw.to_vec()));
+                    }
+                    cur_line += 1;
+                }
             }
-        }
+
+            let mut projected_rows = Vec::new();
+            let mut last_buffer_line = top;
+            for (line_idx, raw) in &raw_lines {
+                last_buffer_line = *line_idx;
+                let sub_rows = self.projection.project_line(raw, *line_idx, tabular);
+                for sub in sub_rows {
+                    projected_rows.push(sub);
+                    if projected_rows.len() >= content_rows {
+                        break;
+                    }
+                }
+            }
+
+            let mut row_idx = 0;
+            if self.projection.sticky_header && !self.projection.columns.is_empty() {
+                let mut header = String::new();
+                for col in self.projection.columns.iter().filter(|c| !c.hidden) {
+                    let padded = format!("{:width$}", col.name, width = col.width);
+                    header.push_str(&padded);
+                    header.push('│');
+                }
+                queue!(out, MoveTo(0, 0))?;
+                write_standout(out, &header)?;
+                row_idx = 1;
+            }
+
+            for row_text in projected_rows {
+                if row_idx >= content_rows {
+                    break;
+                }
+                queue!(out, MoveTo(0, row_idx as u16), Print(&row_text))?;
+                row_idx += 1;
+            }
+
+            screen::WindowRender {
+                rows: Vec::new(),
+                bottom_line: last_buffer_line,
+                at_eof,
+            }
+        } else {
+            let buffer = &mut self.current().buffer;
+            let win = screen::render_window(
+                buffer,
+                top,
+                content_rows,
+                &render_opts,
+                last_search.as_ref().map(|(p, _)| p),
+            )
+            .map_err(io::Error::other)?;
+
+            // NOT consumed here: only `apply()` retires this flag, and only once
+            // the view actually moves (see its doc comment). A redraw that
+            // changes nothing (e.g. a failed EOF-clamp scroll) must keep
+            // rendering bottom-anchored.
+            let is_first_draw = !self.first_render_done;
+            let short_content = win.rows.len() < content_rows;
+
+            let blank_above = if short_content && is_first_draw {
+                content_rows - win.rows.len()
+            } else {
+                0
+            };
+            let mut row_idx = blank_above;
+            for row in &win.rows {
+                queue!(out, MoveTo(0, row_idx as u16))?;
+                write_spans(out, row)?;
+                row_idx += 1;
+            }
+            if short_content && !is_first_draw {
+                for r in row_idx..content_rows {
+                    queue!(out, MoveTo(0, r as u16), Print("~"))?;
+                }
+            }
+            win
+        };
 
         // While a multi-key command (numeric prefix, `:x`, `/pattern`) is
         // still being typed, echo it in place of the computed prompt; not
@@ -938,5 +1176,58 @@ mod tests {
             "Enter must only dismiss the message, not also scroll"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_structured_search_and_filter() {
+        let content = [
+            r#"{"ts":"2026-08-23T00:01:00Z","level":"INFO","status":200,"service":"auth"}"#,
+            r#"{"ts":"2026-08-23T00:02:00Z","level":"DEBUG","status":200,"service":"cart"}"#,
+            r#"{"ts":"2026-08-23T00:03:00Z","level":"ERROR","status":500,"service":"payment"}"#,
+            r#"{"ts":"2026-08-23T00:04:00Z","level":"INFO","status":200,"service":"auth"}"#,
+            r#"{"ts":"2026-08-23T00:05:00Z","level":"ERROR","status":503,"service":"gateway"}"#,
+        ]
+        .join("\n");
+
+        let p = std::env::temp_dir().join(format!("test_structured_{}.jsonl", std::process::id()));
+        std::fs::write(&p, content.as_bytes()).unwrap();
+
+        let mut app = App::new(test_opts(vec![p.clone()]));
+        app.set_size(120, 24);
+        let mut out: Vec<u8> = Vec::new();
+
+        // 1. Initial draw triggers format sniffer
+        app.draw(&mut out).unwrap();
+        assert_eq!(app.projection.format, DetectedFormat::JsonLines);
+
+        // 2. Structured search: /.status >= 500 should jump directly to line 3
+        app.apply(Action::SearchInput(
+            "/.status >= 500".to_string(),
+            Direction::Forward,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(app.top, 3);
+
+        // 3. Structured filter: &.level == "ERROR"
+        app.apply(Action::FilterInput(".level == \"ERROR\"".to_string()))
+            .unwrap();
+        assert!(app.active_filter.is_some());
+
+        // 4. Tabular toggle: 'c'
+        app.apply(Action::ToggleTabular).unwrap();
+        assert!(app.tabular_view);
+
+        // 5. Expand toggle: 'z'
+        app.apply(Action::ToggleExpand).unwrap();
+        assert!(app.projection.expanded_lines.contains(&3));
+
+        // 6. Draw with projection
+        out.clear();
+        app.draw(&mut out).unwrap();
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(rendered.contains("500") || rendered.contains("payment"));
+
+        let _ = std::fs::remove_file(p);
     }
 }

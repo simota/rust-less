@@ -29,10 +29,21 @@ pub enum Action {
     GotoLine(Option<u64>),
     GotoLast(Option<u64>),
     SearchInput(String, Direction, u64),
+    FilterInput(String),
     RepeatSearch(u64),
     RepeatSearchReverse(u64),
     NextFile(u64),
     PrevFile(u64),
+    ToggleTabular,
+    ToggleExpand,
+    ToggleStickyHeader,
+    ToggleFormat,
+    ToggleColumnMode,
+    PrevColumn,
+    NextColumn,
+    PinColumn,
+    HideColumn,
+    SortColumn,
     Quit,
 }
 
@@ -57,6 +68,12 @@ enum Mode {
         dir: Direction,
         buf: String,
         count: u64,
+    },
+    FilterPattern {
+        buf: String,
+    },
+    Column {
+        col_idx: usize,
     },
 }
 
@@ -90,6 +107,8 @@ impl Decoder {
                 };
                 Some(format!("{}{}", lead, buf))
             }
+            Mode::FilterPattern { buf } => Some(format!("&{}", buf)),
+            Mode::Column { col_idx } => Some(format!("[COLUMNS: col {}]", col_idx + 1)),
             Mode::Colon => Some(format!("{}:", self.prefix)),
             Mode::Normal if !self.prefix.is_empty() => Some(self.prefix.clone()),
             _ => None,
@@ -148,6 +167,53 @@ impl Decoder {
                     }
                     return Decoded::Redraw;
                 }
+                _ => return Decoded::Redraw,
+            },
+            Mode::FilterPattern { .. } => match code {
+                KeyCode::Enter => {
+                    let Mode::FilterPattern { buf } =
+                        std::mem::replace(&mut self.mode, Mode::Normal)
+                    else {
+                        unreachable!()
+                    };
+                    return Decoded::Action(Action::FilterInput(buf));
+                }
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    return Decoded::Redraw;
+                }
+                KeyCode::Backspace => {
+                    if let Mode::FilterPattern { buf } = &mut self.mode {
+                        buf.pop();
+                    }
+                    return Decoded::Redraw;
+                }
+                KeyCode::Char(c) => {
+                    if let Mode::FilterPattern { buf } = &mut self.mode {
+                        buf.push(c);
+                    }
+                    return Decoded::Redraw;
+                }
+                _ => return Decoded::Redraw,
+            },
+            Mode::Column { col_idx } => match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => {
+                    self.mode = Mode::Normal;
+                    return Decoded::Redraw;
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    if *col_idx > 0 {
+                        *col_idx -= 1;
+                    }
+                    return Decoded::Action(Action::PrevColumn);
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    *col_idx += 1;
+                    return Decoded::Action(Action::NextColumn);
+                }
+                KeyCode::Char('p') => return Decoded::Action(Action::PinColumn),
+                KeyCode::Char('.') => return Decoded::Action(Action::HideColumn),
+                KeyCode::Char('s') => return Decoded::Action(Action::SortColumn),
                 _ => return Decoded::Redraw,
             },
             Mode::Colon => {
@@ -237,6 +303,14 @@ impl Decoder {
             }
             KeyCode::Char('n') => Some(Action::RepeatSearch(self.take_count())),
             KeyCode::Char('N') => Some(Action::RepeatSearchReverse(self.take_count())),
+            KeyCode::Char('c') => Some(Action::ToggleTabular),
+            KeyCode::Char('s') => Some(Action::ToggleFormat),
+            KeyCode::Char('z') => Some(Action::ToggleExpand),
+            KeyCode::Char('H') => Some(Action::ToggleStickyHeader),
+            KeyCode::Char('x') => {
+                self.mode = Mode::Column { col_idx: 0 };
+                Some(Action::ToggleColumnMode)
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
             _ => None,
         };
@@ -245,6 +319,10 @@ impl Decoder {
         }
 
         match code {
+            KeyCode::Char('&') => {
+                self.mode = Mode::FilterPattern { buf: String::new() };
+                Decoded::Redraw
+            }
             KeyCode::Char('/') => {
                 let count = self.take_count();
                 self.mode = Mode::Pattern {

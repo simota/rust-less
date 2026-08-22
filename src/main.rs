@@ -2,9 +2,13 @@ mod buffer;
 mod cli;
 mod command;
 mod input;
+mod projection;
 mod prompt;
 mod screen;
 mod search;
+mod selector;
+mod simd;
+mod sniffer;
 
 use std::io::stdout;
 
