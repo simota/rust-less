@@ -672,7 +672,7 @@ mod tests {
         }
         let path = temp_file(&content);
         let mut app = App::new(test_opts(vec![path.clone()]));
-        app.set_size(80, 24);
+        app.set_size(160, 24);
 
         let mut out: Vec<u8> = Vec::new();
         app.draw(&mut out).unwrap();
