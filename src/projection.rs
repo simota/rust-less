@@ -26,7 +26,7 @@ pub struct ColumnInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ViewportSpanPool {
+struct ViewportSpanPool {
     pub spans: Vec<FieldSpan>,
 }
 
@@ -61,7 +61,7 @@ pub struct ProjectionEngine {
     pub sticky_header: bool,
     /// `-R`: keep ESC (ANSI colour) in projected text instead of escaping it.
     pub raw_ansi: bool,
-    pub span_pool: ViewportSpanPool,
+    span_pool: ViewportSpanPool,
 }
 
 impl ProjectionEngine {
@@ -447,7 +447,7 @@ fn display_width(text: &str) -> usize {
     width
 }
 
-pub fn display_width_strip_ansi(bytes: &[u8]) -> usize {
+fn display_width_strip_ansi(bytes: &[u8]) -> usize {
     if let Ok(s) = std::str::from_utf8(bytes) {
         let stripped = strip_ansi_escapes(s);
         UnicodeWidthStr::width(stripped.as_str())
@@ -456,7 +456,7 @@ pub fn display_width_strip_ansi(bytes: &[u8]) -> usize {
     }
 }
 
-pub fn strip_ansi_escapes(s: &str) -> String {
+fn strip_ansi_escapes(s: &str) -> String {
     let mut clean = String::with_capacity(s.len());
     let mut in_esc = false;
     for c in s.chars() {
