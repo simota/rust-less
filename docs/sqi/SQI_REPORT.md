@@ -188,3 +188,151 @@ run, so no claim about real users is made.
 | **Mean** | | | | **4.74** |
 
 Peak RSS is 117–118 MB across the bench process, dominated by the 1M-line fixtures.
+
+## 5. After (same rubric, same instruments)
+
+### 5.1 Baseline corrections, made before re-scoring
+
+Applying the fixed criteria to the final code turned up several cases that
+were already present at baseline but had not been counted. Each one was
+counted under the **same** criterion in **both** columns, never in "after"
+alone. All of them *lower* a baseline score or leave it unchanged; none
+raise it.
+
+| Item | Missed at baseline | Before as published → corrected |
+|---|---|---|
+| DQI cohesion | 4 internal-only `pub` items in projection.rs, plus unused `FormatSniffer::new`/`SnifferConfig` generality (10 → 15) | 1 → 1 |
+| AQI contracts / integrity | The `&` filter is kept across `:n` into a file of another format (3 → 4) | 3 → 2 |
+| AQI security | Column names (file bytes) reach pin/hide/sort messages unescaped: a second path (1 → 2) | 2 → 1 |
+| VQI consistency | Re-read: the second inconsistency is the message format (`[SORT: …]`/`[COLUMNS: …]` vs `Subject: value`), not prompt styling. Count unchanged | 3 → 3 |
+| VQI whitespace | CSV header row shown twice under `H` (1 → 2) | 3 → 2 |
+| UXQI predictability | `c` on plain text claims tabular; `j` in a filtered view can move onto a hidden line and change nothing; filter kept across files (4 → 7) | 2 → 1 |
+| UXQI feedback | `H`, and `z` outside JSON lines, change nothing visible and say nothing (4 → 6) | 2 → 2 |
+
+Before corrections, the published baseline was SQI 52.83 (DQI 53.00 /
+AQI 67.00 / VQI 45.00 / UXQI 46.30). The corrected baseline below is the
+one used for the comparison.
+
+### 5.2 Measurements (after), at HEAD of this branch
+
+- M1: **102 tests passed** (+22 regression tests), 0 failed, 9 benches
+  ignored. fmt and clippy `-D warnings` are clean.
+- M2: parity **40/40**. Every capture (`.txt`, `.attrs.txt`, `exit_code`)
+  is byte-identical to the pre-change candidate run
+  (`diff -r`, excluding the timing-bearing `steps.log`).
+- M3: **17/17 tasks (100 %)**, previously 6/17.
+- M4:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Format `match` sites outside sniffer/simd (scenario S1) | 4 | 2 |
+| Per-format scanner calls outside simd | 9 | 0 (3 calls to the single `scan_fields`) |
+| Places that compute column display order (scenario S2) | 2 | 1 |
+| `allow(dead_code)` | 3 | 0 |
+| Never-read fields | 2 | 0 |
+| `pub` fields on `App` | 5 | 0 |
+| Prompt-mode enum definitions | 2 | 1 |
+| `App::draw_frame` length | 158 lines | 38 lines |
+| Projection paths writing unescaped file bytes | 2 | 0 |
+| Tests | 89 | 111 (102 run + 9 bench) |
+| Source lines | 5512 | 6183 (+671, of which ≈470 are tests) |
+
+### 5.3 Scores (before = corrected, after)
+
+| Area | Item | W | Before | After | Weighted Δ | Reason for the change (evidence) |
+|---|---|---:|---:|---:|---:|---|
+| DQI | Separation of responsibilities | 20 | 3 | 4 | +4.0 | Projection window moved to `ProjectionEngine::render_window`; `draw_frame` reduced to sniff → paint → prompt; one dispatch (`scan_fields`) and one scan (`find_by`). `command` still both runs the state machine and paints, which is 1 minor mix (E2) |
+| DQI | Cohesion | 15 | 1 | 4 | +9.0 | 15 → 1 (only the unused `SnifferConfig` generality is left) (M4, E2) |
+| DQI | Contract clarity | 15 | 2 | 4 | +6.0 | Twin enum and twin state removed; the search contract is format-aware; `SearchPattern` holds both kinds. `Query::parse` stays shape-based, with applicability decided at the call site (1) |
+| DQI | Changeability | 15 | 3 | 4 | +3.0 | S1: 4 → 2 sites (`find_field_value`, `is_delimited`) |
+| DQI | Readability | 10 | 4 | 4 | 0 | Still clean; functions over 100 lines remain (`Decoder::feed` 178, `apply_inner` 155, `scan_json_line` 140) |
+| DQI | Testability | 15 | 3 | 4 | +3.0 | Every extension feature has a test (column mode, multi-file sniffing, CSV, header order, clipping, escaping, format cycling, `render_window`) |
+| DQI | Invariants / error handling | 10 | 3 | 4 | +2.0 | Invalid filter rejected; projection I/O errors propagated. Left: the sniffer ignores a read error on purpose (it resurfaces on the draw) (1) |
+| AQI | Boundaries / dependency direction | 20 | 4 | 4 | 0 | Still no cycles; `projection → buffer, selector` mirrors `screen → buffer`; the `input → search::Direction` leak remains |
+| AQI | Layering / data flow | 15 | 3 | 4 | +3.0 | Both views now go model → render_window → paint; the binary-file prompt is still painted directly (1) |
+| AQI | Change locality | 15 | 3 | 4 | +3.0 | S1 = 2 (one off the target), S2 = 1 |
+| AQI | Contracts / integrity | 15 | 2 | 4 | +6.0 | Parity 40/40, byte-identical (E3); per-file format state; single focus state; plain-text fallback restored (T04). Left: filter kept across files (1) |
+| AQI | Fault tolerance | 10 | 4 | 4 | 0 | Unchanged; no fault-injection tests |
+| AQI | Security boundary | 10 | 1 | 5 | +8.0 | 0 unescaped paths, covered by `control_characters_are_escaped_like_the_core_view`, `tabular_and_raw_rows_never_carry_raw_control_bytes`, `column_names_in_messages_are_escaped` and probe T17 (E2) |
+| AQI | Observability / operability | 10 | 4 | 4 | 0 | Unchanged (still no CI) |
+| AQI | Scalability | 5 | 4 | 4 | 0 | Unchanged (a rare-match filter still scans per redraw) |
+| VQI | Visual hierarchy | 20 | 2 | 4 | +8.0 | Header follows display order (T13); CSV columns correct (T10). 5 would need a user check |
+| VQI | Consistency | 20 | 3 | 4 | +4.0 | Cells no longer emit their own `ESC[0m` (only with `-R`); one message style. Left: cell truncation `…` and row clipping `>` use different markers (1) |
+| VQI | Typography / legibility | 15 | 2 | 4 | +6.0 | Prompt truncation counts display width; values sized for their escaped text |
+| VQI | Layout / responsiveness | 15 | 1 | 4 | +9.0 | 0 breakages at 80x24 and 50x10 (T12, `projected_rows_never_exceed_the_terminal_width`) |
+| VQI | Interaction-state visibility | 10 | 1 | 4 | +6.0 | Focus, pinned and hidden shown as text in the column status; pin/hide feedback visible (T14–T16) |
+| VQI | Color / contrast | 10 | 4 | 4 | 0 | Unchanged: one 8.2:1 pair; search highlight in the parity-locked core is still color-only |
+| VQI | Whitespace / density | 10 | 2 | 4 | +4.0 | No phantom columns; no duplicated CSV header row |
+| UXQI | Task completion | 25 | 1.76 | 5.00 | +16.18 | 6/17 → 17/17 (M3, E2; scripted, not a user test) |
+| UXQI | Discoverability | 15 | 2 | 5 | +9.0 | (a) ✓ key reference in `--help`, (b) ✓ column mode lists its keys, (c) ✓ messages name their subject (`View mode: tabular (jsonl)`, `Column 'status' pinned`) |
+| UXQI | Predictability | 15 | 1 | 3 | +6.0 | 7 → 2 (left: `j` in a filtered view can hit a hidden line; filter kept across files) |
+| UXQI | Feedback | 10 | 2 | 5 | +6.0 | 6 → 0 |
+| UXQI | Error prevention / recovery | 10 | 3 | 4 | +2.0 | Invalid filter reported before it takes effect, and the previous filter is kept |
+| UXQI | Accessibility | 15 | 2 | 4 | +6.0 | (a) ✓ (b) ✓ (c) ✗ (color-only search highlight, parity-locked) (d) ✓ (e) ✓ |
+| UXQI | Perceived performance | 10 | 4.74 | 4.73 | −0.01 | M5 (§6); within noise |
+
+### 5.4 Summary
+
+| Index | Before (corrected) | After | Δ (points) | Verdict | Coverage | Evidence |
+|---|---:|---:|---:|---|---:|---|
+| DQI | 53.00 | 80.00 | +27.00 | Improved | 100 % | E2 (M4, tests) + E1 (code reading) |
+| AQI | 62.00 | 82.00 | +20.00 | Improved | 100 % | E3 (parity) + E2 (tests, M4) + E1 |
+| VQI | 43.00 | 80.00 | +37.00 | Improved | 100 % | E2 (tmux screens, tests) + E1 |
+| UXQI | 43.30 | 88.47 | +45.17 | Improved | 100 % | E2 (M3 scripted tasks) + E3 (M5); no user test |
+| **SQI** | **50.33** | **82.62** | **+32.29** | **Improved** | 100 % | |
+
+SQI is a rubric score, not a physical quantity. The measured facts behind it:
+parity 40/40 byte-identical, probe tasks 6 → 17 of 17, 11 reproduced
+defects fixed, and 22 new regression tests. No claim is made about real
+users' speed or satisfaction.
+
+## 6. Performance non-regression (M5)
+
+Three interleaved rounds, base (`47c8784`) and final binary alternating,
+`taskset -c 0`. The table gives the median of the three p50 values. Wall
+time on this machine moves by up to ±9 % between *builds* of the same
+code: `search_forward_regex_1m` was −9.1 % in one round of builds and
++6.5 % in another. So instruction counts (valgrind cachegrind, whole bench
+process) are given as the deterministic measure of work done.
+
+| Bench | Base | After | Wall Δ | Instructions Δ |
+|---|---:|---:|---:|---:|
+| draw_scroll_plain_x500 | 61.317 ms | 61.393 ms | +0.1 % | −1.32 % |
+| render_window_plain_x1000 | 36.029 ms | 35.929 ms | −0.3 % | −0.11 % |
+| render_window_4mb_line | 0.057 ms | 0.056 ms | −1.1 % | — |
+| tabular_draw_x200 | 18.814 ms | 18.455 ms | −1.9 % | −6.05 % |
+| filter_regex_draw_200k | 0.914 ms | 0.979 ms | +7.1 % | +0.25 % |
+| structured_search_200k | 48.376 ms | 48.395 ms | +0.0 % | +0.50 % |
+| search_forward_regex_1m | 52.092 ms | 55.492 ms | +6.5 % | +0.25 % |
+| search_backward_near_top_1m | 127.528 ms | 132.272 ms | +3.7 % | +0.00 % |
+| buffer_full_read_1m | 123.599 ms | 124.545 ms | +0.8 % | +0.00 % |
+
+No bench does measurably more work. The `search_forward` wall-time
+difference was examined further. With the original `search.rs` restored
+into the new binary, the same +8 % appears (55.6 ms vs 52.5 ms), and the
+instruction count matches the base within 0.25 %. The difference is
+therefore code placement in the rebuilt binary, not the change itself.
+Peak RSS is unchanged (117–118 MB, dominated by the 1M-line fixtures).
+An earlier intermediate build that ran +10 % instructions on
+`tabular_draw` (per-cell allocation in escaping and clipping) was fixed
+with borrowed fast paths before commit, and now runs −6 %.
+
+## 7. Residual risks and items not verified
+
+- **No real-user testing.** Task success comes from AI-scripted key
+  sequences (E2). Discovery time, error rates and satisfaction were not
+  measured.
+- **Task-set bias.** The 17 tasks were fixed before the changes, but they
+  were written after the defects had been found, so they over-sample
+  known defects. That inflates the size of the UXQI task-completion change,
+  not its direction.
+- **Parity environment.** The baseline was captured on macOS with less
+  668. Here it runs on Linux with tmux 3.4, and the harness compares rless
+  to the stored captures, so this is valid, but it was not re-confirmed on
+  macOS.
+- Still open, in both scores: `j`/`k` in a filtered view move by buffer
+  line (they can land on a hidden line); a filter is kept across files;
+  sort is not implemented (now reported as such); in the core prompt,
+  file names are printed as given (parity-locked); the search highlight is
+  color-only (parity-locked); there is no CI.
+- Bell audibility, fault injection and screen-reader output were not verified.
