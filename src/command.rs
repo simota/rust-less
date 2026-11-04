@@ -787,6 +787,19 @@ impl App {
     }
 }
 
+#[cfg(test)]
+impl App {
+    /// Benchmark hooks (src/bench.rs): drive `apply`/`draw` from outside
+    /// this module without widening their visibility for the real binary.
+    pub(crate) fn bench_apply(&mut self, action: Action) {
+        let _ = self.apply(action);
+    }
+
+    pub(crate) fn bench_draw<W: Write>(&mut self, out: &mut W) {
+        self.draw(out).unwrap();
+    }
+}
+
 fn shift(top: usize, delta: i64) -> usize {
     if delta >= 0 {
         top.saturating_add(delta as usize)

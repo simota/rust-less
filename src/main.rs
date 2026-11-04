@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod bench;
 mod buffer;
 mod cli;
 mod command;
