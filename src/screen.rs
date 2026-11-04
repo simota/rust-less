@@ -183,7 +183,18 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
 }
 
 /// Renders one logical line into one or more display rows.
-fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<DisplayRow> {
+///
+/// Rendering stops once `max_rows` rows are complete: the caller never
+/// displays more than that, and rows are produced strictly left to right,
+/// so the rows returned are exactly the first `max_rows` rows a full render
+/// would produce (a very long wrapped line no longer costs time and memory
+/// proportional to its whole length when only a window's worth is shown).
+fn render_logical_line(
+    bytes: &[u8],
+    line_no: usize,
+    opts: &RenderOpts,
+    max_rows: usize,
+) -> Vec<DisplayRow> {
     let number_prefix_width = if opts.line_numbers { 8 } else { 0 };
     let content_width = opts.width.saturating_sub(number_prefix_width).max(1);
 
@@ -228,6 +239,11 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
             }
         } else if row_col + piece.width > content_width && row_col > 0 {
             rows.push(std::mem::take(&mut current));
+            if rows.len() >= max_rows {
+                // `piece` (and everything after it) would start row
+                // `max_rows + 1`, which no caller displays.
+                break 'outer;
+            }
             row_col = 0;
         }
         row_col += piece.width;
@@ -352,7 +368,9 @@ pub fn render_window(
             at_eof = true;
             break;
         };
-        let mut line_rows = render_logical_line(raw, line_no, opts);
+        // `rows.len() < content_rows` here (the loop exits as soon as the
+        // window is full), so at least one row is always requested.
+        let mut line_rows = render_logical_line(raw, line_no, opts, content_rows - rows.len());
         if let Some(pat) = highlight {
             line_rows = line_rows
                 .into_iter()
@@ -420,7 +438,7 @@ mod tests {
     #[test]
     fn wraps_at_exact_width_no_indicator() {
         let line = "a".repeat(81);
-        let rows = render_logical_line(line.as_bytes(), 1, &opts(80));
+        let rows = render_logical_line(line.as_bytes(), 1, &opts(80), usize::MAX);
         assert_eq!(rows.len(), 2);
         assert_eq!(text_only(&rows[0]).chars().count(), 80);
         assert_eq!(text_only(&rows[1]).chars().count(), 1);
@@ -431,13 +449,13 @@ mod tests {
         let exact = "a".repeat(80);
         let mut o = opts(80);
         o.chop = true;
-        let rows = render_logical_line(exact.as_bytes(), 1, &o);
+        let rows = render_logical_line(exact.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(rows.len(), 1);
         assert!(!text_only(&rows[0]).ends_with('>'));
         assert_eq!(text_only(&rows[0]).chars().count(), 80);
 
         let over = "a".repeat(81);
-        let rows2 = render_logical_line(over.as_bytes(), 1, &o);
+        let rows2 = render_logical_line(over.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(rows2.len(), 1);
         let t = text_only(&rows2[0]);
         assert_eq!(t.chars().count(), 80);
@@ -447,7 +465,7 @@ mod tests {
 
     #[test]
     fn tab_stops_at_8_columns() {
-        let rows = render_logical_line(b"a\tb\tc\td\t", 1, &opts(80));
+        let rows = render_logical_line(b"a\tb\tc\td\t", 1, &opts(80), usize::MAX);
         let t = text_only(&rows[0]);
         assert_eq!(t.find('b'), Some(8));
         assert_eq!(t.find('c'), Some(16));
@@ -456,16 +474,21 @@ mod tests {
 
     #[test]
     fn caret_notation_for_control_chars() {
-        let rows = render_logical_line(b"ctrl:[\x01][\x02][\x07][\x1f]end", 1, &opts(80));
+        let rows = render_logical_line(
+            b"ctrl:[\x01][\x02][\x07][\x1f]end",
+            1,
+            &opts(80),
+            usize::MAX,
+        );
         let t = text_only(&rows[0]);
         assert_eq!(t, "ctrl:[^A][^B][^G][^_]end");
     }
 
     #[test]
     fn malformed_utf8_becomes_per_byte_hex() {
-        let rows = render_logical_line(b"line before\n", 1, &opts(80));
+        let rows = render_logical_line(b"line before\n", 1, &opts(80), usize::MAX);
         let _ = rows; // sanity: no panic on plain ascii
-        let rows2 = render_logical_line(&[0xE4, 0xB8], 1, &opts(80));
+        let rows2 = render_logical_line(&[0xE4, 0xB8], 1, &opts(80), usize::MAX);
         let t = text_only(&rows2[0]);
         assert_eq!(t, "<E4><B8>");
         assert!(rows2[0].iter().all(|s| s.reverse || s.text.is_empty()));
@@ -474,7 +497,7 @@ mod tests {
     #[test]
     fn cjk_wraps_by_display_width_not_char_count() {
         let line: String = "\u{6f22}".repeat(45);
-        let rows = render_logical_line(line.as_bytes(), 1, &opts(80));
+        let rows = render_logical_line(line.as_bytes(), 1, &opts(80), usize::MAX);
         assert_eq!(rows.len(), 2);
         assert_eq!(text_only(&rows[0]).chars().count(), 40);
         assert_eq!(text_only(&rows[1]).chars().count(), 5);
@@ -485,7 +508,7 @@ mod tests {
         let mut o = opts(80);
         o.line_numbers = true;
         let line = "x".repeat(150);
-        let rows = render_logical_line(line.as_bytes(), 4, &o);
+        let rows = render_logical_line(line.as_bytes(), 4, &o, usize::MAX);
         assert!(rows.len() >= 2);
         for row in &rows {
             assert!(text_only(row).starts_with("      4 "));
@@ -496,11 +519,11 @@ mod tests {
     fn raw_ansi_color_passthrough_and_malformed_sequence_dropped() {
         let mut o = opts(80);
         o.raw_ansi = true;
-        let rows = render_logical_line(b"a\x1b[31mb\x1b[0mc", 1, &o);
+        let rows = render_logical_line(b"a\x1b[31mb\x1b[0mc", 1, &o, usize::MAX);
         let t = text_only(&rows[0]);
         assert_eq!(t, "\x1b[0ma\x1b[31mb\x1b[0mc");
 
-        let rows2 = render_logical_line(b"before \x1b[2;5H after", 1, &o);
+        let rows2 = render_logical_line(b"before \x1b[2;5H after", 1, &o, usize::MAX);
         let t2 = text_only(&rows2[0]);
         assert_eq!(t2, "\x1b[0mbefore  after");
     }
@@ -514,8 +537,8 @@ mod tests {
     fn raw_ansi_row_resets_at_start_so_unclosed_color_does_not_bleed() {
         let mut o = opts(80);
         o.raw_ansi = true;
-        let unclosed = render_logical_line(b"\x1b[35mMagenta start (unclosed)", 1, &o);
-        let next = render_logical_line(b"next line after unclosed color", 2, &o);
+        let unclosed = render_logical_line(b"\x1b[35mMagenta start (unclosed)", 1, &o, usize::MAX);
+        let next = render_logical_line(b"next line after unclosed color", 2, &o, usize::MAX);
         assert!(text_only(&unclosed[0]).starts_with("\x1b[0m\x1b[35m"));
         assert!(
             text_only(&next[0]).starts_with("\x1b[0mnext"),
@@ -528,7 +551,7 @@ mod tests {
         let mut o = opts(10);
         o.raw_ansi = true;
         let content = format!("\x1b[31m{}", "a".repeat(10));
-        let rows = render_logical_line(content.as_bytes(), 1, &o);
+        let rows = render_logical_line(content.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(
             rows.len(),
             1,
@@ -539,7 +562,12 @@ mod tests {
     #[test]
     fn search_highlight_marks_all_occurrences_on_a_row() {
         let re = Regex::new("[cb]at").unwrap();
-        let rows = render_logical_line(b"regex sample cat bat hat sat mat", 1, &opts(80));
+        let rows = render_logical_line(
+            b"regex sample cat bat hat sat mat",
+            1,
+            &opts(80),
+            usize::MAX,
+        );
         let highlighted = highlight_matches(rows[0].clone(), &re);
         let reversed: Vec<&str> = highlighted
             .iter()
@@ -547,6 +575,70 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(reversed, vec!["cat", "bat"]);
+    }
+
+    /// The `max_rows` cap must yield exactly the first `max_rows` rows of
+    /// an uncapped render, for every option combination and for content
+    /// mixing wide chars, tabs, control chars, malformed UTF-8 and ANSI.
+    #[test]
+    fn capped_render_is_a_prefix_of_full_render() {
+        let mut samples: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"short".to_vec(),
+            "x".repeat(400).into_bytes(),
+            "\u{6f22}a".repeat(90).into_bytes(),
+            b"\t".repeat(50),
+        ];
+        let mut mixed = Vec::new();
+        for i in 0..60u8 {
+            mixed.extend_from_slice(b"ab\tc\x1b[31mred\x1b[0m\x01");
+            mixed.extend_from_slice("\u{6f22}".as_bytes());
+            mixed.push(0xE4);
+            mixed.push(b'0' + i % 10);
+            mixed.extend_from_slice(b"\x1b[2;5H\x1b]8;;http://x\x07L\x1b]8;;\x07");
+        }
+        samples.push(mixed);
+        for width in [1usize, 2, 7, 10, 80] {
+            for flags in 0..8u8 {
+                let o = RenderOpts {
+                    width,
+                    line_numbers: flags & 1 != 0,
+                    chop: flags & 2 != 0,
+                    raw_ansi: flags & 4 != 0,
+                };
+                for bytes in &samples {
+                    let full = render_logical_line(bytes, 7, &o, usize::MAX);
+                    for cap in [
+                        1,
+                        2,
+                        3,
+                        full.len().saturating_sub(1).max(1),
+                        full.len(),
+                        full.len() + 1,
+                    ] {
+                        let capped = render_logical_line(bytes, 7, &o, cap);
+                        let expect = &full[..cap.min(full.len())];
+                        assert_eq!(capped, expect, "width={width} flags={flags} cap={cap}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A window over one huge wrapped line still fills exactly and is not
+    /// at EOF while the same line continues below the window.
+    #[test]
+    fn window_over_long_wrapped_line_matches_uncapped_semantics() {
+        let mut content = "y".repeat(80 * 100 + 3);
+        content.push_str("\nnext\n");
+        let path = temp_file(&content);
+        let mut buf = Buffer::new(crate::buffer::Source::File(path.clone()));
+        let win = render_window(&mut buf, 1, 23, &opts(80), None).unwrap();
+        assert_eq!(win.rows.len(), 23);
+        assert_eq!(win.bottom_line, 1);
+        assert!(!win.at_eof);
+        assert!(win.rows.iter().all(|r| text_only(r) == "y".repeat(80)));
+        let _ = std::fs::remove_file(path);
     }
 
     fn temp_file(contents: &str) -> std::path::PathBuf {
