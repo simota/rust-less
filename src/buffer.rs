@@ -19,27 +19,36 @@ pub enum Source {
 /// tty still returns whatever is available, so it never waits to fill it.
 const READ_BUF_CAPACITY: usize = 64 * 1024;
 
+/// Each cached line starts at a multiple of this offset in the byte store.
+/// Word-aligned line starts keep `str::from_utf8` (run on every line by
+/// search and filters) on its aligned word-at-a-time path; unaligned starts
+/// measurably slowed line scans. Costs 3.5 padding bytes per line on
+/// average, far below the per-line allocation overhead this layout replaces.
+const LINE_ALIGN: usize = 8;
+
 /// One input file (or stdin), with lines read incrementally and cached.
 ///
-/// Cached lines live back to back in one contiguous byte store (newlines
-/// stripped) indexed by per-line end offsets, rather than one heap
-/// allocation per line: this removes a 24-byte `Vec` header, an allocator
-/// header and growth slack per line, and lets `read_until` append straight
-/// into the store with no intermediate copy.
+/// Cached lines live in one contiguous byte store (newlines stripped, each
+/// line starting at a `LINE_ALIGN` boundary) indexed by per-line end
+/// offsets, rather than one heap allocation per line: this removes a
+/// 24-byte `Vec` header, an allocator header and growth slack per line, and
+/// lets `read_until` append straight into the store with no intermediate
+/// copy.
 pub struct Buffer {
     source: Source,
     reader: Option<Box<dyn BufRead>>,
     open_error: Option<String>,
-    /// Concatenated content of every cached line, newlines excluded.
+    /// Content of every cached line, newlines excluded, with zero padding
+    /// between lines up to the next `LINE_ALIGN` boundary.
     data: Vec<u8>,
     /// `line_ends[n - 1]` is the end offset in `data` of line N (1-indexed);
-    /// line N starts at the previous line's end (or 0).
+    /// line N starts at the previous line's end rounded up to `LINE_ALIGN`
+    /// (line 1 starts at 0).
     line_ends: Vec<usize>,
-    /// Line numbers (1-indexed, ascending) that were read without a
-    /// trailing newline. In practice at most the final line of the input,
-    /// but kept exact so cumulative byte offsets (`byte_offset_through`)
-    /// stay correct even for a source that delivers data after a short read.
-    unterminated: Vec<usize>,
+    /// Cumulative byte count through the end of line N (1-indexed), including
+    /// that line's trailing newline. `byte_totals[0]` is unused (index 0
+    /// slot kept absent; use `byte_totals.get(n - 1)`).
+    byte_totals: Vec<usize>,
     eof: bool,
 }
 
@@ -51,7 +60,7 @@ impl Buffer {
             open_error: None,
             data: Vec::new(),
             line_ends: Vec::new(),
-            unterminated: Vec::new(),
+            byte_totals: Vec::new(),
             eof: false,
         }
     }
@@ -93,17 +102,19 @@ impl Buffer {
         }
         let reader = self.reader.as_mut().expect("opened above");
         while self.line_ends.len() < up_to {
-            let start = self.data.len();
+            let prev_end = self.data.len();
+            self.data.resize(line_start(prev_end), 0);
             let n = match reader.read_until(b'\n', &mut self.data) {
                 Ok(n) => n,
                 Err(e) => {
                     // read_until keeps whatever it read before failing;
                     // drop that partial line, as the per-line buffer used to.
-                    self.data.truncate(start);
+                    self.data.truncate(prev_end);
                     return Err(describe_io_error(&e));
                 }
             };
             if n == 0 {
+                self.data.truncate(prev_end);
                 self.eof = true;
                 break;
             }
@@ -111,10 +122,11 @@ impl Buffer {
             if had_newline {
                 self.data.pop();
             }
+            let len = self.data.len() - line_start(prev_end);
+            let prev_total = self.byte_totals.last().copied().unwrap_or(0);
+            self.byte_totals
+                .push(prev_total + len + if had_newline { 1 } else { 0 });
             self.line_ends.push(self.data.len());
-            if !had_newline {
-                self.unterminated.push(self.line_ends.len());
-            }
         }
         Ok(())
     }
@@ -135,7 +147,11 @@ impl Buffer {
             return None;
         }
         let end = *self.line_ends.get(n - 1)?;
-        let start = if n == 1 { 0 } else { self.line_ends[n - 2] };
+        let start = if n == 1 {
+            0
+        } else {
+            line_start(self.line_ends[n - 2])
+        };
         Some(&self.data[start..end])
     }
 
@@ -147,25 +163,19 @@ impl Buffer {
         self.eof
     }
 
-    /// Cumulative byte count through the end of line N (1-indexed),
-    /// including that line's trailing newline; for N beyond the cached
-    /// lines, the total of everything cached so far.
     pub fn byte_offset_through(&self, n: usize) -> usize {
         if n == 0 {
             return 0;
         }
-        let cached = self.line_ends.len();
-        let n = n.min(cached);
-        if n == 0 {
-            return 0;
-        }
-        let unterminated = self.unterminated.partition_point(|&l| l <= n);
-        self.line_ends[n - 1] + n - unterminated
+        self.byte_totals
+            .get(n - 1)
+            .copied()
+            .unwrap_or_else(|| self.byte_totals.last().copied().unwrap_or(0))
     }
 
     pub fn total_bytes(&mut self) -> Result<usize, String> {
         self.ensure_full_read()?;
-        Ok(self.byte_offset_through(self.line_ends.len()))
+        Ok(self.byte_totals.last().copied().unwrap_or(0))
     }
 
     pub fn total_lines(&mut self) -> Result<usize, String> {
@@ -183,9 +193,16 @@ impl Buffer {
     /// `default-tabs-and-control-chars` in parity/baseline/.
     pub fn sniff_binary(&mut self) -> Result<bool, String> {
         self.ensure_lines_read(64)?;
-        // `data` holds exactly the cached lines' bytes (newlines excluded).
+        // `data` holds the cached lines' bytes (newlines excluded) plus zero
+        // padding, which can never be ESC.
         Ok(self.data.contains(&0x1b))
     }
+}
+
+/// Offset at which the line following one that ends at `prev_end` starts.
+#[inline]
+fn line_start(prev_end: usize) -> usize {
+    prev_end.next_multiple_of(LINE_ALIGN)
 }
 
 fn describe_io_error(e: &io::Error) -> String {
@@ -304,6 +321,41 @@ mod tests {
         assert_eq!(buf.total_bytes().unwrap(), 0);
         assert_eq!(buf.line(1), None);
         assert!(!buf.sniff_binary().unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn many_lines_of_varied_length_round_trip() {
+        let mut content = Vec::new();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        let mut seed: u32 = 12345;
+        for i in 0..3000u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let len = (seed >> 16) as usize % 40;
+            let line: Vec<u8> = (0..len)
+                .map(|j| b'a' + ((i as usize + j) % 26) as u8)
+                .collect();
+            content.extend_from_slice(&line);
+            content.push(b'\n');
+            expected.push(line);
+        }
+        content.extend_from_slice(b"tail");
+        expected.push(b"tail".to_vec());
+        let path = temp_file(&content);
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        // Mix incremental and full reads.
+        buf.ensure_lines_read(17).unwrap();
+        buf.ensure_lines_read(1000).unwrap();
+        buf.ensure_full_read().unwrap();
+        assert_eq!(buf.lines_cached(), expected.len());
+        let mut total = 0;
+        for (i, line) in expected.iter().enumerate() {
+            let n = i + 1;
+            assert_eq!(buf.line(n), Some(line.as_slice()), "line {n}");
+            total += line.len() + usize::from(n < expected.len());
+            assert_eq!(buf.byte_offset_through(n), total, "offset {n}");
+        }
+        assert_eq!(buf.total_bytes().unwrap(), content.len());
         let _ = std::fs::remove_file(path);
     }
 
