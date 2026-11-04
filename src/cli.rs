@@ -3,41 +3,65 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+/// Interactive keys, shown after the options in `--help`. There is no
+/// in-pager help screen (`h` is out of scope), so this is where the keys,
+/// above all the non-less structured-view keys, can be found.
+const KEYS_HELP: &str = "\
+Keys (as in less):
+  j k Enter Down Up      forward / backward one line (N j: N lines)
+  f b Space PgDn PgUp    forward / backward one window
+  d u                    half window (N d sets the default)
+  g G                    first / last line (N g: line N)
+  /pat ?pat n N          search forward / backward, repeat, repeat reversed
+  :n :p                  next / previous file
+  q Q :q ZZ              quit
+
+Structured input (JSON lines, CSV, TSV, logfmt; detected automatically):
+  c                      table view on / off
+  s                      cycle the format (plain, jsonl, csv, tsv, logfmt)
+  z                      expand the top JSON line
+  H                      sticky header row on / off
+  &expr                  show only matching lines (empty: clear)
+  x                      column mode: h/l move, p pin, . hide, q done
+  /.field OP value       selector search, also in &: OP is == != > >= < <= =~
+                         e.g. /.status >= 500   &.level == \"ERROR\"   &.ms > 250ms";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rless",
-    about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668"
+    about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668",
+    after_help = KEYS_HELP
 )]
 struct Cli {
-    /// -N / --LINE-NUMBERS: display a line number at the start of every line.
+    /// Display a line number at the start of every line.
     #[arg(short = 'N', long = "LINE-NUMBERS")]
     line_numbers_on: bool,
 
-    /// -n / --line-numbers: suppress line numbers (default).
+    /// Suppress line numbers (default).
     #[arg(short = 'n', long = "line-numbers")]
     line_numbers_off: bool,
 
-    /// -S / --chop-long-lines: truncate long lines instead of wrapping.
+    /// Truncate long lines instead of wrapping.
     #[arg(short = 'S', long = "chop-long-lines")]
     chop_long_lines: bool,
 
-    /// -R / --RAW-CONTROL-CHARS: pass ANSI color / OSC 8 sequences through raw.
+    /// Pass ANSI color / OSC 8 sequences through raw.
     #[arg(short = 'R', long = "RAW-CONTROL-CHARS")]
     raw_control_chars: bool,
 
-    /// -m: medium (percent) prompt.
+    /// Medium (percent) prompt.
     #[arg(short = 'm')]
     medium_prompt: bool,
 
-    /// -M: long (byte/line-range/percent) prompt.
+    /// Long (byte/line-range/percent) prompt.
     #[arg(short = 'M')]
     long_prompt: bool,
 
-    /// -q / --quiet: silence the bell for EOF/BOF-scroll errors only.
+    /// Silence the bell for EOF/BOF-scroll errors only.
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// -Q / --QUIET: silence the bell entirely.
+    /// Silence the bell entirely.
     #[arg(short = 'Q', long = "QUIET")]
     very_quiet: bool,
 
