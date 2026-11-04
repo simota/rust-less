@@ -95,6 +95,16 @@ impl Query {
         Query::Regex(RegexQuery::new(input.to_string()))
     }
 
+    /// False for a plain-regex query whose pattern does not compile (such a
+    /// query matches nothing, so applying it as a filter would blank the
+    /// view without saying why).
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Query::Regex(q) => q.regex().is_some(),
+            Query::Structured(_) => true,
+        }
+    }
+
     /// Evaluates the query against a raw line and its format.
     pub fn matches_line(&self, line: &[u8], format: DetectedFormat) -> bool {
         match self {

@@ -72,9 +72,9 @@ enum Mode {
     FilterPattern {
         buf: String,
     },
-    Column {
-        col_idx: usize,
-    },
+    /// Column mode (`x`). The focused column itself lives in `command`,
+    /// which knows how many columns exist.
+    Column,
 }
 
 pub struct Decoder {
@@ -108,11 +108,15 @@ impl Decoder {
                 Some(format!("{}{}", lead, buf))
             }
             Mode::FilterPattern { buf } => Some(format!("&{}", buf)),
-            Mode::Column { col_idx } => Some(format!("[COLUMNS: col {}]", col_idx + 1)),
             Mode::Colon => Some(format!("{}:", self.prefix)),
             Mode::Normal if !self.prefix.is_empty() => Some(self.prefix.clone()),
             _ => None,
         }
+    }
+
+    /// True while column mode (`x`) is active; `command` draws its status.
+    pub fn in_column_mode(&self) -> bool {
+        self.mode == Mode::Column
     }
 
     /// Resolves the prefix to a concrete count, default `1` when absent or
@@ -142,75 +146,29 @@ impl Decoder {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         match &mut self.mode {
-            Mode::Pattern { .. } => match code {
-                KeyCode::Enter => {
-                    let Mode::Pattern { dir, buf, count } =
-                        std::mem::replace(&mut self.mode, Mode::Normal)
-                    else {
-                        unreachable!()
-                    };
-                    return Decoded::Action(Action::SearchInput(buf, dir, count));
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                    return Decoded::Redraw;
-                }
-                KeyCode::Backspace => {
-                    if let Mode::Pattern { buf, .. } = &mut self.mode {
-                        buf.pop();
+            Mode::Pattern { buf, .. } | Mode::FilterPattern { buf } => {
+                return match edit_line(buf, code) {
+                    LineEdit::Editing => Decoded::Redraw,
+                    LineEdit::Cancel => {
+                        self.mode = Mode::Normal;
+                        Decoded::Redraw
                     }
-                    return Decoded::Redraw;
-                }
-                KeyCode::Char(c) => {
-                    if let Mode::Pattern { buf, .. } = &mut self.mode {
-                        buf.push(c);
-                    }
-                    return Decoded::Redraw;
-                }
-                _ => return Decoded::Redraw,
-            },
-            Mode::FilterPattern { .. } => match code {
-                KeyCode::Enter => {
-                    let Mode::FilterPattern { buf } =
-                        std::mem::replace(&mut self.mode, Mode::Normal)
-                    else {
-                        unreachable!()
-                    };
-                    return Decoded::Action(Action::FilterInput(buf));
-                }
-                KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                    return Decoded::Redraw;
-                }
-                KeyCode::Backspace => {
-                    if let Mode::FilterPattern { buf } = &mut self.mode {
-                        buf.pop();
-                    }
-                    return Decoded::Redraw;
-                }
-                KeyCode::Char(c) => {
-                    if let Mode::FilterPattern { buf } = &mut self.mode {
-                        buf.push(c);
-                    }
-                    return Decoded::Redraw;
-                }
-                _ => return Decoded::Redraw,
-            },
-            Mode::Column { col_idx } => match code {
+                    LineEdit::Submit => match std::mem::replace(&mut self.mode, Mode::Normal) {
+                        Mode::Pattern { dir, buf, count } => {
+                            Decoded::Action(Action::SearchInput(buf, dir, count))
+                        }
+                        Mode::FilterPattern { buf } => Decoded::Action(Action::FilterInput(buf)),
+                        _ => unreachable!("matched a text-entry mode above"),
+                    },
+                };
+            }
+            Mode::Column => match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => {
                     self.mode = Mode::Normal;
                     return Decoded::Redraw;
                 }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    if *col_idx > 0 {
-                        *col_idx -= 1;
-                    }
-                    return Decoded::Action(Action::PrevColumn);
-                }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    *col_idx += 1;
-                    return Decoded::Action(Action::NextColumn);
-                }
+                KeyCode::Char('h') | KeyCode::Left => return Decoded::Action(Action::PrevColumn),
+                KeyCode::Char('l') | KeyCode::Right => return Decoded::Action(Action::NextColumn),
                 KeyCode::Char('p') => return Decoded::Action(Action::PinColumn),
                 KeyCode::Char('.') => return Decoded::Action(Action::HideColumn),
                 KeyCode::Char('s') => return Decoded::Action(Action::SortColumn),
@@ -308,7 +266,7 @@ impl Decoder {
             KeyCode::Char('z') => Some(Action::ToggleExpand),
             KeyCode::Char('H') => Some(Action::ToggleStickyHeader),
             KeyCode::Char('x') => {
-                self.mode = Mode::Column { col_idx: 0 };
+                self.mode = Mode::Column;
                 Some(Action::ToggleColumnMode)
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
@@ -363,6 +321,28 @@ impl Decoder {
             }
         }
     }
+}
+
+enum LineEdit {
+    Editing,
+    Submit,
+    Cancel,
+}
+
+/// Shared line editing for the `/`, `?` and `&` prompts: Enter submits,
+/// Esc cancels, Backspace deletes, characters append, other keys are
+/// ignored.
+fn edit_line(buf: &mut String, code: KeyCode) -> LineEdit {
+    match code {
+        KeyCode::Enter => return LineEdit::Submit,
+        KeyCode::Esc => return LineEdit::Cancel,
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => buf.push(c),
+        _ => {}
+    }
+    LineEdit::Editing
 }
 
 #[cfg(test)]
@@ -526,5 +506,44 @@ mod tests {
             d.feed(c, m),
             Decoded::Action(Action::ScrollWindow(Some(10), true))
         );
+    }
+
+    #[test]
+    fn column_mode_emits_column_actions_until_q() {
+        let mut d = Decoder::new();
+        let (c, m) = key('x');
+        assert_eq!(d.feed(c, m), Decoded::Action(Action::ToggleColumnMode));
+        assert!(d.in_column_mode());
+        assert_eq!(d.preview(), None, "command draws the column status");
+        assert_eq!(
+            d.feed(KeyCode::Right, KeyModifiers::NONE),
+            Decoded::Action(Action::NextColumn)
+        );
+        let (c, m) = key('h');
+        assert_eq!(d.feed(c, m), Decoded::Action(Action::PrevColumn));
+        let (c, m) = key('q');
+        assert_eq!(d.feed(c, m), Decoded::Redraw);
+        assert!(!d.in_column_mode());
+        let (c, m) = key('q');
+        assert_eq!(d.feed(c, m), Decoded::Action(Action::Quit));
+    }
+
+    #[test]
+    fn filter_prompt_edits_like_the_search_prompt() {
+        let mut d = Decoder::new();
+        for ch in "&ab".chars() {
+            let (c, m) = key(ch);
+            d.feed(c, m);
+        }
+        d.feed(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(d.preview(), Some("&a".to_string()));
+        assert_eq!(
+            d.feed(KeyCode::Enter, KeyModifiers::NONE),
+            Decoded::Action(Action::FilterInput("a".to_string()))
+        );
+        let (c, m) = key('/');
+        d.feed(c, m);
+        assert_eq!(d.feed(KeyCode::Esc, KeyModifiers::NONE), Decoded::Redraw);
+        assert_eq!(d.preview(), None, "Esc cancels the prompt");
     }
 }
