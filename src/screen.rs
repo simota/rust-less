@@ -28,10 +28,41 @@ pub struct RenderOpts {
 
 /// One content-producing unit inside a display row, before spans are
 /// coalesced by reverse/non-reverse runs.
-struct Piece {
-    text: String,
+struct Piece<'a> {
+    text: PieceText<'a>,
     width: usize,
     reverse: bool,
+}
+
+/// A piece's text, kept allocation-free for every common case (a character
+/// borrowed from the line, a tab's spaces, a short caret/hex token); only a
+/// raw escape sequence holding invalid UTF-8 needs an owned lossy copy.
+/// Building one `String` per character used to make the allocator the
+/// dominant cost of rendering.
+enum PieceText<'a> {
+    Borrowed(&'a str),
+    Spaces(usize),
+    Inline([u8; 4], u8),
+    Owned(String),
+}
+
+impl PieceText<'_> {
+    fn inline(s: &str) -> Self {
+        let mut buf = [0u8; 4];
+        buf[..s.len()].copy_from_slice(s.as_bytes());
+        PieceText::Inline(buf, s.len() as u8)
+    }
+
+    fn push_to(&self, out: &mut String) {
+        match self {
+            PieceText::Borrowed(s) => out.push_str(s),
+            PieceText::Spaces(n) => out.extend(std::iter::repeat_n(' ', *n)),
+            PieceText::Inline(buf, len) => out.push_str(
+                std::str::from_utf8(&buf[..*len as usize]).expect("inline text is ASCII"),
+            ),
+            PieceText::Owned(s) => out.push_str(s),
+        }
+    }
 }
 
 /// LESSANSIMIDCHARS default set: digits, `:`, `;`, `[`, `?`, `!`, `"`, `'`,
@@ -104,13 +135,13 @@ fn scan_escape(bytes: &[u8], i: usize) -> Option<(usize, Option<&[u8]>)> {
 /// display row (§ no scenario disambiguates cross-row tab stops, so the
 /// simplest, most conventional choice — one running counter per logical
 /// line — is used).
-fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
+fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece<'_>, usize) {
     let b = bytes[i];
     if b == b'\t' {
         let amount = 8 - (col % 8);
         return (
             Piece {
-                text: " ".repeat(amount),
+                text: PieceText::Spaces(amount),
                 width: amount,
                 reverse: false,
             },
@@ -119,14 +150,15 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     }
     // Try to decode one UTF-8 scalar value starting here.
     let remaining = &bytes[i..];
-    if let Some((ch, len)) = decode_utf8_char(remaining) {
+    if let Some((ch, text)) = decode_utf8_char(remaining) {
+        let len = text.len();
         if (ch as u32) < 0x20 || ch as u32 == 0x7f {
             return (caret_piece(ch), len);
         }
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
         return (
             Piece {
-                text: ch.to_string(),
+                text: PieceText::Borrowed(text),
                 width: w,
                 reverse: false,
             },
@@ -136,7 +168,7 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     // Malformed byte: LESSBINFMT per-byte hex fallback, e.g. `<E4>`.
     (
         Piece {
-            text: format!("<{:02X}>", b),
+            text: hex_token(b),
             width: 4,
             reverse: true,
         },
@@ -144,25 +176,37 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     )
 }
 
-fn caret_piece(ch: char) -> Piece {
+/// `<XX>` (uppercase hex), identical to `format!("<{:02X}>", b)`.
+fn hex_token(b: u8) -> PieceText<'static> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    PieceText::Inline(
+        [b'<', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize], b'>'],
+        4,
+    )
+}
+
+fn caret_piece(ch: char) -> Piece<'static> {
     let code = ch as u32 as u8;
     let printable = code ^ 0x40; // 0x00->'@', 0x01->'A', ... 0x1f->'_', 0x7f->'?'
     Piece {
-        text: format!("^{}", printable as char),
+        text: PieceText::Inline([b'^', printable, 0, 0], 2),
         width: 2,
         reverse: true,
     }
 }
 
-/// Decodes a single UTF-8 scalar value at the start of `bytes`, if valid.
+/// Decodes a single UTF-8 scalar value at the start of `bytes`, if valid,
+/// returning it along with its encoded text (borrowed from `bytes`).
 /// Returns `None` for a byte sequence that isn't a valid encoding start
 /// (including a truncated/incomplete multi-byte sequence) — the caller then
 /// falls back to a per-byte hex token, matching the LESSBINFMT behavior
 /// confirmed by `utf8-malformed` (not LESSUTFBINFMT's `<U+%04lX>`).
-fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, &str)> {
     let b0 = *bytes.first()?;
     let len = if b0 < 0x80 {
-        1
+        // ASCII fast path: a lone byte < 0x80 is always valid UTF-8.
+        let text = std::str::from_utf8(&bytes[..1]).expect("ASCII is valid UTF-8");
+        return Some((b0 as char, text));
     } else if b0 & 0xE0 == 0xC0 {
         2
     } else if b0 & 0xF0 == 0xE0 {
@@ -175,11 +219,8 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
     if bytes.len() < len {
         return None;
     }
-    std::str::from_utf8(&bytes[..len])
-        .ok()?
-        .chars()
-        .next()
-        .map(|c| (c, len))
+    let text = std::str::from_utf8(&bytes[..len]).ok()?;
+    text.chars().next().map(|c| (c, text))
 }
 
 /// Renders one logical line into one or more display rows.
@@ -211,7 +252,10 @@ fn render_logical_line(
         {
             if let Some(seq) = raw {
                 current.push(Piece {
-                    text: String::from_utf8_lossy(seq).into_owned(),
+                    text: match String::from_utf8_lossy(seq) {
+                        std::borrow::Cow::Borrowed(s) => PieceText::Borrowed(s),
+                        std::borrow::Cow::Owned(s) => PieceText::Owned(s),
+                    },
                     width: 0,
                     reverse: false,
                 });
@@ -230,7 +274,7 @@ fn render_logical_line(
                     current.pop();
                 }
                 current.push(Piece {
-                    text: ">".to_string(),
+                    text: PieceText::inline(">"),
                     width: 1,
                     reverse: false,
                 });
@@ -285,11 +329,15 @@ fn finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> Displa
     }
     for piece in pieces {
         match spans.last_mut() {
-            Some(last) if last.reverse == piece.reverse => last.text.push_str(&piece.text),
-            _ => spans.push(Span {
-                text: piece.text,
-                reverse: piece.reverse,
-            }),
+            Some(last) if last.reverse == piece.reverse => piece.text.push_to(&mut last.text),
+            _ => {
+                let mut text = String::new();
+                piece.text.push_to(&mut text);
+                spans.push(Span {
+                    text,
+                    reverse: piece.reverse,
+                });
+            }
         }
     }
     spans
