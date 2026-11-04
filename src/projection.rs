@@ -301,6 +301,11 @@ impl ProjectionEngine {
         let header = (self.sticky_header && !self.columns.is_empty())
             .then(|| clip_to_width(self.header_text(), width));
         let capacity = content_rows.saturating_sub(header.is_some() as usize);
+        // A CSV/TSV file's first line is the header row the column names
+        // came from; under the sticky header it would show twice.
+        let header_line = (header.is_some()
+            && matches!(self.format, DetectedFormat::Csv | DetectedFormat::Tsv))
+        .then_some(1);
 
         let mut rows = Vec::new();
         let mut bottom_line = top;
@@ -313,7 +318,9 @@ impl ProjectionEngine {
                 at_eof = true;
                 break;
             };
-            if filter.is_none_or(|q| q.matches_line(raw, self.format)) {
+            if Some(line_no) != header_line
+                && filter.is_none_or(|q| q.matches_line(raw, self.format))
+            {
                 let sub_rows = self.project_line(raw, line_no, tabular);
                 let room = capacity - rows.len();
                 cut_short = sub_rows.len() > room;
@@ -630,6 +637,24 @@ mod tests {
         assert_eq!(order, ["c", "b"]);
         assert_eq!(proj.header_text(), "c   │b   │");
         assert_eq!(proj.project_line(lines[0], 1, true), ["3   │2   │"]);
+    }
+
+    #[test]
+    fn csv_header_line_is_not_repeated_under_the_sticky_header() {
+        let path =
+            std::env::temp_dir().join(format!("rust-less-proj-csv-{}.csv", std::process::id()));
+        std::fs::write(&path, "name,age\nalice,30\nbob,25\n").unwrap();
+        let mut buf = Buffer::new(crate::buffer::Source::File(path.clone()));
+        let mut proj = ProjectionEngine::new(DetectedFormat::Csv);
+        proj.update_columns_from_lines(&[b"name,age", b"alice,30"]);
+        let win = proj.render_window(&mut buf, 1, 5, 80, None, true).unwrap();
+        assert_eq!(win.header, None);
+        assert_eq!(win.rows[0], "name │age │", "no sticky header: line 1 stays");
+        proj.sticky_header = true;
+        let win = proj.render_window(&mut buf, 1, 5, 80, None, true).unwrap();
+        assert_eq!(win.header.as_deref(), Some("name │age │"));
+        assert_eq!(win.rows, ["alice│30  │", "bob  │25  │"]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

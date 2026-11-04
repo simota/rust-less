@@ -345,10 +345,27 @@ impl App {
                 });
             }
             Action::ToggleExpand => {
-                self.projection.toggle_expand(self.top);
+                // Only JSON lines expand; elsewhere the key would change
+                // nothing visible, so say why instead.
+                if self.projection.format == DetectedFormat::JsonLines {
+                    self.projection.toggle_expand(self.top);
+                } else {
+                    self.pending_message =
+                        Some(format!("Expand: JSON lines only ({PICK_FORMAT_HINT})"));
+                }
             }
             Action::ToggleStickyHeader => {
                 self.projection.sticky_header = !self.projection.sticky_header;
+                let state = if self.projection.sticky_header {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.pending_message = Some(if self.projection.format.is_structured() {
+                    format!("Sticky header: {state}")
+                } else {
+                    format!("Sticky header: {state} (no effect on plain text; {PICK_FORMAT_HINT})")
+                });
             }
             Action::ToggleFormat => {
                 let next = self.projection.format.next_cycle();
@@ -375,22 +392,26 @@ impl App {
                 if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
                     col.pinned = !col.pinned;
                     let state = if col.pinned { "pinned" } else { "unpinned" };
-                    self.pending_message = Some(format!("Column '{}' {}", col.name, state));
+                    let name = escape_controls(&col.name, false);
+                    self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
             Action::HideColumn => {
                 if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
                     col.hidden = !col.hidden;
                     let state = if col.hidden { "hidden" } else { "shown" };
-                    self.pending_message = Some(format!("Column '{}' {}", col.name, state));
+                    let name = escape_controls(&col.name, false);
+                    self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
             Action::SortColumn => {
                 // Bound but not implemented: say so instead of implying a
                 // sort happened.
                 if let Some(col) = self.projection.columns.get(self.focused_column) {
-                    self.pending_message =
-                        Some(format!("Sorting by '{}' is not supported yet", col.name));
+                    self.pending_message = Some(format!(
+                        "Sorting by '{}' is not supported yet",
+                        escape_controls(&col.name, false)
+                    ));
                 }
             }
             Action::FilterInput(buf) => {
@@ -1507,6 +1528,62 @@ mod tests {
         app.handle_key(&mut out, code, m).unwrap();
         let rows = drawn_rows(&mut app);
         assert_eq!(rows[&23], "Sorting by 'msg' is not supported yet");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_names_in_messages_are_escaped() {
+        let path = temp_file("{\"le\u{7}vel\":\"x\"}\n{\"le\u{7}vel\":\"y\"}\n");
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::JsonLines);
+        app.apply(Action::PinColumn).unwrap();
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Column 'le^Gvel' pinned")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn toggles_without_a_visible_effect_explain_themselves() {
+        let path = lines_fixture(30);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        app.apply(Action::ToggleExpand).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("JSON lines only")
+        );
+        assert!(app.projection.expanded_lines.is_empty());
+        app.apply(Action::ToggleStickyHeader).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("no effect")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cycling_the_format_derives_that_formats_columns() {
+        let path = temp_file("a,b\n1,2\n3,4\n");
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        // csv -> tsv -> logfmt -> plain -> jsonl -> csv
+        for _ in 0..5 {
+            app.apply(Action::ToggleFormat).unwrap();
+        }
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        let names: Vec<_> = app.projection.columns.iter().map(|c| &c.name).collect();
+        assert_eq!(names, ["a", "b"]);
         let _ = std::fs::remove_file(path);
     }
 
