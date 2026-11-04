@@ -1,5 +1,5 @@
-//! Regex-based forward/backward search across `buffer` lines, with sticky
-//! last-pattern + last-direction state for `n`/`N`.
+//! Forward/backward line search across `buffer` (regex, or any line
+//! predicate). The sticky last-pattern state for `n`/`N` lives in `command`.
 
 use crate::buffer::Buffer;
 use regex::Regex;
@@ -33,6 +33,28 @@ pub fn find(
     inclusive: bool,
     count: u64,
 ) -> Result<Option<usize>, String> {
+    find_by(
+        buffer,
+        |raw| line_matches(raw, pattern),
+        direction,
+        start_line,
+        inclusive,
+        count,
+    )
+}
+
+/// `find` with any line predicate (the structured selector search uses
+/// this), so both kinds of search share one scan and one set of
+/// start/inclusive/count rules.
+#[inline]
+pub fn find_by(
+    buffer: &mut Buffer,
+    mut is_match: impl FnMut(&[u8]) -> bool,
+    direction: Direction,
+    start_line: usize,
+    inclusive: bool,
+    count: u64,
+) -> Result<Option<usize>, String> {
     let count = count.max(1);
     let mut found = 0u64;
     let mut last_match = None;
@@ -46,7 +68,7 @@ pub fn find(
             loop {
                 buffer.ensure_lines_read(line)?;
                 let Some(raw) = buffer.line(line) else { break };
-                if line_matches(raw, pattern) {
+                if is_match(raw) {
                     found += 1;
                     last_match = Some(line);
                     if found >= count {
@@ -70,7 +92,7 @@ pub fn find(
             let mut line = start;
             while line >= 1 {
                 if let Some(raw) = buffer.line(line)
-                    && line_matches(raw, pattern)
+                    && is_match(raw)
                 {
                     found += 1;
                     last_match = Some(line);
@@ -88,6 +110,7 @@ pub fn find(
     Ok(last_match)
 }
 
+#[inline]
 fn line_matches(raw: &[u8], pattern: &Regex) -> bool {
     // Search over a lossy UTF-8 view; malformed bytes cannot participate in
     // a text match anyway, and no baseline scenario searches such content.

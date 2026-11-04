@@ -112,24 +112,7 @@ impl Query {
                 }
                 SPAN_SCRATCH.with(|scratch| {
                     let spans = &mut *scratch.borrow_mut();
-                    match format {
-                        DetectedFormat::JsonLines => {
-                            StructuralClassifier::scan_json_line(line, spans);
-                        }
-                        DetectedFormat::Csv | DetectedFormat::Tsv => {
-                            let delim = if format == DetectedFormat::Csv {
-                                b','
-                            } else {
-                                b'\t'
-                            };
-                            StructuralClassifier::scan_csv_line(line, delim, spans);
-                        }
-                        DetectedFormat::Logfmt => {
-                            StructuralClassifier::scan_logfmt_line(line, spans);
-                        }
-                        DetectedFormat::PlainText => return false,
-                    }
-
+                    StructuralClassifier::scan_fields(format, line, spans);
                     preds
                         .iter()
                         .all(|pred| evaluate_predicate(pred, line, spans))

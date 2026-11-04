@@ -3,6 +3,7 @@
 //! Provides zero-allocation scanning of JSONL, CSV, TSV, and Logfmt lines into
 //! compact 16-byte `FieldSpan` descriptors with memory safety and ASan/Miri compliance.
 
+use crate::sniffer::DetectedFormat;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,6 +56,20 @@ impl FieldSpan {
 pub struct StructuralClassifier;
 
 impl StructuralClassifier {
+    /// Scans `line` with the scanner `format` calls for, replacing the
+    /// contents of `out_spans`. Plain text has no fields, so `out_spans`
+    /// is left empty. This is the one place that maps a format to its
+    /// scanner and delimiter.
+    pub fn scan_fields(format: DetectedFormat, line: &[u8], out_spans: &mut Vec<FieldSpan>) {
+        match format {
+            DetectedFormat::JsonLines => Self::scan_json_line(line, out_spans),
+            DetectedFormat::Csv => Self::scan_csv_line(line, b',', out_spans),
+            DetectedFormat::Tsv => Self::scan_csv_line(line, b'\t', out_spans),
+            DetectedFormat::Logfmt => Self::scan_logfmt_line(line, out_spans),
+            DetectedFormat::PlainText => out_spans.clear(),
+        }
+    }
+
     /// Classifies a JSON line into a sequence of FieldSpan descriptors.
     pub fn scan_json_line(line: &[u8], out_spans: &mut Vec<FieldSpan>) {
         out_spans.clear();
