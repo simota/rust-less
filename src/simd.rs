@@ -176,12 +176,7 @@ impl StructuralClassifier {
                 }
             }
 
-            let val_slice = &slice[val_start..val_end];
-            let width = if let Ok(s) = std::str::from_utf8(val_slice) {
-                UnicodeWidthStr::width(s) as u16
-            } else {
-                val_slice.len() as u16
-            };
+            let width = value_display_width(&slice[val_start..val_end]);
 
             out_spans.push(FieldSpan {
                 key_offset: base_offset + key_start as u32,
@@ -251,12 +246,7 @@ impl StructuralClassifier {
                 }
             }
 
-            let val_slice = &line[start..val_end];
-            let width = if let Ok(s) = std::str::from_utf8(val_slice) {
-                UnicodeWidthStr::width(s) as u16
-            } else {
-                val_slice.len() as u16
-            };
+            let width = value_display_width(&line[start..val_end]);
 
             out_spans.push(FieldSpan {
                 key_offset: start as u32,
@@ -345,12 +335,7 @@ impl StructuralClassifier {
                 }
             }
 
-            let val_slice = &line[val_start..val_end];
-            let width = if let Ok(s) = std::str::from_utf8(val_slice) {
-                UnicodeWidthStr::width(s) as u16
-            } else {
-                val_slice.len() as u16
-            };
+            let width = value_display_width(&line[val_start..val_end]);
 
             out_spans.push(FieldSpan {
                 key_offset: key_start as u32,
@@ -362,6 +347,22 @@ impl StructuralClassifier {
                 display_width: width,
             });
         }
+    }
+}
+
+/// Display width of a field value: `UnicodeWidthStr::width` of its UTF-8
+/// text, or its byte length when it is not valid UTF-8. Printable ASCII
+/// (0x20..=0x7E) is one column per byte under every Unicode width table, so
+/// that common case skips UTF-8 validation and the width-table walk.
+#[inline]
+fn value_display_width(bytes: &[u8]) -> u16 {
+    if bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return bytes.len() as u16;
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        UnicodeWidthStr::width(s) as u16
+    } else {
+        bytes.len() as u16
     }
 }
 
@@ -380,6 +381,38 @@ fn trim_whitespace_offsets(bytes: &[u8]) -> (usize, usize, &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_display_width_matches_reference_formula() {
+        fn reference(bytes: &[u8]) -> u16 {
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                UnicodeWidthStr::width(s) as u16
+            } else {
+                bytes.len() as u16
+            }
+        }
+        let samples: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"plain ascii 123 ~!".to_vec(),
+            b"\"quoted\"".to_vec(),
+            b"tab\there".to_vec(),
+            b"ctrl\x01\x1b[31m\x7f".to_vec(),
+            "漢字かな".as_bytes().to_vec(),
+            "e\u{301}🙂".as_bytes().to_vec(),
+            vec![b'a', 0xff, 0xfe],
+            (0u8..=255).collect(),
+        ];
+        for b in &samples {
+            assert_eq!(value_display_width(b), reference(b), "{b:?}");
+        }
+        for byte in 0u8..=255 {
+            assert_eq!(
+                value_display_width(&[byte]),
+                reference(&[byte]),
+                "{byte:#x}"
+            );
+        }
+    }
 
     #[test]
     fn scans_json_line_correctly() {
