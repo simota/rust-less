@@ -619,7 +619,7 @@ impl App {
             let mut raw_lines = Vec::new();
             let mut cur_line = top;
             let format = self.projection.format;
-            let filter = self.active_filter.clone();
+            let filter = self.active_filter.as_ref();
             let tabular = self.tabular_view;
             let mut at_eof = false;
 
@@ -634,7 +634,7 @@ impl App {
                         break;
                     };
 
-                    let matches_filter = match &filter {
+                    let matches_filter = match filter {
                         Some(q) => q.matches_line(raw, format),
                         None => true,
                     };

@@ -35,8 +35,48 @@ pub struct SelectorPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
-    Regex(String),
+    Regex(RegexQuery),
     Structured(Vec<SelectorPredicate>),
+}
+
+/// A plain-regex query: the source pattern plus its compiled form, built
+/// lazily on first use and then reused for every line it is matched against
+/// (a filter is evaluated per line on every redraw, so recompiling per line
+/// dominated filtered draws). An invalid pattern caches `None` and matches
+/// nothing, exactly as before.
+#[derive(Debug, Clone)]
+pub struct RegexQuery {
+    pub source: String,
+    compiled: std::cell::OnceCell<Option<regex::Regex>>,
+}
+
+impl RegexQuery {
+    pub fn new(source: String) -> Self {
+        RegexQuery {
+            source,
+            compiled: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn regex(&self) -> Option<&regex::Regex> {
+        self.compiled
+            .get_or_init(|| regex::Regex::new(&self.source).ok())
+            .as_ref()
+    }
+}
+
+/// Equality is defined by the source pattern alone; the compiled cache is
+/// derived state.
+impl PartialEq for RegexQuery {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+thread_local! {
+    /// Reusable span scratch for structured matching (one allocation per
+    /// thread instead of one per evaluated line).
+    static SPAN_SCRATCH: std::cell::RefCell<Vec<FieldSpan>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Query {
@@ -52,14 +92,14 @@ impl Query {
         {
             return Query::Structured(vec![pred]);
         }
-        Query::Regex(input.to_string())
+        Query::Regex(RegexQuery::new(input.to_string()))
     }
 
     /// Evaluates the query against a raw line and its format.
     pub fn matches_line(&self, line: &[u8], format: DetectedFormat) -> bool {
         match self {
-            Query::Regex(pat) => {
-                if let Ok(re) = regex::Regex::new(pat)
+            Query::Regex(q) => {
+                if let Some(re) = q.regex()
                     && let Ok(s) = std::str::from_utf8(line)
                 {
                     return re.is_match(s);
@@ -70,28 +110,30 @@ impl Query {
                 if !format.is_structured() {
                     return false;
                 }
-                let mut spans = Vec::new();
-                match format {
-                    DetectedFormat::JsonLines => {
-                        StructuralClassifier::scan_json_line(line, &mut spans);
+                SPAN_SCRATCH.with(|scratch| {
+                    let spans = &mut *scratch.borrow_mut();
+                    match format {
+                        DetectedFormat::JsonLines => {
+                            StructuralClassifier::scan_json_line(line, spans);
+                        }
+                        DetectedFormat::Csv | DetectedFormat::Tsv => {
+                            let delim = if format == DetectedFormat::Csv {
+                                b','
+                            } else {
+                                b'\t'
+                            };
+                            StructuralClassifier::scan_csv_line(line, delim, spans);
+                        }
+                        DetectedFormat::Logfmt => {
+                            StructuralClassifier::scan_logfmt_line(line, spans);
+                        }
+                        DetectedFormat::PlainText => return false,
                     }
-                    DetectedFormat::Csv | DetectedFormat::Tsv => {
-                        let delim = if format == DetectedFormat::Csv {
-                            b','
-                        } else {
-                            b'\t'
-                        };
-                        StructuralClassifier::scan_csv_line(line, delim, &mut spans);
-                    }
-                    DetectedFormat::Logfmt => {
-                        StructuralClassifier::scan_logfmt_line(line, &mut spans);
-                    }
-                    DetectedFormat::PlainText => return false,
-                }
 
-                preds
-                    .iter()
-                    .all(|pred| evaluate_predicate(pred, line, &spans))
+                    preds
+                        .iter()
+                        .all(|pred| evaluate_predicate(pred, line, spans))
+                })
             }
         }
     }
@@ -241,12 +283,11 @@ fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]
         Operand::String(target_s) => {
             if let Some(span) = target_span {
                 let raw_val = span.value(line);
-                let val_str = String::from_utf8_lossy(raw_val)
-                    .trim_matches('"')
-                    .to_string();
+                let lossy = String::from_utf8_lossy(raw_val);
+                let val_str = lossy.trim_matches('"');
                 match pred.op {
-                    Operator::Equal => &val_str == target_s,
-                    Operator::NotEqual => &val_str != target_s,
+                    Operator::Equal => val_str == target_s,
+                    Operator::NotEqual => val_str != target_s,
                     Operator::Contains => val_str.contains(target_s),
                     _ => false,
                 }
@@ -312,6 +353,38 @@ fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_query_matches_reuse_compiled_pattern_and_keep_semantics() {
+        let q = Query::parse("ERR(OR)?");
+        assert!(matches!(q, Query::Regex(_)));
+        for _ in 0..3 {
+            assert!(q.matches_line(b"an ERROR here", DetectedFormat::JsonLines));
+            assert!(q.matches_line(b"ERR", DetectedFormat::PlainText));
+            assert!(!q.matches_line(b"info", DetectedFormat::PlainText));
+        }
+        // Non-UTF-8 lines never match a regex filter.
+        assert!(!q.matches_line(b"ERROR \xff", DetectedFormat::PlainText));
+        // An invalid pattern matches nothing (and keeps doing so).
+        let bad = Query::parse("(unclosed");
+        assert!(!bad.matches_line(b"(unclosed", DetectedFormat::PlainText));
+        assert!(!bad.matches_line(b"(unclosed", DetectedFormat::PlainText));
+        // Equality is by source pattern, independent of compile state.
+        assert_eq!(Query::parse("ERR(OR)?"), q);
+        assert_ne!(Query::parse("ERR"), q);
+    }
+
+    #[test]
+    fn structured_queries_on_all_formats() {
+        let q = Query::parse("&.status >= 500");
+        assert!(q.matches_line(b"status=503 msg=x", DetectedFormat::Logfmt));
+        assert!(!q.matches_line(b"status=200 msg=x", DetectedFormat::Logfmt));
+        assert!(!q.matches_line(b"status=503", DetectedFormat::PlainText));
+        let s = Query::parse(r#"&.level != "INFO""#);
+        assert!(s.matches_line(br#"{"level":"WARN"}"#, DetectedFormat::JsonLines));
+        assert!(!s.matches_line(br#"{"level":"INFO"}"#, DetectedFormat::JsonLines));
+        assert!(!s.matches_line(br#"{"other":"x"}"#, DetectedFormat::JsonLines));
+    }
 
     #[test]
     fn parses_numeric_predicate() {
