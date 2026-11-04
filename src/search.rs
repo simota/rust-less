@@ -91,8 +91,13 @@ pub fn find(
 fn line_matches(raw: &[u8], pattern: &Regex) -> bool {
     // Search over a lossy UTF-8 view; malformed bytes cannot participate in
     // a text match anyway, and no baseline scenario searches such content.
-    let text = String::from_utf8_lossy(raw);
-    pattern.is_match(&text)
+    // Valid lines (the norm) are checked with `str::from_utf8`, whose
+    // word-at-a-time ASCII path is far cheaper than `from_utf8_lossy`'s
+    // byte-at-a-time chunk walk; for a valid line both yield the same text.
+    match std::str::from_utf8(raw) {
+        Ok(text) => pattern.is_match(text),
+        Err(_) => pattern.is_match(&String::from_utf8_lossy(raw)),
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +193,17 @@ mod tests {
         let found = find(&mut buf, &re, Direction::Backward, 200, true, 1).unwrap();
         assert_eq!(found, Some(140));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_utf8_lines_are_matched_through_the_lossy_view() {
+        let re = Regex::new("a\u{FFFD}b").unwrap();
+        assert!(line_matches(b"xa\xffb", &re));
+        assert!(!line_matches(b"xab", &re));
+        let dot = Regex::new("^a.b$").unwrap();
+        assert!(line_matches(b"a\xffb", &dot));
+        assert!(line_matches("a\u{6f22}b".as_bytes(), &dot));
+        assert!(!line_matches(b"a\xff\xfeb", &dot));
     }
 
     #[test]
