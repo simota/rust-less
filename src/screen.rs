@@ -28,10 +28,41 @@ pub struct RenderOpts {
 
 /// One content-producing unit inside a display row, before spans are
 /// coalesced by reverse/non-reverse runs.
-struct Piece {
-    text: String,
+struct Piece<'a> {
+    text: PieceText<'a>,
     width: usize,
     reverse: bool,
+}
+
+/// A piece's text, kept allocation-free for every common case (a character
+/// borrowed from the line, a tab's spaces, a short caret/hex token); only a
+/// raw escape sequence holding invalid UTF-8 needs an owned lossy copy.
+/// Building one `String` per character used to make the allocator the
+/// dominant cost of rendering.
+enum PieceText<'a> {
+    Borrowed(&'a str),
+    Spaces(usize),
+    Inline([u8; 4], u8),
+    Owned(String),
+}
+
+impl PieceText<'_> {
+    fn inline(s: &str) -> Self {
+        let mut buf = [0u8; 4];
+        buf[..s.len()].copy_from_slice(s.as_bytes());
+        PieceText::Inline(buf, s.len() as u8)
+    }
+
+    fn push_to(&self, out: &mut String) {
+        match self {
+            PieceText::Borrowed(s) => out.push_str(s),
+            PieceText::Spaces(n) => out.extend(std::iter::repeat_n(' ', *n)),
+            PieceText::Inline(buf, len) => out.push_str(
+                std::str::from_utf8(&buf[..*len as usize]).expect("inline text is ASCII"),
+            ),
+            PieceText::Owned(s) => out.push_str(s),
+        }
+    }
 }
 
 /// LESSANSIMIDCHARS default set: digits, `:`, `;`, `[`, `?`, `!`, `"`, `'`,
@@ -104,13 +135,13 @@ fn scan_escape(bytes: &[u8], i: usize) -> Option<(usize, Option<&[u8]>)> {
 /// display row (§ no scenario disambiguates cross-row tab stops, so the
 /// simplest, most conventional choice — one running counter per logical
 /// line — is used).
-fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
+fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece<'_>, usize) {
     let b = bytes[i];
     if b == b'\t' {
         let amount = 8 - (col % 8);
         return (
             Piece {
-                text: " ".repeat(amount),
+                text: PieceText::Spaces(amount),
                 width: amount,
                 reverse: false,
             },
@@ -119,14 +150,15 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     }
     // Try to decode one UTF-8 scalar value starting here.
     let remaining = &bytes[i..];
-    if let Some((ch, len)) = decode_utf8_char(remaining) {
+    if let Some((ch, text)) = decode_utf8_char(remaining) {
+        let len = text.len();
         if (ch as u32) < 0x20 || ch as u32 == 0x7f {
             return (caret_piece(ch), len);
         }
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
         return (
             Piece {
-                text: ch.to_string(),
+                text: PieceText::Borrowed(text),
                 width: w,
                 reverse: false,
             },
@@ -136,7 +168,7 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     // Malformed byte: LESSBINFMT per-byte hex fallback, e.g. `<E4>`.
     (
         Piece {
-            text: format!("<{:02X}>", b),
+            text: hex_token(b),
             width: 4,
             reverse: true,
         },
@@ -144,25 +176,37 @@ fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece, usize) {
     )
 }
 
-fn caret_piece(ch: char) -> Piece {
+/// `<XX>` (uppercase hex), identical to `format!("<{:02X}>", b)`.
+fn hex_token(b: u8) -> PieceText<'static> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    PieceText::Inline(
+        [b'<', HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize], b'>'],
+        4,
+    )
+}
+
+fn caret_piece(ch: char) -> Piece<'static> {
     let code = ch as u32 as u8;
     let printable = code ^ 0x40; // 0x00->'@', 0x01->'A', ... 0x1f->'_', 0x7f->'?'
     Piece {
-        text: format!("^{}", printable as char),
+        text: PieceText::Inline([b'^', printable, 0, 0], 2),
         width: 2,
         reverse: true,
     }
 }
 
-/// Decodes a single UTF-8 scalar value at the start of `bytes`, if valid.
+/// Decodes a single UTF-8 scalar value at the start of `bytes`, if valid,
+/// returning it along with its encoded text (borrowed from `bytes`).
 /// Returns `None` for a byte sequence that isn't a valid encoding start
 /// (including a truncated/incomplete multi-byte sequence) — the caller then
 /// falls back to a per-byte hex token, matching the LESSBINFMT behavior
 /// confirmed by `utf8-malformed` (not LESSUTFBINFMT's `<U+%04lX>`).
-fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, &str)> {
     let b0 = *bytes.first()?;
     let len = if b0 < 0x80 {
-        1
+        // ASCII fast path: a lone byte < 0x80 is always valid UTF-8.
+        let text = std::str::from_utf8(&bytes[..1]).expect("ASCII is valid UTF-8");
+        return Some((b0 as char, text));
     } else if b0 & 0xE0 == 0xC0 {
         2
     } else if b0 & 0xF0 == 0xE0 {
@@ -175,15 +219,23 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
     if bytes.len() < len {
         return None;
     }
-    std::str::from_utf8(&bytes[..len])
-        .ok()?
-        .chars()
-        .next()
-        .map(|c| (c, len))
+    let text = std::str::from_utf8(&bytes[..len]).ok()?;
+    text.chars().next().map(|c| (c, text))
 }
 
 /// Renders one logical line into one or more display rows.
-fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<DisplayRow> {
+///
+/// Rendering stops once `max_rows` rows are complete: the caller never
+/// displays more than that, and rows are produced strictly left to right,
+/// so the rows returned are exactly the first `max_rows` rows a full render
+/// would produce (a very long wrapped line no longer costs time and memory
+/// proportional to its whole length when only a window's worth is shown).
+fn render_logical_line(
+    bytes: &[u8],
+    line_no: usize,
+    opts: &RenderOpts,
+    max_rows: usize,
+) -> Vec<DisplayRow> {
     let number_prefix_width = if opts.line_numbers { 8 } else { 0 };
     let content_width = opts.width.saturating_sub(number_prefix_width).max(1);
 
@@ -200,7 +252,10 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
         {
             if let Some(seq) = raw {
                 current.push(Piece {
-                    text: String::from_utf8_lossy(seq).into_owned(),
+                    text: match String::from_utf8_lossy(seq) {
+                        std::borrow::Cow::Borrowed(s) => PieceText::Borrowed(s),
+                        std::borrow::Cow::Owned(s) => PieceText::Owned(s),
+                    },
                     width: 0,
                     reverse: false,
                 });
@@ -219,7 +274,7 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
                     current.pop();
                 }
                 current.push(Piece {
-                    text: ">".to_string(),
+                    text: PieceText::inline(">"),
                     width: 1,
                     reverse: false,
                 });
@@ -228,6 +283,11 @@ fn render_logical_line(bytes: &[u8], line_no: usize, opts: &RenderOpts) -> Vec<D
             }
         } else if row_col + piece.width > content_width && row_col > 0 {
             rows.push(std::mem::take(&mut current));
+            if rows.len() >= max_rows {
+                // `piece` (and everything after it) would start row
+                // `max_rows + 1`, which no caller displays.
+                break 'outer;
+            }
             row_col = 0;
         }
         row_col += piece.width;
@@ -269,11 +329,15 @@ fn finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> Displa
     }
     for piece in pieces {
         match spans.last_mut() {
-            Some(last) if last.reverse == piece.reverse => last.text.push_str(&piece.text),
-            _ => spans.push(Span {
-                text: piece.text,
-                reverse: piece.reverse,
-            }),
+            Some(last) if last.reverse == piece.reverse => piece.text.push_to(&mut last.text),
+            _ => {
+                let mut text = String::new();
+                piece.text.push_to(&mut text);
+                spans.push(Span {
+                    text,
+                    reverse: piece.reverse,
+                });
+            }
         }
     }
     spans
@@ -352,7 +416,9 @@ pub fn render_window(
             at_eof = true;
             break;
         };
-        let mut line_rows = render_logical_line(raw, line_no, opts);
+        // `rows.len() < content_rows` here (the loop exits as soon as the
+        // window is full), so at least one row is always requested.
+        let mut line_rows = render_logical_line(raw, line_no, opts, content_rows - rows.len());
         if let Some(pat) = highlight {
             line_rows = line_rows
                 .into_iter()
@@ -420,7 +486,7 @@ mod tests {
     #[test]
     fn wraps_at_exact_width_no_indicator() {
         let line = "a".repeat(81);
-        let rows = render_logical_line(line.as_bytes(), 1, &opts(80));
+        let rows = render_logical_line(line.as_bytes(), 1, &opts(80), usize::MAX);
         assert_eq!(rows.len(), 2);
         assert_eq!(text_only(&rows[0]).chars().count(), 80);
         assert_eq!(text_only(&rows[1]).chars().count(), 1);
@@ -431,13 +497,13 @@ mod tests {
         let exact = "a".repeat(80);
         let mut o = opts(80);
         o.chop = true;
-        let rows = render_logical_line(exact.as_bytes(), 1, &o);
+        let rows = render_logical_line(exact.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(rows.len(), 1);
         assert!(!text_only(&rows[0]).ends_with('>'));
         assert_eq!(text_only(&rows[0]).chars().count(), 80);
 
         let over = "a".repeat(81);
-        let rows2 = render_logical_line(over.as_bytes(), 1, &o);
+        let rows2 = render_logical_line(over.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(rows2.len(), 1);
         let t = text_only(&rows2[0]);
         assert_eq!(t.chars().count(), 80);
@@ -447,7 +513,7 @@ mod tests {
 
     #[test]
     fn tab_stops_at_8_columns() {
-        let rows = render_logical_line(b"a\tb\tc\td\t", 1, &opts(80));
+        let rows = render_logical_line(b"a\tb\tc\td\t", 1, &opts(80), usize::MAX);
         let t = text_only(&rows[0]);
         assert_eq!(t.find('b'), Some(8));
         assert_eq!(t.find('c'), Some(16));
@@ -456,16 +522,21 @@ mod tests {
 
     #[test]
     fn caret_notation_for_control_chars() {
-        let rows = render_logical_line(b"ctrl:[\x01][\x02][\x07][\x1f]end", 1, &opts(80));
+        let rows = render_logical_line(
+            b"ctrl:[\x01][\x02][\x07][\x1f]end",
+            1,
+            &opts(80),
+            usize::MAX,
+        );
         let t = text_only(&rows[0]);
         assert_eq!(t, "ctrl:[^A][^B][^G][^_]end");
     }
 
     #[test]
     fn malformed_utf8_becomes_per_byte_hex() {
-        let rows = render_logical_line(b"line before\n", 1, &opts(80));
+        let rows = render_logical_line(b"line before\n", 1, &opts(80), usize::MAX);
         let _ = rows; // sanity: no panic on plain ascii
-        let rows2 = render_logical_line(&[0xE4, 0xB8], 1, &opts(80));
+        let rows2 = render_logical_line(&[0xE4, 0xB8], 1, &opts(80), usize::MAX);
         let t = text_only(&rows2[0]);
         assert_eq!(t, "<E4><B8>");
         assert!(rows2[0].iter().all(|s| s.reverse || s.text.is_empty()));
@@ -474,7 +545,7 @@ mod tests {
     #[test]
     fn cjk_wraps_by_display_width_not_char_count() {
         let line: String = "\u{6f22}".repeat(45);
-        let rows = render_logical_line(line.as_bytes(), 1, &opts(80));
+        let rows = render_logical_line(line.as_bytes(), 1, &opts(80), usize::MAX);
         assert_eq!(rows.len(), 2);
         assert_eq!(text_only(&rows[0]).chars().count(), 40);
         assert_eq!(text_only(&rows[1]).chars().count(), 5);
@@ -485,7 +556,7 @@ mod tests {
         let mut o = opts(80);
         o.line_numbers = true;
         let line = "x".repeat(150);
-        let rows = render_logical_line(line.as_bytes(), 4, &o);
+        let rows = render_logical_line(line.as_bytes(), 4, &o, usize::MAX);
         assert!(rows.len() >= 2);
         for row in &rows {
             assert!(text_only(row).starts_with("      4 "));
@@ -496,11 +567,11 @@ mod tests {
     fn raw_ansi_color_passthrough_and_malformed_sequence_dropped() {
         let mut o = opts(80);
         o.raw_ansi = true;
-        let rows = render_logical_line(b"a\x1b[31mb\x1b[0mc", 1, &o);
+        let rows = render_logical_line(b"a\x1b[31mb\x1b[0mc", 1, &o, usize::MAX);
         let t = text_only(&rows[0]);
         assert_eq!(t, "\x1b[0ma\x1b[31mb\x1b[0mc");
 
-        let rows2 = render_logical_line(b"before \x1b[2;5H after", 1, &o);
+        let rows2 = render_logical_line(b"before \x1b[2;5H after", 1, &o, usize::MAX);
         let t2 = text_only(&rows2[0]);
         assert_eq!(t2, "\x1b[0mbefore  after");
     }
@@ -514,8 +585,8 @@ mod tests {
     fn raw_ansi_row_resets_at_start_so_unclosed_color_does_not_bleed() {
         let mut o = opts(80);
         o.raw_ansi = true;
-        let unclosed = render_logical_line(b"\x1b[35mMagenta start (unclosed)", 1, &o);
-        let next = render_logical_line(b"next line after unclosed color", 2, &o);
+        let unclosed = render_logical_line(b"\x1b[35mMagenta start (unclosed)", 1, &o, usize::MAX);
+        let next = render_logical_line(b"next line after unclosed color", 2, &o, usize::MAX);
         assert!(text_only(&unclosed[0]).starts_with("\x1b[0m\x1b[35m"));
         assert!(
             text_only(&next[0]).starts_with("\x1b[0mnext"),
@@ -528,7 +599,7 @@ mod tests {
         let mut o = opts(10);
         o.raw_ansi = true;
         let content = format!("\x1b[31m{}", "a".repeat(10));
-        let rows = render_logical_line(content.as_bytes(), 1, &o);
+        let rows = render_logical_line(content.as_bytes(), 1, &o, usize::MAX);
         assert_eq!(
             rows.len(),
             1,
@@ -539,7 +610,12 @@ mod tests {
     #[test]
     fn search_highlight_marks_all_occurrences_on_a_row() {
         let re = Regex::new("[cb]at").unwrap();
-        let rows = render_logical_line(b"regex sample cat bat hat sat mat", 1, &opts(80));
+        let rows = render_logical_line(
+            b"regex sample cat bat hat sat mat",
+            1,
+            &opts(80),
+            usize::MAX,
+        );
         let highlighted = highlight_matches(rows[0].clone(), &re);
         let reversed: Vec<&str> = highlighted
             .iter()
@@ -547,6 +623,70 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(reversed, vec!["cat", "bat"]);
+    }
+
+    /// The `max_rows` cap must yield exactly the first `max_rows` rows of
+    /// an uncapped render, for every option combination and for content
+    /// mixing wide chars, tabs, control chars, malformed UTF-8 and ANSI.
+    #[test]
+    fn capped_render_is_a_prefix_of_full_render() {
+        let mut samples: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"short".to_vec(),
+            "x".repeat(400).into_bytes(),
+            "\u{6f22}a".repeat(90).into_bytes(),
+            b"\t".repeat(50),
+        ];
+        let mut mixed = Vec::new();
+        for i in 0..60u8 {
+            mixed.extend_from_slice(b"ab\tc\x1b[31mred\x1b[0m\x01");
+            mixed.extend_from_slice("\u{6f22}".as_bytes());
+            mixed.push(0xE4);
+            mixed.push(b'0' + i % 10);
+            mixed.extend_from_slice(b"\x1b[2;5H\x1b]8;;http://x\x07L\x1b]8;;\x07");
+        }
+        samples.push(mixed);
+        for width in [1usize, 2, 7, 10, 80] {
+            for flags in 0..8u8 {
+                let o = RenderOpts {
+                    width,
+                    line_numbers: flags & 1 != 0,
+                    chop: flags & 2 != 0,
+                    raw_ansi: flags & 4 != 0,
+                };
+                for bytes in &samples {
+                    let full = render_logical_line(bytes, 7, &o, usize::MAX);
+                    for cap in [
+                        1,
+                        2,
+                        3,
+                        full.len().saturating_sub(1).max(1),
+                        full.len(),
+                        full.len() + 1,
+                    ] {
+                        let capped = render_logical_line(bytes, 7, &o, cap);
+                        let expect = &full[..cap.min(full.len())];
+                        assert_eq!(capped, expect, "width={width} flags={flags} cap={cap}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A window over one huge wrapped line still fills exactly and is not
+    /// at EOF while the same line continues below the window.
+    #[test]
+    fn window_over_long_wrapped_line_matches_uncapped_semantics() {
+        let mut content = "y".repeat(80 * 100 + 3);
+        content.push_str("\nnext\n");
+        let path = temp_file(&content);
+        let mut buf = Buffer::new(crate::buffer::Source::File(path.clone()));
+        let win = render_window(&mut buf, 1, 23, &opts(80), None).unwrap();
+        assert_eq!(win.rows.len(), 23);
+        assert_eq!(win.bottom_line, 1);
+        assert!(!win.at_eof);
+        assert!(win.rows.iter().all(|r| text_only(r) == "y".repeat(80)));
+        let _ = std::fs::remove_file(path);
     }
 
     fn temp_file(contents: &str) -> std::path::PathBuf {

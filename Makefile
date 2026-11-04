@@ -39,6 +39,13 @@ test: ## Unit + integration tests
 # Installs to $(PREFIX)/bin. `--locked` builds the dependency versions this
 # clone was parity-verified against; a resolver-picked newer set has not been
 # through the harness. Run `make parity` before installing.
+# Opt-in hot-path benchmarks (src/bench.rs): min/p50/p95 wall time and peak
+# RSS per benchmark. Run one benchmark per process (BENCH=<name>) when
+# comparing peak memory, and pin a CPU (taskset) when comparing runs.
+.PHONY: bench
+bench: ## Release-mode hot-path benchmarks (BENCH=<name> to pick one)
+	cargo test --release bench::$(BENCH) -- --ignored --nocapture --test-threads=1
+
 .PHONY: install
 install: ## Install rless into $(PREFIX)/bin (default ~/.cargo/bin)
 	cargo install --path . --locked --force --root $(PREFIX)

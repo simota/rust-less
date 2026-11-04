@@ -75,6 +75,8 @@ pub struct App {
     pub active_filter: Option<Query>,
     pub focused_column: usize,
     pub sniffer_checked: bool,
+    /// Reused frame buffer for `draw` (kept to avoid regrowing it per frame).
+    frame_buf: Vec<u8>,
 }
 
 impl App {
@@ -109,6 +111,7 @@ impl App {
             active_filter: None,
             focused_column: 0,
             sniffer_checked: false,
+            frame_buf: Vec::new(),
         }
     }
 
@@ -582,7 +585,23 @@ impl App {
         out.flush()
     }
 
+    /// Draws one full frame. The frame is assembled in memory and handed to
+    /// `out` with a single `write_all` + `flush`, so the terminal receives
+    /// it in one write instead of one per 1 KiB of stdout's line buffer
+    /// (fewer syscalls, and no partially drawn frame is ever visible).
     fn draw<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        let mut frame = std::mem::take(&mut self.frame_buf);
+        frame.clear();
+        let result = self.draw_frame(&mut frame);
+        let written = result.and_then(|()| {
+            out.write_all(&frame)?;
+            out.flush()
+        });
+        self.frame_buf = frame;
+        written
+    }
+
+    fn draw_frame(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         let content_rows = self.content_rows();
         let width = self.width as usize;
         let render_opts = self.render_opts();
@@ -619,7 +638,7 @@ impl App {
             let mut raw_lines = Vec::new();
             let mut cur_line = top;
             let format = self.projection.format;
-            let filter = self.active_filter.clone();
+            let filter = self.active_filter.as_ref();
             let tabular = self.tabular_view;
             let mut at_eof = false;
 
@@ -634,7 +653,7 @@ impl App {
                         break;
                     };
 
-                    let matches_filter = match &filter {
+                    let matches_filter = match filter {
                         Some(q) => q.matches_line(raw, format),
                         None => true,
                     };
@@ -738,7 +757,7 @@ impl App {
             queue!(out, Print(&prompt_text))?;
         }
 
-        out.flush()
+        Ok(())
     }
 
     fn build_prompt(&mut self, win: &screen::WindowRender, width: usize) -> (String, bool) {
@@ -784,6 +803,19 @@ impl App {
             prompt::render(self.pending_message.as_deref(), mode, &ctx, width);
         self.filename_shown = false;
         (text, highlighted)
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// Benchmark hooks (src/bench.rs): drive `apply`/`draw` from outside
+    /// this module without widening their visibility for the real binary.
+    pub(crate) fn bench_apply(&mut self, action: Action) {
+        let _ = self.apply(action);
+    }
+
+    pub(crate) fn bench_draw<W: Write>(&mut self, out: &mut W) {
+        self.draw(out).unwrap();
     }
 }
 
@@ -976,6 +1008,50 @@ mod tests {
             "a no-op redraw must not switch to tilde-fill"
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A frame reaches the terminal as one write followed by one flush.
+    #[test]
+    fn draw_emits_each_frame_in_a_single_write() {
+        struct Counting {
+            writes: usize,
+            flushes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Counting {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let path = lines_fixture(200);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(160, 48);
+        app.apply(Action::ScrollLines(1)).unwrap();
+        let mut a = Counting {
+            writes: 0,
+            flushes: 0,
+            bytes: Vec::new(),
+        };
+        app.draw(&mut a).unwrap();
+        assert_eq!((a.writes, a.flushes), (1, 1));
+        assert!(
+            a.bytes.len() > 1024,
+            "frame larger than stdout's line buffer"
+        );
+        // The first frame shows the filename prompt; later frames of the
+        // same view are identical to each other.
+        let mut b: Vec<u8> = Vec::new();
+        app.draw(&mut b).unwrap();
+        let mut c: Vec<u8> = Vec::new();
+        app.draw(&mut c).unwrap();
+        assert!(b == c, "redraws of an unchanged view must be identical");
         let _ = std::fs::remove_file(path);
     }
 

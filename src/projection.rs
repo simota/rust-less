@@ -262,24 +262,27 @@ impl ProjectionEngine {
     }
 
     fn find_field_value(&self, col_name: &str, line: &[u8]) -> String {
+        // Keys are compared in place (borrowed) rather than materialized as
+        // a String per span per cell; only the matched value is allocated.
         for (i, span) in self.span_pool.spans.iter().enumerate() {
-            let k = match self.format {
+            let is_match = match self.format {
                 DetectedFormat::JsonLines | DetectedFormat::Logfmt => {
-                    String::from_utf8_lossy(span.key(line)).to_string()
+                    String::from_utf8_lossy(span.key(line)).as_ref() == col_name
                 }
                 DetectedFormat::Csv | DetectedFormat::Tsv => {
                     if i < self.columns.len() {
-                        self.columns[i].name.clone()
+                        self.columns[i].name == col_name
                     } else {
-                        format!("col_{}", i + 1)
+                        format!("col_{}", i + 1) == col_name
                     }
                 }
-                _ => String::new(),
+                _ => col_name.is_empty(),
             };
 
-            if k == col_name {
-                let raw_val = String::from_utf8_lossy(span.value(line)).to_string();
-                return raw_val.trim_matches('"').to_string();
+            if is_match {
+                return String::from_utf8_lossy(span.value(line))
+                    .trim_matches('"')
+                    .to_string();
             }
         }
         String::new()
