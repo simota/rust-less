@@ -273,3 +273,22 @@ fn bench_structured_search() {
     });
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+#[ignore]
+fn bench_tabular_draw() {
+    let path = jsonl_lines(10_000);
+    let mut app = App::new(opts(vec![path.clone()]));
+    app.set_size(200, 48);
+    let mut sink: Vec<u8> = Vec::new();
+    app.bench_draw(&mut sink); // sniff -> jsonl, columns from the sample
+    app.bench_apply(Action::ToggleTabular);
+    run("tabular_draw_x200", 20, || {
+        for _ in 0..200 {
+            app.bench_apply(Action::ScrollLines(1));
+            sink.clear();
+            app.bench_draw(&mut sink);
+        }
+    });
+    let _ = std::fs::remove_file(path);
+}
