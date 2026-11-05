@@ -16,7 +16,7 @@ use regex::Regex;
 use crate::buffer::{Buffer, Source};
 use crate::cli::{BellMode, Options, PromptMode};
 use crate::input::{Action, Decoded, Decoder};
-use crate::projection::ProjectionEngine;
+use crate::projection::{ProjectionEngine, clip_to_width, escape_controls};
 use crate::prompt::{self, PromptContext};
 use crate::screen::{self, RenderOpts};
 use crate::search::{self, Direction};
@@ -44,6 +44,17 @@ enum BellClass {
     Error,
 }
 
+/// The last search, kept for `n`/`N` and (regex only) match highlighting.
+#[derive(Debug, Clone)]
+enum SearchPattern {
+    Regex(Regex),
+    /// A selector query (`/.status >= 500`) on a structured file.
+    Structured(Query),
+}
+
+/// How many leading lines the format sniffer and column derivation sample.
+const SNIFF_SAMPLE_LINES: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyOutcome {
     Quit,
@@ -66,15 +77,19 @@ pub struct App {
     first_render_done: bool,
     filename_shown: bool,
     pending_message: Option<String>,
-    last_search: Option<(Regex, Direction)>,
+    last_search: Option<(SearchPattern, Direction)>,
     width: u16,
     height: u16,
     decoder: Decoder,
-    pub projection: ProjectionEngine,
-    pub tabular_view: bool,
-    pub active_filter: Option<Query>,
-    pub focused_column: usize,
-    pub sniffer_checked: bool,
+    /// Structured-view state of the *current* file; reset on `:n`/`:p`.
+    projection: ProjectionEngine,
+    tabular_view: bool,
+    active_filter: Option<Query>,
+    /// Index into `projection.columns` of the column-mode focus.
+    focused_column: usize,
+    /// Whether the current file's format has been sniffed (once per file,
+    /// on its first draw).
+    sniffer_checked: bool,
     /// Reused frame buffer for `draw` (kept to avoid regrowing it per frame).
     frame_buf: Vec<u8>,
 }
@@ -93,6 +108,8 @@ impl App {
                 })
                 .collect()
         };
+        let mut projection = ProjectionEngine::new(DetectedFormat::PlainText);
+        projection.raw_ansi = opts.raw_control_chars;
         App {
             opts,
             files,
@@ -106,7 +123,7 @@ impl App {
             width: 80,
             height: 24,
             decoder: Decoder::new(),
-            projection: ProjectionEngine::new(DetectedFormat::PlainText),
+            projection,
             tabular_view: false,
             active_filter: None,
             focused_column: 0,
@@ -314,36 +331,48 @@ impl App {
             Action::SearchInput(pattern, dir, count) => {
                 self.run_search(&pattern, dir, count, true)?;
             }
-            Action::RepeatSearch(count) => {
-                let Some((pattern, dir)) = self.last_search.clone() else {
-                    return Ok(());
-                };
-                self.run_search_regex(&pattern, dir, count, false)?;
-            }
-            Action::RepeatSearchReverse(count) => {
-                let Some((pattern, dir)) = self.last_search.clone() else {
-                    return Ok(());
-                };
-                self.run_search_regex(&pattern, dir.reversed(), count, false)?;
-            }
+            Action::RepeatSearch(count) => self.repeat_search(count, false)?,
+            Action::RepeatSearchReverse(count) => self.repeat_search(count, true)?,
             Action::ToggleTabular => {
                 self.tabular_view = !self.tabular_view;
-                let mode_str = if self.tabular_view {
-                    "tabular"
+                let format = self.projection.format;
+                self.pending_message = Some(if !self.tabular_view {
+                    "View mode: raw stream".to_string()
+                } else if format.is_structured() {
+                    format!("View mode: tabular ({})", format.name())
                 } else {
-                    "raw stream"
-                };
-                self.pending_message = Some(format!("View mode: {}", mode_str));
+                    format!("View mode: tabular (no effect on plain text; {PICK_FORMAT_HINT})")
+                });
             }
             Action::ToggleExpand => {
-                self.projection.toggle_expand(self.top);
+                // Only JSON lines expand; elsewhere the key would change
+                // nothing visible, so say why instead.
+                if self.projection.format == DetectedFormat::JsonLines {
+                    self.projection.toggle_expand(self.top);
+                } else {
+                    self.pending_message =
+                        Some(format!("Expand: JSON lines only ({PICK_FORMAT_HINT})"));
+                }
             }
             Action::ToggleStickyHeader => {
                 self.projection.sticky_header = !self.projection.sticky_header;
+                let state = if self.projection.sticky_header {
+                    "on"
+                } else {
+                    "off"
+                };
+                self.pending_message = Some(if self.projection.format.is_structured() {
+                    format!("Sticky header: {state}")
+                } else {
+                    format!("Sticky header: {state} (no effect on plain text; {PICK_FORMAT_HINT})")
+                });
             }
             Action::ToggleFormat => {
                 let next = self.projection.format.next_cycle();
+                let sample = self.sample_lines();
                 self.projection.set_format(next);
+                self.projection.update_columns_from_lines(&sample);
+                self.focused_column = 0;
                 self.pending_message = Some(format!("Format: {}", next.name()));
             }
             Action::ToggleColumnMode => {
@@ -362,21 +391,27 @@ impl App {
             Action::PinColumn => {
                 if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
                     col.pinned = !col.pinned;
-                    self.pending_message =
-                        Some(format!("Column '{}' pinned: {}", col.name, col.pinned));
+                    let state = if col.pinned { "pinned" } else { "unpinned" };
+                    let name = escape_controls(&col.name, false);
+                    self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
             Action::HideColumn => {
                 if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
                     col.hidden = !col.hidden;
-                    self.pending_message =
-                        Some(format!("Column '{}' hidden: {}", col.name, col.hidden));
+                    let state = if col.hidden { "hidden" } else { "shown" };
+                    let name = escape_controls(&col.name, false);
+                    self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
             Action::SortColumn => {
+                // Bound but not implemented: say so instead of implying a
+                // sort happened.
                 if let Some(col) = self.projection.columns.get(self.focused_column) {
-                    let col_name = col.name.clone();
-                    self.pending_message = Some(format!("[SORT: {} (snapshot)]", col_name));
+                    self.pending_message = Some(format!(
+                        "Sorting by '{}' is not supported yet",
+                        escape_controls(&col.name, false)
+                    ));
                 }
             }
             Action::FilterInput(buf) => {
@@ -385,8 +420,20 @@ impl App {
                     self.pending_message = Some("Filter cleared".to_string());
                 } else {
                     let q = Query::parse(&buf);
+                    // Reject before applying: a pattern that cannot compile
+                    // matches nothing and would blank the view silently.
+                    if !q.is_valid() {
+                        return Err("Invalid pattern".to_string());
+                    }
                     self.active_filter = Some(q);
-                    self.pending_message = Some(format!("Filter: &{}", buf));
+                    self.pending_message = Some(if self.projection.format.is_structured() {
+                        format!("Filter: &{}", buf)
+                    } else {
+                        format!(
+                            "Filter: &{} (no effect on plain text; {PICK_FORMAT_HINT})",
+                            buf
+                        )
+                    });
                 }
             }
             Action::NextFile(n) => self.switch_file(n as i64)?,
@@ -442,12 +489,35 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let q = Query::parse(pattern_src);
-        if let Query::Structured(_) = q {
-            return self.run_search_query(&q, dir, count, fresh);
+        // A selector query only means something on a structured file; on
+        // plain text `/.status >= 500` is an ordinary regex, as in less.
+        if self.projection.format.is_structured() {
+            let q = Query::parse(pattern_src);
+            if let Query::Structured(_) = q {
+                return self.run_search_query(&q, dir, count, fresh);
+            }
         }
         let pattern = Regex::new(pattern_src).map_err(|_| "Invalid pattern".to_string())?;
         self.run_search_regex(&pattern, dir, count, fresh)
+    }
+
+    fn repeat_search(&mut self, count: u64, reverse: bool) -> Result<(), String> {
+        let Some((pattern, dir)) = self.last_search.clone() else {
+            return Ok(());
+        };
+        let dir = if reverse { dir.reversed() } else { dir };
+        match pattern {
+            SearchPattern::Regex(re) => self.run_search_regex(&re, dir, count, false),
+            SearchPattern::Structured(q) => self.run_search_query(&q, dir, count, false),
+        }
+    }
+
+    /// Line a search starts from; see `run_search_regex`.
+    fn search_start(&self, dir: Direction, fresh: bool) -> usize {
+        match (fresh, dir) {
+            (true, Direction::Backward) => self.top + self.content_rows().saturating_sub(1),
+            _ => self.top,
+        }
     }
 
     fn run_search_query(
@@ -457,55 +527,23 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = if fresh {
-            match dir {
-                Direction::Forward => self.top,
-                Direction::Backward => self.top + self.content_rows().saturating_sub(1),
-            }
-        } else {
-            self.top
-        };
+        let start = self.search_start(dir, fresh);
         let format = self.projection.format;
         let buffer = &mut self.files[self.file_index].buffer;
-        let mut found = 0u64;
-        let mut last_match = None;
-
-        match dir {
-            Direction::Forward => {
-                let mut line = if fresh { start } else { start + 1 };
-                loop {
-                    buffer.ensure_lines_read(line)?;
-                    let Some(raw) = buffer.line(line) else { break };
-                    if query.matches_line(raw, format) {
-                        found += 1;
-                        last_match = Some(line);
-                        if found >= count {
-                            break;
-                        }
-                    }
-                    line += 1;
-                }
-            }
-            Direction::Backward => {
-                buffer.ensure_full_read()?;
-                let total = buffer.lines_cached();
-                let upper = start.min(total);
-                for line in (1..=upper).rev() {
-                    let Some(raw) = buffer.line(line) else {
-                        continue;
-                    };
-                    if query.matches_line(raw, format) {
-                        found += 1;
-                        last_match = Some(line);
-                        if found >= count {
-                            break;
-                        }
-                    }
-                }
-            }
+        let found = search::find_by(
+            buffer,
+            |line| query.matches_line(line, format),
+            dir,
+            start,
+            fresh,
+            count,
+        )?;
+        // Only an original `/`/`?` (with the direction it was typed in) is
+        // remembered; `N` reverses relative to it, never to itself.
+        if fresh {
+            self.last_search = Some((SearchPattern::Structured(query.clone()), dir));
         }
-
-        match last_match {
+        match found {
             Some(line) => {
                 self.top = line;
                 Ok(())
@@ -529,17 +567,14 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = if fresh {
-            match dir {
-                Direction::Forward => self.top,
-                Direction::Backward => self.top + self.content_rows().saturating_sub(1),
-            }
-        } else {
-            self.top
-        };
+        let start = self.search_start(dir, fresh);
         let buffer = &mut self.current().buffer;
         let found = search::find(buffer, pattern, dir, start, fresh, count)?;
-        self.last_search = Some((pattern.clone(), dir));
+        // Remember only the typed search: storing the reversed direction
+        // of an `N` would make a following `n` run backwards too.
+        if fresh {
+            self.last_search = Some((SearchPattern::Regex(pattern.clone()), dir));
+        }
         match found {
             Some(line) => {
                 self.top = line;
@@ -561,6 +596,11 @@ impl App {
         self.top = 1;
         self.filename_shown = true;
         self.last_search = None;
+        // Structured-view state belongs to one file: the next file gets its
+        // own format sniff and columns on its first draw.
+        self.projection.set_format(DetectedFormat::PlainText);
+        self.sniffer_checked = false;
+        self.focused_column = 0;
         // A file switch always leaves the fresh-process bottom-anchor
         // window (§3 item 1), regardless of whether `top` numerically
         // changed (a fresh file also starts at line 1).
@@ -604,151 +644,31 @@ impl App {
     fn draw_frame(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         let content_rows = self.content_rows();
         let width = self.width as usize;
-        let render_opts = self.render_opts();
-        let last_search = self.last_search.clone();
-        let top = self.top;
-
-        if !self.sniffer_checked {
-            let buffer = &mut self.current().buffer;
-            let _ = buffer.ensure_lines_read(16);
-            let sample_lines: Vec<_> = (1..=16)
-                .filter_map(|i| buffer.line(i).map(|s| s.to_vec()))
-                .collect();
-            let sniffer = FormatSniffer::default();
-            let detected = sniffer.sniff(&sample_lines);
-            if detected.is_structured() {
-                self.projection.set_format(detected);
-                self.projection.update_columns_from_lines(&sample_lines);
-            }
-            self.sniffer_checked = true;
-        }
-
-        let is_structured = self.projection.format.is_structured();
-        let use_projection = is_structured
-            && (self.tabular_view
-                || !self.projection.expanded_lines.is_empty()
-                || self.active_filter.is_some());
+        self.ensure_format_sniffed();
 
         // `Clear(All)` already blanks the whole pane, so the fresh-launch
         // bottom-anchor case (§3 item 1) needs no explicit fill: leaving
         // `blank_above` rows untouched before the content starts is enough.
         queue!(out, Clear(ClearType::All))?;
 
-        let win = if use_projection {
-            let mut raw_lines = Vec::new();
-            let mut cur_line = top;
-            let format = self.projection.format;
-            let filter = self.active_filter.as_ref();
-            let tabular = self.tabular_view;
-            let mut at_eof = false;
-
-            {
-                let buf = &mut self.files[self.file_index].buffer;
-                while raw_lines.len() < content_rows {
-                    if buf.ensure_lines_read(cur_line).is_err() {
-                        break;
-                    }
-                    let Some(raw) = buf.line(cur_line) else {
-                        at_eof = buf.is_eof();
-                        break;
-                    };
-
-                    let matches_filter = match filter {
-                        Some(q) => q.matches_line(raw, format),
-                        None => true,
-                    };
-
-                    if matches_filter {
-                        raw_lines.push((cur_line, raw.to_vec()));
-                    }
-                    cur_line += 1;
-                }
-            }
-
-            let mut projected_rows = Vec::new();
-            let mut last_buffer_line = top;
-            for (line_idx, raw) in &raw_lines {
-                last_buffer_line = *line_idx;
-                let sub_rows = self.projection.project_line(raw, *line_idx, tabular);
-                for sub in sub_rows {
-                    projected_rows.push(sub);
-                    if projected_rows.len() >= content_rows {
-                        break;
-                    }
-                }
-            }
-
-            let mut row_idx = 0;
-            if self.projection.sticky_header && !self.projection.columns.is_empty() {
-                let mut header = String::new();
-                for col in self.projection.columns.iter().filter(|c| !c.hidden) {
-                    let padded = format!("{:width$}", col.name, width = col.width);
-                    header.push_str(&padded);
-                    header.push('│');
-                }
-                queue!(out, MoveTo(0, 0))?;
-                write_standout(out, &header)?;
-                row_idx = 1;
-            }
-
-            for row_text in projected_rows {
-                if row_idx >= content_rows {
-                    break;
-                }
-                queue!(out, MoveTo(0, row_idx as u16), Print(&row_text))?;
-                row_idx += 1;
-            }
-
-            screen::WindowRender {
-                rows: Vec::new(),
-                bottom_line: last_buffer_line,
-                at_eof,
-            }
+        let (bottom_line, at_eof) = if self.use_projection() {
+            self.paint_projection(out, content_rows, width)?
         } else {
-            let buffer = &mut self.current().buffer;
-            let win = screen::render_window(
-                buffer,
-                top,
-                content_rows,
-                &render_opts,
-                last_search.as_ref().map(|(p, _)| p),
-            )
-            .map_err(io::Error::other)?;
-
-            // NOT consumed here: only `apply()` retires this flag, and only once
-            // the view actually moves (see its doc comment). A redraw that
-            // changes nothing (e.g. a failed EOF-clamp scroll) must keep
-            // rendering bottom-anchored.
-            let is_first_draw = !self.first_render_done;
-            let short_content = win.rows.len() < content_rows;
-
-            let blank_above = if short_content && is_first_draw {
-                content_rows - win.rows.len()
-            } else {
-                0
-            };
-            let mut row_idx = blank_above;
-            for row in &win.rows {
-                queue!(out, MoveTo(0, row_idx as u16))?;
-                write_spans(out, row)?;
-                row_idx += 1;
-            }
-            if short_content && !is_first_draw {
-                for r in row_idx..content_rows {
-                    queue!(out, MoveTo(0, r as u16), Print("~"))?;
-                }
-            }
-            win
+            self.paint_text(out, content_rows)?
         };
 
         // While a multi-key command (numeric prefix, `:x`, `/pattern`) is
         // still being typed, echo it in place of the computed prompt; not
         // baseline-verified (every capture is taken post-Enter) but this is
         // the conventional, low-risk less UX and never fires in any tested
-        // sequence's captured steps.
+        // sequence's captured steps. Column mode shows its own status line
+        // unless a message (pin/hide feedback, an error) is pending.
         let (prompt_text, highlighted) = match self.decoder.preview() {
             Some(preview) => (preview, false),
-            None => self.build_prompt(&win, width),
+            None if self.decoder.in_column_mode() && self.pending_message.is_none() => {
+                (self.column_mode_prompt(width), false)
+            }
+            None => self.build_prompt(bottom_line, at_eof, width),
         };
         queue!(out, MoveTo(0, content_rows as u16))?;
         if highlighted {
@@ -760,16 +680,143 @@ impl App {
         Ok(())
     }
 
-    fn build_prompt(&mut self, win: &screen::WindowRender, width: usize) -> (String, bool) {
-        let mode = match self.opts.prompt_mode {
-            PromptMode::Short => prompt::Mode::Short,
-            PromptMode::Medium => prompt::Mode::Medium,
-            PromptMode::Long => prompt::Mode::Long,
+    /// The structured views (table, expanded lines, filter) replace the
+    /// less-compatible text view only on a structured file and only once
+    /// one of them is switched on.
+    fn use_projection(&self) -> bool {
+        self.projection.format.is_structured()
+            && (self.tabular_view
+                || !self.projection.expanded_lines.is_empty()
+                || self.active_filter.is_some())
+    }
+
+    /// The first `SNIFF_SAMPLE_LINES` lines of the current file (fewer if
+    /// it is shorter or unreadable; the read error itself surfaces on the
+    /// draw that needs those lines).
+    fn sample_lines(&mut self) -> Vec<Vec<u8>> {
+        let buffer = &mut self.current().buffer;
+        let _ = buffer.ensure_lines_read(SNIFF_SAMPLE_LINES);
+        (1..=SNIFF_SAMPLE_LINES)
+            .map_while(|i| buffer.line(i).map(<[u8]>::to_vec))
+            .collect()
+    }
+
+    fn ensure_format_sniffed(&mut self) {
+        if self.sniffer_checked {
+            return;
+        }
+        self.sniffer_checked = true;
+        let sample = self.sample_lines();
+        let detected = FormatSniffer::default().sniff(&sample);
+        if detected.is_structured() {
+            self.projection.set_format(detected);
+            self.projection.update_columns_from_lines(&sample);
+        }
+    }
+
+    /// Paints the less-compatible text view. Returns `(bottom_line, at_eof)`
+    /// for the prompt.
+    fn paint_text(&mut self, out: &mut Vec<u8>, content_rows: usize) -> io::Result<(usize, bool)> {
+        let render_opts = self.render_opts();
+        let top = self.top;
+        let highlight = match &self.last_search {
+            Some((SearchPattern::Regex(re), _)) => Some(re),
+            _ => None,
         };
-        let needs_totals = matches!(mode, prompt::Mode::Medium | prompt::Mode::Long);
+        let buffer = &mut self.files[self.file_index].buffer;
+        let win = screen::render_window(buffer, top, content_rows, &render_opts, highlight)
+            .map_err(io::Error::other)?;
+
+        // NOT consumed here: only `apply()` retires this flag, and only once
+        // the view actually moves (see its doc comment). A redraw that
+        // changes nothing (e.g. a failed EOF-clamp scroll) must keep
+        // rendering bottom-anchored.
+        let is_first_draw = !self.first_render_done;
+        let short_content = win.rows.len() < content_rows;
+
+        let blank_above = if short_content && is_first_draw {
+            content_rows - win.rows.len()
+        } else {
+            0
+        };
+        let mut row_idx = blank_above;
+        for row in &win.rows {
+            queue!(out, MoveTo(0, row_idx as u16))?;
+            write_spans(out, row)?;
+            row_idx += 1;
+        }
+        if short_content && !is_first_draw {
+            for r in row_idx..content_rows {
+                queue!(out, MoveTo(0, r as u16), Print("~"))?;
+            }
+        }
+        Ok((win.bottom_line, win.at_eof))
+    }
+
+    /// Paints a structured view (rows already escaped and width-clipped by
+    /// `ProjectionEngine::render_window`). Returns `(bottom_line, at_eof)`.
+    fn paint_projection(
+        &mut self,
+        out: &mut Vec<u8>,
+        content_rows: usize,
+        width: usize,
+    ) -> io::Result<(usize, bool)> {
+        let buffer = &mut self.files[self.file_index].buffer;
+        let win = self
+            .projection
+            .render_window(
+                buffer,
+                self.top,
+                content_rows,
+                width,
+                self.active_filter.as_ref(),
+                self.tabular_view,
+            )
+            .map_err(io::Error::other)?;
+        let mut row = 0u16;
+        if let Some(header) = &win.header {
+            queue!(out, MoveTo(0, 0))?;
+            write_standout(out, header)?;
+            row = 1;
+        }
+        for text in &win.rows {
+            queue!(out, MoveTo(0, row), Print(text))?;
+            row += 1;
+        }
+        Ok((win.bottom_line, win.at_eof))
+    }
+
+    /// Status line of column mode: which column has focus (by name, with
+    /// its state) and the keys that act on it.
+    fn column_mode_prompt(&self, width: usize) -> String {
+        let columns = &self.projection.columns;
+        let text = match columns.get(self.focused_column) {
+            None => "Columns: none (needs a structured file) - q done".to_string(),
+            Some(col) => {
+                let state = match (col.pinned, col.hidden) {
+                    (true, true) => " (pinned, hidden)",
+                    (true, false) => " (pinned)",
+                    (false, true) => " (hidden)",
+                    (false, false) => "",
+                };
+                format!(
+                    "Columns: {}/{} {}{} - h/l move  p pin  . hide  q done",
+                    self.focused_column + 1,
+                    columns.len(),
+                    escape_controls(&col.name, false),
+                    state
+                )
+            }
+        };
+        clip_to_width(text, width)
+    }
+
+    fn build_prompt(&mut self, bottom_line: usize, at_eof: bool, width: usize) -> (String, bool) {
+        let mode = self.opts.prompt_mode;
+        let needs_totals = matches!(mode, PromptMode::Medium | PromptMode::Long);
         let file_count = self.files.len();
         let file_index = self.file_index + 1;
-        let next_filename = if win.at_eof && self.file_index + 1 < self.files.len() {
+        let next_filename = if at_eof && self.file_index + 1 < self.files.len() {
             self.files[self.file_index + 1].display()
         } else {
             None
@@ -780,7 +827,7 @@ impl App {
             let buffer = &mut self.current().buffer;
             let total_lines = buffer.total_lines().ok();
             let total_bytes = buffer.total_bytes().ok();
-            let byte_offset = buffer.byte_offset_through(win.bottom_line);
+            let byte_offset = buffer.byte_offset_through(bottom_line);
             (total_lines, total_bytes, byte_offset)
         } else {
             (None, None, 0)
@@ -792,9 +839,9 @@ impl App {
             file_index,
             file_count,
             top_line: self.top,
-            bottom_line: win.bottom_line,
+            bottom_line,
             total_lines,
-            at_eof: win.at_eof,
+            at_eof,
             next_filename: next_filename.as_deref(),
             byte_offset,
             total_bytes,
@@ -805,6 +852,9 @@ impl App {
         (text, highlighted)
     }
 }
+
+/// Appended to feedback for a structured-only action taken on plain text.
+const PICK_FORMAT_HINT: &str = "s picks a format";
 
 #[cfg(test)]
 impl App {
@@ -1305,5 +1355,254 @@ mod tests {
         assert!(rendered.contains("500") || rendered.contains("payment"));
 
         let _ = std::fs::remove_file(p);
+    }
+
+    // --- Structured-view regressions (docs/sqi/SQI_REPORT.md, probe T04-T17)
+
+    fn jsonl_fixture() -> PathBuf {
+        let levels = ["INFO", "DEBUG", "ERROR", "WARN"];
+        let statuses = [200, 200, 500, 404];
+        let mut content = String::new();
+        for i in 1..=60 {
+            content.push_str(&format!(
+                "{{\"level\":\"{}\",\"status\":{},\"msg\":\"request {}\"}}\n",
+                levels[i % 4],
+                statuses[i % 4],
+                i
+            ));
+        }
+        temp_file(&content)
+    }
+
+    fn drawn_rows(app: &mut App) -> std::collections::BTreeMap<u16, String> {
+        let mut out: Vec<u8> = Vec::new();
+        app.draw(&mut out).unwrap();
+        rows_from_output(&out)
+    }
+
+    #[test]
+    fn selector_shaped_search_on_plain_text_is_an_ordinary_regex() {
+        let mut content = String::new();
+        for n in 1..=30 {
+            content.push_str(&format!("line {n} .status >= 500 literal\n"));
+        }
+        let path = temp_file(&content);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app); // sniff: plain text
+        app.apply(Action::ScrollLines(1)).unwrap();
+        app.apply(Action::SearchInput(
+            ".status >= 500".to_string(),
+            Direction::Forward,
+            1,
+        ))
+        .expect("less finds this text, so must rless");
+        assert_eq!(app.top, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn structured_search_is_repeated_by_n_and_reversed_by_n_upper() {
+        let path = jsonl_fixture();
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app); // sniff: jsonl
+        app.apply(Action::SearchInput(
+            ".status >= 500".to_string(),
+            Direction::Forward,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(app.top, 2);
+        app.apply(Action::RepeatSearch(1)).unwrap();
+        assert_eq!(app.top, 6);
+        app.apply(Action::RepeatSearch(1)).unwrap();
+        assert_eq!(app.top, 10);
+        app.apply(Action::RepeatSearchReverse(1)).unwrap();
+        assert_eq!(app.top, 6);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn n_after_upper_n_keeps_the_original_search_direction() {
+        let path = lines_fixture(200);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        // Lines 010, 100, 110..119, 200... contain "10"; use a sparse one.
+        app.apply(Action::SearchInput(
+            "^0[2468]0 ".to_string(),
+            Direction::Forward,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(app.top, 20);
+        app.apply(Action::RepeatSearch(1)).unwrap();
+        assert_eq!(app.top, 40);
+        app.apply(Action::RepeatSearch(1)).unwrap();
+        assert_eq!(app.top, 60);
+        app.apply(Action::RepeatSearchReverse(1)).unwrap();
+        assert_eq!(app.top, 40);
+        app.apply(Action::RepeatSearch(1)).unwrap();
+        assert_eq!(app.top, 60, "n after N must search forward again");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn each_file_gets_its_own_format_and_columns() {
+        let jsonl = jsonl_fixture();
+        let csv = temp_file("name,age,city\nalice,30,tokyo\nbob,25,osaka\n");
+        let mut app = App::new(test_opts(vec![jsonl.clone(), csv.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::JsonLines);
+        app.apply(Action::NextFile(1)).unwrap();
+        app.apply(Action::ToggleTabular).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        let names: Vec<_> = app.projection.columns.iter().map(|c| &c.name).collect();
+        assert_eq!(names, ["name", "age", "city"]);
+        assert_eq!(rows[&1], "alice│30  │tokyo│");
+        let _ = std::fs::remove_file(jsonl);
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[test]
+    fn invalid_filter_is_rejected_and_the_previous_filter_kept() {
+        let path = jsonl_fixture();
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        app.apply(Action::FilterInput("ERROR".to_string())).unwrap();
+        let err = app
+            .apply(Action::FilterInput("(unclosed".to_string()))
+            .unwrap_err();
+        assert_eq!(err, "Invalid pattern");
+        assert_eq!(app.active_filter, Some(Query::parse("ERROR")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plain_text_feedback_does_not_claim_a_structured_effect() {
+        let path = lines_fixture(50);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        app.apply(Action::ToggleTabular).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("no effect")
+        );
+        app.apply(Action::FilterInput("line".to_string())).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("no effect")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_mode_prompt_names_the_focus_and_clamps_it() {
+        let path = jsonl_fixture();
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        let mut out: Vec<u8> = Vec::new();
+        drawn_rows(&mut app);
+        for c in ['c', 'x', 'l', 'l', 'l', 'l', 'l'] {
+            let (code, m) = key(c);
+            app.handle_key(&mut out, code, m).unwrap();
+        }
+        assert_eq!(app.focused_column, 2, "3 columns: focus stops at the last");
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&23].starts_with("Columns: 3/3 msg"), "{}", rows[&23]);
+
+        // Feedback of an action in column mode is shown, not hidden.
+        let (code, m) = key('p');
+        app.handle_key(&mut out, code, m).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&23], "Column 'msg' pinned");
+        let (code, m) = key('s');
+        app.handle_key(&mut out, code, m).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&23], "Sorting by 'msg' is not supported yet");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_names_in_messages_are_escaped() {
+        let path = temp_file("{\"le\u{7}vel\":\"x\"}\n{\"le\u{7}vel\":\"y\"}\n");
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::JsonLines);
+        app.apply(Action::PinColumn).unwrap();
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Column 'le^Gvel' pinned")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn toggles_without_a_visible_effect_explain_themselves() {
+        let path = lines_fixture(30);
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        app.apply(Action::ToggleExpand).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("JSON lines only")
+        );
+        assert!(app.projection.expanded_lines.is_empty());
+        app.apply(Action::ToggleStickyHeader).unwrap();
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .contains("no effect")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cycling_the_format_derives_that_formats_columns() {
+        let path = temp_file("a,b\n1,2\n3,4\n");
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        // csv -> tsv -> logfmt -> plain -> jsonl -> csv
+        for _ in 0..5 {
+            app.apply(Action::ToggleFormat).unwrap();
+        }
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        let names: Vec<_> = app.projection.columns.iter().map(|c| &c.name).collect();
+        assert_eq!(names, ["a", "b"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn projected_rows_never_exceed_the_terminal_width() {
+        let path = jsonl_fixture();
+        let mut app = App::new(test_opts(vec![path.clone()]));
+        app.set_size(20, 6);
+        drawn_rows(&mut app);
+        app.apply(Action::ToggleTabular).unwrap();
+        app.apply(Action::ToggleStickyHeader).unwrap();
+        let rows = drawn_rows(&mut app);
+        for (r, text) in &rows {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(text.as_str()) <= 20,
+                "row {r} overflows: {text:?}"
+            );
+        }
+        assert!(rows[&1].ends_with('>'), "a cut row carries the chop marker");
+        let _ = std::fs::remove_file(path);
     }
 }

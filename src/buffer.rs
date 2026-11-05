@@ -10,6 +10,9 @@ use std::path::PathBuf;
 
 pub enum Source {
     File(PathBuf),
+    /// Read through an ordinary `BufReader`: crossterm reads keyboard
+    /// events from the controlling tty on Unix, not from `std::io::stdin()`,
+    /// so piping content over stdin does not conflict with key handling.
     Stdin,
 }
 
@@ -212,14 +215,6 @@ fn describe_io_error(e: &io::Error) -> String {
         _ => e.to_string(),
     }
 }
-
-/// Reads the raw bytes of stdin fully upfront isn't used; kept here only to
-/// document why Buffer::Source::Stdin uses BufReader::new directly: crossterm
-/// reads keyboard events via the controlling tty on Unix, not via
-/// `std::io::stdin()`, so piping file content over stdin does not conflict
-/// with interactive key handling.
-#[allow(dead_code)]
-fn _doc_marker() {}
 
 #[cfg(test)]
 mod tests {

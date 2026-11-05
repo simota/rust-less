@@ -12,12 +12,8 @@
 //! captured evidence than a general parser for syntax no other format
 //! string in scope exercises.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Short,
-    Medium,
-    Long,
-}
+pub use crate::cli::PromptMode as Mode;
+use unicode_width::UnicodeWidthChar;
 
 pub struct PromptContext<'a> {
     pub filename: Option<&'a str>,
@@ -155,13 +151,26 @@ fn percent_only(ctx: &PromptContext) -> String {
     }
 }
 
-/// §3 item 4: prompt truncation drops LEADING characters, keeping the tail.
+/// §3 item 4: prompt truncation drops LEADING characters, keeping the
+/// tail. Counted in display columns, so a double-width character counts
+/// twice and a wide filename cannot push the row past `width` (for ASCII
+/// this is the same as counting characters).
 fn truncate_left(text: &str, width: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
+    let char_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    if text.chars().map(char_width).sum::<usize>() <= width {
         return text.to_string();
     }
-    chars[chars.len() - width..].iter().collect()
+    let mut used = 0;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = char_width(c);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    text[start..].to_string()
 }
 
 #[cfg(test)]
@@ -291,6 +300,16 @@ mod tests {
             text,
             "ity/fixtures/multi-1.txt (file 1 of 3) (END) - Next: parity/fixtures/multi-2.txt"
         );
+    }
+
+    #[test]
+    fn truncation_counts_display_columns_for_wide_characters() {
+        // 10 double-width characters = 20 columns; keep the tail that fits.
+        let text = "日本語のファイル名です";
+        let cut = truncate_left(text, 9);
+        assert_eq!(cut, "ル名です");
+        assert!(truncate_left("abc", 3) == "abc");
+        assert_eq!(truncate_left("abcdef", 4), "cdef");
     }
 
     #[test]

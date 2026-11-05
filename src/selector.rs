@@ -95,6 +95,16 @@ impl Query {
         Query::Regex(RegexQuery::new(input.to_string()))
     }
 
+    /// False for a plain-regex query whose pattern does not compile (such a
+    /// query matches nothing, so applying it as a filter would blank the
+    /// view without saying why).
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Query::Regex(q) => q.regex().is_some(),
+            Query::Structured(_) => true,
+        }
+    }
+
     /// Evaluates the query against a raw line and its format.
     pub fn matches_line(&self, line: &[u8], format: DetectedFormat) -> bool {
         match self {
@@ -112,24 +122,7 @@ impl Query {
                 }
                 SPAN_SCRATCH.with(|scratch| {
                     let spans = &mut *scratch.borrow_mut();
-                    match format {
-                        DetectedFormat::JsonLines => {
-                            StructuralClassifier::scan_json_line(line, spans);
-                        }
-                        DetectedFormat::Csv | DetectedFormat::Tsv => {
-                            let delim = if format == DetectedFormat::Csv {
-                                b','
-                            } else {
-                                b'\t'
-                            };
-                            StructuralClassifier::scan_csv_line(line, delim, spans);
-                        }
-                        DetectedFormat::Logfmt => {
-                            StructuralClassifier::scan_logfmt_line(line, spans);
-                        }
-                        DetectedFormat::PlainText => return false,
-                    }
-
+                    StructuralClassifier::scan_fields(format, line, spans);
                     preds
                         .iter()
                         .all(|pred| evaluate_predicate(pred, line, spans))
