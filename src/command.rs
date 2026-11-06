@@ -245,6 +245,11 @@ impl App {
         let rows = self.content_rows();
         let opts = self.render_opts();
         let buffer = &mut self.files[0].buffer;
+        // A pipe must not look short just because its producer is slow to
+        // start (`git log` computing): wait for a screenful or the end.
+        while buffer.is_open_stream() && buffer.lines_cached() <= rows {
+            buffer.ensure_lines_read(rows + 1)?;
+        }
         let win = screen::render_window(buffer, 1, rows, &opts, None)?;
         if !win.at_eof || win.rows.len() > rows {
             return Ok(None);
@@ -1860,7 +1865,7 @@ impl App {
         let filename = self.current().display();
         let view_tag = self.view_tag();
 
-        let (total_lines, total_bytes, byte_offset) = if needs_totals {
+        let (mut total_lines, total_bytes, byte_offset) = if needs_totals {
             let buffer = &mut self.current().buffer;
             let total_lines = buffer.total_lines().ok();
             let total_bytes = buffer.total_bytes().ok();
@@ -1869,13 +1874,27 @@ impl App {
         } else {
             (None, None, 0)
         };
+        // A sorted view's rows are not in line order: count rows, not
+        // buffer lines, so `lines a-b/N` and the percentage stay true.
+        let (mut top_line, mut bottom_line) = (self.top, bottom_line);
+        if needs_totals && self.view.as_ref().is_some_and(ViewIndex::is_sorted) {
+            let (top, bottom) = (top_line, bottom_line);
+            let (view, buffer) = self.view_and_buffer();
+            if let (Ok(Some(t)), Ok(Some(b)), Ok(n)) = (
+                view.position_of(buffer, top),
+                view.position_of(buffer, bottom),
+                view.total(buffer),
+            ) {
+                (top_line, bottom_line, total_lines) = (t + 1, b + 1, Some(n));
+            }
+        }
 
         let ctx = PromptContext {
             filename: filename.as_deref(),
             show_filename: self.filename_shown,
             file_index,
             file_count,
-            top_line: self.top,
+            top_line,
             bottom_line,
             total_lines,
             at_eof,
@@ -3145,5 +3164,21 @@ mod tests {
         assert!(rows[&0].contains("\"level\":\"ERROR\""), "{}", rows[&0]);
         let _ = std::fs::remove_file(jsonl);
         let _ = std::fs::remove_file(plain);
+    }
+
+    #[test]
+    fn long_prompt_counts_rows_of_a_sorted_view() {
+        let path = scores_csv();
+        let mut app = App::new(Options {
+            prompt_mode: PromptMode::Long,
+            ..test_opts(vec![path.clone()])
+        });
+        app.set_size(80, 4);
+        drawn_rows(&mut app);
+        feed(&mut app, "cxllsq\n");
+        let rows = drawn_rows(&mut app);
+        // q dismissed the sort message, so Enter moved one row down.
+        assert!(rows[&3].contains("lines 2-4/6 66%"), "{}", rows[&3]);
+        let _ = std::fs::remove_file(path);
     }
 }

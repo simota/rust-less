@@ -31,7 +31,18 @@ spec and for Phase 4: **mark (`m`/`'`), follow (`F`), filter (`&`), `-i`, `-I`, 
 screen (`h`), editor (`v`), horizontal scroll (`ESC-(` / `ESC-)`), `-p`, `-F`, `-X`**. No baseline
 scenario exercises them; implementing them is not required for Phase 4/5 parity.
 
-Horizontal scroll is out of scope **even under `-S`**: `opt-chop-long-lines` (feature
+**Extensions after Phase 5 (not parity-verified).** Most of the deferred features above now
+exist as rless's own extensions: mark (`m`/`'`, plus `''`), follow (`F`, `+F`), filter (`&`,
+`&!`), `-i`/`-I` (also typed in the pager, with `-N` and `-S`), `+cmd`, `-p`, `-F`, `-X`, a help
+screen (`h`, this project's own text, not less's), and horizontal scroll (Right/Left, `ESC-)`/
+`ESC-(`, under `-S` and in the table view). No baseline scenario covers them, so they are
+specified by `cargo test` and `docs/fvi/fvi_probe.py`, not by the less oracle; known
+differences from less: any key (not only the interrupt key) stops `F`, `-F` prints the rendered
+input instead of drawing it, and `$LESS` contributes only the flags rless implements. The editor
+(`v`) stays out of scope. None of these keys or flags appears in a parity scenario, and
+`make parity` stays 40/40.
+
+Horizontal scroll was out of scope for parity **even under `-S`**: `opt-chop-long-lines` (feature
 `opt-chop-long-lines-S`) verifies only that long lines are truncated with a trailing `>` marker
 (§2, `opt-chop-long-lines`); the `RIGHT-ARROW` reveal-of-chopped-content behavior that
 `declared-inventory.json`'s `fixture_needs` mentions is not captured by any scenario and is
