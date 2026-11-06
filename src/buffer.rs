@@ -98,7 +98,19 @@ impl Buffer {
     }
 
     /// Reads lines until at least `up_to` lines are cached, or EOF.
+    #[inline]
     pub fn ensure_lines_read(&mut self, up_to: usize) -> Result<(), String> {
+        // Fast path for line-by-line scans over cached lines (search,
+        // filters, rendering): a cached line implies the source opened, so
+        // this returns exactly what the full path would. `up_to == 0` takes
+        // the full path, which still reports an open error.
+        if up_to > 0 && self.line_ends.len() >= up_to {
+            return Ok(());
+        }
+        self.read_more_lines(up_to)
+    }
+
+    fn read_more_lines(&mut self, up_to: usize) -> Result<(), String> {
         self.ensure_open()?;
         if self.eof || self.line_ends.len() >= up_to {
             return Ok(());
@@ -299,6 +311,7 @@ mod tests {
             "/nonexistent/does-not-exist-rust-less",
         )));
         assert!(buf.ensure_lines_read(1).is_err());
+        assert!(buf.ensure_lines_read(0).is_err());
     }
 
     #[test]
