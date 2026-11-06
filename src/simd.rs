@@ -26,6 +26,10 @@ pub struct FieldSpan {
     pub val_len: u16,
     pub val_type: FieldType,
     pub depth: u8,
+    /// Display width of the value. Only CSV/TSV scans fill it in (their
+    /// columns are sized from it); JSON-lines and logfmt scans leave it 0,
+    /// since every reader of those spans measures the value itself and
+    /// computing it per field was a large share of a structured search.
     pub display_width: u16,
 }
 
@@ -191,8 +195,6 @@ impl StructuralClassifier {
                 }
             }
 
-            let width = value_display_width(&slice[val_start..val_end]);
-
             out_spans.push(FieldSpan {
                 key_offset: base_offset + key_start as u32,
                 key_len: (key_end - key_start) as u16,
@@ -200,7 +202,7 @@ impl StructuralClassifier {
                 val_len: (val_end - val_start) as u16,
                 val_type,
                 depth: 0,
-                display_width: width,
+                display_width: 0, // not read for JSON lines (see the field)
             });
 
             // Advance past comma
@@ -350,8 +352,6 @@ impl StructuralClassifier {
                 }
             }
 
-            let width = value_display_width(&line[val_start..val_end]);
-
             out_spans.push(FieldSpan {
                 key_offset: key_start as u32,
                 key_len: (key_end - key_start) as u16,
@@ -359,7 +359,7 @@ impl StructuralClassifier {
                 val_len: (val_end - val_start) as u16,
                 val_type,
                 depth: 0,
-                display_width: width,
+                display_width: 0, // not read for logfmt (see the field)
             });
         }
     }
