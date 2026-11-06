@@ -44,6 +44,25 @@ pub enum Action {
     PinColumn,
     HideColumn,
     SortColumn,
+    /// Column mode `i`: value statistics of the focused column.
+    ColumnStats,
+    /// `F`: keep reading as the input grows.
+    Follow,
+    /// `m<c>`.
+    SetMark(char),
+    /// `'<c>`; `''` (the `'` character) goes back to the previous position.
+    GotoMark(char),
+    /// `h`.
+    Help,
+    /// `-<c>`: toggle option `c` (`N`, `S`, `i`, `I`).
+    ToggleOption(char),
+    /// (explicit count, rightward?): Right/Left, ESC-) / ESC-(.
+    HScroll(Option<u64>, bool),
+    /// `:w path` (`force` for `:w!`).
+    SaveView {
+        path: String,
+        force: bool,
+    },
     Quit,
 }
 
@@ -72,6 +91,16 @@ enum Mode {
     FilterPattern {
         buf: String,
     },
+    /// `:w` typed: reading the file name.
+    SavePath {
+        buf: String,
+    },
+    /// `m` typed: the next letter names the mark.
+    MarkSet,
+    /// `'` typed: the next letter names the mark.
+    MarkGoto,
+    /// `-` typed: the next letter names the option.
+    Dash,
     /// Column mode (`x`). The focused column itself lives in `command`,
     /// which knows how many columns exist.
     Column,
@@ -108,6 +137,10 @@ impl Decoder {
                 Some(format!("{}{}", lead, buf))
             }
             Mode::FilterPattern { buf } => Some(format!("&{}", buf)),
+            Mode::SavePath { buf } => Some(format!(":w{}", buf)),
+            Mode::MarkSet => Some("mark: ".to_string()),
+            Mode::MarkGoto => Some("goto mark: ".to_string()),
+            Mode::Dash => Some("-".to_string()),
             Mode::Colon => Some(format!("{}:", self.prefix)),
             Mode::Normal if !self.prefix.is_empty() => Some(self.prefix.clone()),
             _ => None,
@@ -146,7 +179,7 @@ impl Decoder {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         match &mut self.mode {
-            Mode::Pattern { buf, .. } | Mode::FilterPattern { buf } => {
+            Mode::Pattern { buf, .. } | Mode::FilterPattern { buf } | Mode::SavePath { buf } => {
                 return match edit_line(buf, code) {
                     LineEdit::Editing => Decoded::Redraw,
                     LineEdit::Cancel => {
@@ -158,6 +191,16 @@ impl Decoder {
                             Decoded::Action(Action::SearchInput(buf, dir, count))
                         }
                         Mode::FilterPattern { buf } => Decoded::Action(Action::FilterInput(buf)),
+                        Mode::SavePath { buf } => {
+                            let (force, path) = match buf.strip_prefix('!') {
+                                Some(rest) => (true, rest),
+                                None => (false, buf.as_str()),
+                            };
+                            Decoded::Action(Action::SaveView {
+                                path: path.trim().to_string(),
+                                force,
+                            })
+                        }
                         _ => unreachable!("matched a text-entry mode above"),
                     },
                 };
@@ -172,8 +215,24 @@ impl Decoder {
                 KeyCode::Char('p') => return Decoded::Action(Action::PinColumn),
                 KeyCode::Char('.') => return Decoded::Action(Action::HideColumn),
                 KeyCode::Char('s') => return Decoded::Action(Action::SortColumn),
+                KeyCode::Char('i') => return Decoded::Action(Action::ColumnStats),
                 _ => return Decoded::Redraw,
             },
+            Mode::MarkSet | Mode::MarkGoto | Mode::Dash => {
+                let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+                self.prefix.clear();
+                let KeyCode::Char(c) = code else {
+                    return Decoded::Redraw;
+                };
+                return match mode {
+                    Mode::MarkSet if c.is_ascii_lowercase() => Decoded::Action(Action::SetMark(c)),
+                    Mode::MarkGoto if c.is_ascii_lowercase() || c == '\'' => {
+                        Decoded::Action(Action::GotoMark(c))
+                    }
+                    Mode::Dash => Decoded::Action(Action::ToggleOption(c)),
+                    _ => Decoded::Redraw,
+                };
+            }
             Mode::Colon => {
                 self.mode = Mode::Normal;
                 let count = self.take_count();
@@ -181,6 +240,10 @@ impl Decoder {
                     KeyCode::Char('n') => Decoded::Action(Action::NextFile(count)),
                     KeyCode::Char('p') => Decoded::Action(Action::PrevFile(count)),
                     KeyCode::Char('q') | KeyCode::Char('Q') => Decoded::Action(Action::Quit),
+                    KeyCode::Char('w') => {
+                        self.mode = Mode::SavePath { buf: String::new() };
+                        Decoded::Redraw
+                    }
                     _ => Decoded::Redraw,
                 };
             }
@@ -195,6 +258,12 @@ impl Decoder {
                     }
                     KeyCode::Char('>') => {
                         Decoded::Action(Action::GotoLast(self.take_optional_count()))
+                    }
+                    KeyCode::Char(')') => {
+                        Decoded::Action(Action::HScroll(self.take_optional_count(), true))
+                    }
+                    KeyCode::Char('(') => {
+                        Decoded::Action(Action::HScroll(self.take_optional_count(), false))
                     }
                     _ => Decoded::Redraw,
                 };
@@ -269,6 +338,16 @@ impl Decoder {
                 self.mode = Mode::Column;
                 Some(Action::ToggleColumnMode)
             }
+            KeyCode::Char('F') => {
+                self.prefix.clear();
+                Some(Action::Follow)
+            }
+            KeyCode::Char('h') => {
+                self.prefix.clear();
+                Some(Action::Help)
+            }
+            KeyCode::Right => Some(Action::HScroll(self.take_optional_count(), true)),
+            KeyCode::Left => Some(Action::HScroll(self.take_optional_count(), false)),
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
             _ => None,
         };
@@ -301,6 +380,18 @@ impl Decoder {
             }
             KeyCode::Char(':') => {
                 self.mode = Mode::Colon;
+                Decoded::Redraw
+            }
+            KeyCode::Char('m') => {
+                self.mode = Mode::MarkSet;
+                Decoded::Redraw
+            }
+            KeyCode::Char('\'') => {
+                self.mode = Mode::MarkGoto;
+                Decoded::Redraw
+            }
+            KeyCode::Char('-') => {
+                self.mode = Mode::Dash;
                 Decoded::Redraw
             }
             KeyCode::Char('Z') => {
@@ -545,5 +636,73 @@ mod tests {
         d.feed(c, m);
         assert_eq!(d.feed(KeyCode::Esc, KeyModifiers::NONE), Decoded::Redraw);
         assert_eq!(d.preview(), None, "Esc cancels the prompt");
+    }
+
+    fn feed_all(d: &mut Decoder, keys: &str) -> Decoded {
+        let mut last = Decoded::Nothing;
+        for c in keys.chars() {
+            let code = if c == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            last = d.feed(code, KeyModifiers::NONE);
+        }
+        last
+    }
+
+    #[test]
+    fn new_commands_decode() {
+        let mut d = Decoder::new();
+        assert_eq!(feed_all(&mut d, "F"), Decoded::Action(Action::Follow));
+        assert_eq!(feed_all(&mut d, "h"), Decoded::Action(Action::Help));
+        assert_eq!(
+            feed_all(&mut d, "ma"),
+            Decoded::Action(Action::SetMark('a'))
+        );
+        assert_eq!(
+            feed_all(&mut d, "'b"),
+            Decoded::Action(Action::GotoMark('b'))
+        );
+        assert_eq!(
+            feed_all(&mut d, "''"),
+            Decoded::Action(Action::GotoMark('\''))
+        );
+        assert_eq!(feed_all(&mut d, "mZ"), Decoded::Redraw, "marks are a-z");
+        assert_eq!(
+            feed_all(&mut d, "-S"),
+            Decoded::Action(Action::ToggleOption('S'))
+        );
+        assert_eq!(
+            feed_all(&mut d, ":w out.log\n"),
+            Decoded::Action(Action::SaveView {
+                path: "out.log".to_string(),
+                force: false
+            })
+        );
+        assert_eq!(
+            feed_all(&mut d, ":w! out.log\n"),
+            Decoded::Action(Action::SaveView {
+                path: "out.log".to_string(),
+                force: true
+            })
+        );
+        assert_eq!(
+            d.feed(KeyCode::Right, KeyModifiers::NONE),
+            Decoded::Action(Action::HScroll(None, true))
+        );
+        feed_all(&mut d, "8");
+        assert_eq!(
+            d.feed(KeyCode::Left, KeyModifiers::NONE),
+            Decoded::Action(Action::HScroll(Some(8), false))
+        );
+        d.feed(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            feed_all(&mut d, ")"),
+            Decoded::Action(Action::HScroll(None, true))
+        );
+        feed_all(&mut d, "x");
+        assert_eq!(feed_all(&mut d, "i"), Decoded::Action(Action::ColumnStats));
+        assert_eq!(feed_all(&mut d, "s"), Decoded::Action(Action::SortColumn));
     }
 }

@@ -92,6 +92,10 @@ parity: release ## Verify rless against the captured less baseline (the ship gat
 	bash $(HARNESS)/run.sh $(BIN) $(SCENARIOS) $(TMP)/candidate
 	bash $(HARNESS)/diff.sh $(BASELINE) $(TMP)/candidate
 
+.PHONY: probe
+probe: release ## Scripted end-to-end feature tasks (docs/fvi/fvi_probe.py)
+	python3 docs/fvi/fvi_probe.py $(BIN)
+
 .PHONY: drift
 drift: ## Re-capture the reference and diff vs the stamped baseline (has the target moved?)
 	rm -rf $(TMP)/drift-check

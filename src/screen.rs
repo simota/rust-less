@@ -24,6 +24,9 @@ pub struct RenderOpts {
     pub line_numbers: bool,
     pub chop: bool,
     pub raw_ansi: bool,
+    /// Display columns skipped at the start of every line (horizontal
+    /// scroll). Only applies with `chop`: a wrapped line has nothing hidden.
+    pub hscroll: usize,
 }
 
 /// One content-producing unit inside a display row, before spans are
@@ -265,7 +268,13 @@ fn render_logical_line(
         }
         let (piece, consumed) = decode_piece(bytes, i, line_col);
         i += consumed;
+        let piece_start = line_col;
         line_col += piece.width;
+        if opts.chop && piece_start < opts.hscroll {
+            // Scrolled off to the left (a wide character or tab that
+            // straddles the edge goes with it).
+            continue;
+        }
 
         if opts.chop {
             if row_col + piece.width > content_width {
@@ -466,6 +475,42 @@ pub fn render_window(
     })
 }
 
+/// Renders the given buffer `lines` (a filtered or sorted view, in display
+/// order, already read) into at most `content_rows` rows. Returns the rows,
+/// the buffer line of the last row and whether every given line was shown
+/// in full.
+pub fn render_lines(
+    buffer: &Buffer,
+    lines: &[usize],
+    content_rows: usize,
+    opts: &RenderOpts,
+    highlight: Option<&Regex>,
+) -> (Vec<DisplayRow>, Option<usize>, bool) {
+    let mut rows: Vec<DisplayRow> = Vec::new();
+    let mut bottom = None;
+    let mut complete = true;
+    for &line_no in lines {
+        if rows.len() >= content_rows {
+            complete = false;
+            break;
+        }
+        let Some(raw) = buffer.line(line_no) else {
+            break;
+        };
+        let room = content_rows - rows.len();
+        let line_rows = render_logical_line(raw, line_no, opts, room + 1);
+        if line_rows.len() > room {
+            complete = false;
+        }
+        rows.extend(line_rows.into_iter().take(room).map(|r| match highlight {
+            Some(pat) => highlight_matches(r, pat),
+            None => r,
+        }));
+        bottom = Some(line_no);
+    }
+    (rows, bottom, complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +521,7 @@ mod tests {
             line_numbers: false,
             chop: false,
             raw_ansi: false,
+            hscroll: 0,
         }
     }
 
@@ -653,6 +699,7 @@ mod tests {
                     line_numbers: flags & 1 != 0,
                     chop: flags & 2 != 0,
                     raw_ansi: flags & 4 != 0,
+                    hscroll: 0,
                 };
                 for bytes in &samples {
                     let full = render_logical_line(bytes, 7, &o, usize::MAX);
