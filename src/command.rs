@@ -2,35 +2,148 @@
 //! half-window N, current file index and the multi-file list, the
 //! "first draw of this process" flag, and dispatches decoded `Action`s to
 //! `buffer`/`screen`/`search`/`prompt`.
+//!
+//! Beyond the less-parity core it owns the paging features layered on top:
+//! the `&` line filter (any format), marks, horizontal scroll, option
+//! toggles, follow mode, per-file remembered positions, the help page,
+//! `:e`, and the structured views' column sort.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::buffer::{Buffer, Source};
-use crate::cli::{BellMode, Options, PromptMode};
+use crate::cli::{BellMode, CaseMode, Options, PromptMode};
 use crate::input::{Action, Decoded, Decoder};
-use crate::projection::{ProjectionEngine, clip_to_width, escape_controls};
+use crate::projection::{ProjectionEngine, SortKey, clip_to_width, escape_controls};
 use crate::prompt::{self, PromptContext};
 use crate::screen::{self, RenderOpts};
 use crate::search::{self, Direction};
 use crate::selector::Query;
 use crate::sniffer::{DetectedFormat, FormatSniffer};
 
+/// A sorted snapshot of a structured file (column mode `s`): the sorted
+/// lines live in their own in-memory buffer, so every view, search,
+/// filter and mark works on it unchanged.
+struct SortedView {
+    buffer: Buffer,
+    column: String,
+    descending: bool,
+}
+
 struct FileEntry {
     buffer: Buffer,
+    sorted: Option<SortedView>,
+    /// The view of this file when another file was last switched to, so
+    /// `:p` returns to where the user was (as less does).
+    saved_view: Option<ViewState>,
 }
 
 impl FileEntry {
+    fn new(source: Source) -> Self {
+        FileEntry {
+            buffer: Buffer::new(source),
+            sorted: None,
+            saved_view: None,
+        }
+    }
+
     fn display(&self) -> Option<String> {
         self.buffer.display_name()
     }
+
+    /// The buffer the views read: the sorted snapshot when there is one.
+    fn buf(&mut self) -> &mut Buffer {
+        match &mut self.sorted {
+            Some(s) => &mut s.buffer,
+            None => &mut self.buffer,
+        }
+    }
+}
+
+/// The file being shown: the help page while it is open, else the current
+/// file. A free function over the two fields (not a method on `App`) so a
+/// caller can hold the buffer while reading other `App` fields.
+fn entry_mut<'a>(
+    files: &'a mut [FileEntry],
+    index: usize,
+    help: &'a mut Option<HelpState>,
+) -> &'a mut FileEntry {
+    match help {
+        Some(h) => &mut h.entry,
+        None => &mut files[index],
+    }
+}
+
+/// The per-file part of the view, kept across file switches.
+struct ViewState {
+    top: usize,
+    projection: ProjectionEngine,
+    tabular_view: bool,
+    active_filter: Option<ActiveFilter>,
+    focused_column: usize,
+    sniffer_checked: bool,
+}
+
+impl ViewState {
+    fn fresh(raw_ansi: bool) -> Self {
+        let mut projection = ProjectionEngine::new(DetectedFormat::PlainText);
+        projection.raw_ansi = raw_ansi;
+        ViewState {
+            top: 1,
+            projection,
+            tabular_view: false,
+            active_filter: None,
+            focused_column: 0,
+            sniffer_checked: false,
+        }
+    }
+}
+
+/// The help page, shown in place of the current file until `q`.
+struct HelpState {
+    entry: FileEntry,
+    saved_view: ViewState,
+    saved_hshift: usize,
+}
+
+/// The `&` filter: only lines that match (or, with `&!`, that do not) are
+/// shown, scrolled through and searched.
+#[derive(Debug, Clone)]
+struct ActiveFilter {
+    /// What was typed after `&` (and after `!`), kept to rebuild the query
+    /// when the format or the case rule changes.
+    source: String,
+    invert: bool,
+    query: Query,
+}
+
+impl ActiveFilter {
+    fn keeps(&self, raw: &[u8], projection: &ProjectionEngine) -> bool {
+        let lookup = |name: &str| projection.column_index(name);
+        self.query
+            .matches_line_with(raw, projection.format, &lookup)
+            != self.invert
+    }
+
+    fn label(&self) -> String {
+        format!("&{}{}", if self.invert { "!" } else { "" }, self.source)
+    }
+}
+
+/// A place in the file list: file and top line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    file_index: usize,
+    top: usize,
 }
 
 /// Bell classes per §2 `prompt-error-bell`'s documented rule: `-q` silences
@@ -47,13 +160,20 @@ enum BellClass {
 /// The last search, kept for `n`/`N` and (regex only) match highlighting.
 #[derive(Debug, Clone)]
 enum SearchPattern {
-    Regex(Regex),
+    /// The typed pattern is kept to recompile it when the case rule changes.
+    Regex(Regex, String),
     /// A selector query (`/.status >= 500`) on a structured file.
     Structured(Query),
 }
 
 /// How many leading lines the format sniffer and column derivation sample.
 const SNIFF_SAMPLE_LINES: usize = 16;
+
+/// How often follow mode (`F`) looks for new input.
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+const FOLLOW_PROMPT: &str = "Waiting for data... (any key stops following)";
+const HELP_PROMPT: &str = "HELP -- Press q when done";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyOutcome {
@@ -81,15 +201,34 @@ pub struct App {
     width: u16,
     height: u16,
     decoder: Decoder,
-    /// Structured-view state of the *current* file; reset on `:n`/`:p`.
+    /// Structured-view state of the *current* file; saved with the rest of
+    /// its view on `:n`/`:p` and restored on return.
     projection: ProjectionEngine,
     tabular_view: bool,
-    active_filter: Option<Query>,
+    active_filter: Option<ActiveFilter>,
     /// Index into `projection.columns` of the column-mode focus.
     focused_column: usize,
     /// Whether the current file's format has been sniffed (once per file,
     /// on its first draw).
     sniffer_checked: bool,
+    /// Horizontal scroll in display columns (all files share it, as in less).
+    hshift: usize,
+    /// Case rule of `/`, `?` and `&` (`-i`/`-I`, toggled while paging).
+    case: CaseMode,
+    marks: HashMap<char, Position>,
+    /// Where the last jump (goto, search, mark, file switch) started, for `''`.
+    last_jump: Option<Position>,
+    /// Follow mode (`F`) is on: new input is shown as it arrives.
+    following: bool,
+    help: Option<HelpState>,
+    /// The last frame's bottom line and end-of-input state (for `=`).
+    last_bottom: (usize, bool),
+    /// `v` asked to open this file at this line in the editor; the main
+    /// loop, which owns the terminal, runs it.
+    pending_edit: Option<(PathBuf, usize)>,
+    /// The last frame ran out of piped input that has not arrived yet: the
+    /// main loop watches for it and redraws as it comes.
+    awaiting_input: bool,
     /// Reused frame buffer for `draw` (kept to avoid regrowing it per frame).
     frame_buf: Vec<u8>,
 }
@@ -97,24 +236,20 @@ pub struct App {
 impl App {
     pub fn new(opts: Options) -> Self {
         let files: Vec<FileEntry> = if opts.files.is_empty() {
-            vec![FileEntry {
-                buffer: Buffer::new(Source::Stdin),
-            }]
+            vec![FileEntry::new(Source::Stdin)]
         } else {
             opts.files
                 .iter()
-                .map(|p: &PathBuf| FileEntry {
-                    buffer: Buffer::new(Source::File(p.clone())),
-                })
+                .map(|p: &PathBuf| FileEntry::new(Source::File(p.clone())))
                 .collect()
         };
-        let mut projection = ProjectionEngine::new(DetectedFormat::PlainText);
-        projection.raw_ansi = opts.raw_control_chars;
+        let view = ViewState::fresh(opts.raw_control_chars);
+        let case = opts.case;
         App {
             opts,
             files,
             file_index: 0,
-            top: 1,
+            top: view.top,
             sticky_half: None,
             first_render_done: false,
             filename_shown: true,
@@ -123,13 +258,32 @@ impl App {
             width: 80,
             height: 24,
             decoder: Decoder::new(),
-            projection,
-            tabular_view: false,
-            active_filter: None,
-            focused_column: 0,
-            sniffer_checked: false,
+            projection: view.projection,
+            tabular_view: view.tabular_view,
+            active_filter: view.active_filter,
+            focused_column: view.focused_column,
+            sniffer_checked: view.sniffer_checked,
+            hshift: 0,
+            case,
+            marks: HashMap::new(),
+            last_jump: None,
+            following: false,
+            help: None,
+            last_bottom: (1, false),
+            awaiting_input: false,
+            pending_edit: None,
             frame_buf: Vec::new(),
         }
+    }
+
+    /// `-X`: page in the normal screen instead of the alternate one.
+    pub fn no_init(&self) -> bool {
+        self.opts.no_init
+    }
+
+    /// `-F`: exit at once when the input fits on one screen.
+    pub fn quit_if_one_screen(&self) -> bool {
+        self.opts.quit_if_one_screen
     }
 
     pub fn set_size(&mut self, w: u16, h: u16) {
@@ -152,11 +306,16 @@ impl App {
             line_numbers: self.opts.line_numbers,
             chop: self.opts.chop_long_lines,
             raw_ansi: self.opts.raw_control_chars,
+            hshift: self.hshift,
         }
     }
 
     fn current(&mut self) -> &mut FileEntry {
-        &mut self.files[self.file_index]
+        entry_mut(&mut self.files, self.file_index, &mut self.help)
+    }
+
+    fn buffer(&mut self) -> &mut Buffer {
+        self.current().buf()
     }
 
     /// Eagerly validates the very first file before any terminal state is
@@ -167,9 +326,69 @@ impl App {
         Ok(())
     }
 
+    /// `-F`: when there is a single input and it fits on one screen,
+    /// returns its rendered rows (as terminal bytes, one row per line) so
+    /// the caller can print them and exit without paging. `None` means the
+    /// pager is needed (more than a screen, several files, or content that
+    /// would first ask "may be a binary file").
+    pub fn one_screen_output(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.files.len() != 1 {
+            return Ok(None);
+        }
+        if !self.opts.raw_control_chars && self.files[0].buffer.sniff_binary()? {
+            return Ok(None);
+        }
+        let rows = self.content_rows();
+        let opts = self.render_opts();
+        let win = screen::render_window(&mut self.files[0].buffer, 1, rows + 1, &opts, None)?;
+        if !win.at_eof || win.rows.len() > rows {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        for row in &win.rows {
+            write_spans(&mut out, row).map_err(|e| e.to_string())?;
+            if opts.raw_ansi {
+                out.extend_from_slice(b"\x1b[0m");
+            }
+            out.push(b'\n');
+        }
+        Ok(Some(out))
+    }
+
     fn binary_prompt_text(&self) -> String {
         let name = self.files[0].display().unwrap_or_default();
         format!("\"{}\" may be a binary file.  See it anyway?", name)
+    }
+
+    /// Runs `+cmd`/`-p`/`--filter` commands as if typed, before the first
+    /// screen is drawn. A command left waiting for input (`/pattern`) is
+    /// submitted. An error is shown on the first screen.
+    fn run_initial_commands(&mut self) -> KeyOutcome {
+        let commands = std::mem::take(&mut self.opts.initial_commands);
+        if commands.is_empty() {
+            return KeyOutcome::Continue;
+        }
+        self.ensure_format_sniffed();
+        for cmd in commands {
+            let mut keys: Vec<KeyCode> = cmd.chars().map(KeyCode::Char).collect();
+            keys.push(KeyCode::Enter);
+            for (i, code) in keys.into_iter().enumerate() {
+                // The trailing Enter only submits an unfinished prompt.
+                if code == KeyCode::Enter && i > 0 && !self.decoder.in_text_entry() {
+                    break;
+                }
+                if let Decoded::Action(action) = self.decoder.feed(code, KeyModifiers::NONE) {
+                    if action == Action::Quit {
+                        return KeyOutcome::Quit;
+                    }
+                    if let Err(msg) = self.apply(action) {
+                        self.pending_message = Some(format!("{}  (press RETURN)", msg));
+                    }
+                }
+            }
+            self.decoder.reset();
+        }
+        KeyOutcome::Continue
     }
 
     /// Runs the interactive loop until quit. Returns the process exit code.
@@ -193,11 +412,28 @@ impl App {
             }
         }
 
+        if self.run_initial_commands() == KeyOutcome::Quit {
+            return Ok(0);
+        }
         self.draw(out)?;
         loop {
+            if (self.following || self.awaiting_input) && !event::poll(FOLLOW_POLL)? {
+                let changed = if self.following {
+                    self.follow_tick()?
+                } else {
+                    self.input_arrived()
+                };
+                if changed {
+                    self.draw(out)?;
+                }
+                continue;
+            }
             match event::read()? {
                 Event::Resize(w, h) => {
                     self.set_size(w, h);
+                    if self.following {
+                        self.follow_tick()?;
+                    }
                     self.draw(out)?;
                 }
                 Event::Key(k) => {
@@ -207,6 +443,9 @@ impl App {
                     match self.handle_key(out, k.code, k.modifiers)? {
                         KeyOutcome::Quit => return Ok(0),
                         KeyOutcome::Continue => {}
+                    }
+                    if let Some((path, line)) = self.pending_edit.take() {
+                        self.run_editor(out, &path, line)?;
                     }
                 }
                 _ => {}
@@ -224,6 +463,13 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> io::Result<KeyOutcome> {
+        if self.following {
+            // Any key ends follow mode and is consumed by doing so.
+            self.following = false;
+            self.decoder.reset();
+            self.draw(out)?;
+            return Ok(KeyOutcome::Continue);
+        }
         if self.pending_message.is_some() {
             // Any key dismisses a "(press RETURN)" message; per
             // `nav-goto-line/after-50G-mid-file` (baseline top lands on 50
@@ -241,6 +487,10 @@ impl App {
             }
         }
         match self.decoder.feed(code, modifiers) {
+            Decoded::Action(Action::Quit) if self.help.is_some() => {
+                self.close_help();
+                self.draw(out)?;
+            }
             Decoded::Action(Action::Quit) => return Ok(KeyOutcome::Quit),
             Decoded::Action(action) => {
                 let was_scroll = matches!(
@@ -276,27 +526,74 @@ impl App {
     /// `j` (no-op, screen byte-identical) must still redraw bottom-anchored
     /// with no tilde — only a real position/file change may switch to
     /// top-anchor+tilde on the next draw.
+    ///
+    /// Jumps (goto, search, marks, file switches) also remember where they
+    /// started, for `''`.
     fn apply(&mut self, action: Action) -> Result<(), String> {
         let old_top = self.top;
         let old_file_index = self.file_index;
+        let was_help = self.help.is_some();
+        let is_jump = matches!(
+            action,
+            Action::GotoLine(_)
+                | Action::GotoLast(_)
+                | Action::GotoPercent(_)
+                | Action::SearchInput(..)
+                | Action::RepeatSearch(_)
+                | Action::RepeatSearchReverse(_)
+                | Action::NextFile(_)
+                | Action::PrevFile(_)
+                | Action::GotoFile(_)
+                | Action::Examine(_)
+        );
         let result = self.apply_inner(action);
-        if result.is_ok() && (self.top != old_top || self.file_index != old_file_index) {
+        let moved = self.top != old_top || self.file_index != old_file_index;
+        if result.is_ok() && moved {
             self.first_render_done = true;
+            if is_jump && !was_help && self.help.is_none() {
+                self.last_jump = Some(Position {
+                    file_index: old_file_index,
+                    top: old_top,
+                });
+            }
         }
         result
     }
 
     fn apply_inner(&mut self, action: Action) -> Result<(), String> {
+        if self.help.is_some()
+            && matches!(
+                action,
+                Action::NextFile(_)
+                    | Action::PrevFile(_)
+                    | Action::GotoFile(_)
+                    | Action::Examine(_)
+                    | Action::Reload
+                    | Action::Follow
+                    | Action::SetMark(_)
+                    | Action::GotoMark(_)
+            )
+        {
+            self.close_help();
+        }
         match action {
             Action::ScrollLines(n) => {
-                let proposed = shift(self.top, n);
-                self.top = self.clamp_relative(proposed)?;
+                if self.active_filter.is_some() {
+                    self.scroll_visible(n.unsigned_abs(), n >= 0)?;
+                } else {
+                    let proposed = shift(self.top, n);
+                    self.top = self.clamp_relative(proposed)?;
+                }
             }
             Action::ScrollWindow(n, forward) => {
-                let mag = n.unwrap_or(self.content_rows() as u64) as i64;
-                let signed = if forward { mag } else { -mag };
-                let proposed = shift(self.top, signed);
-                self.top = self.clamp_relative(proposed)?;
+                let mag = n.unwrap_or(self.content_rows() as u64);
+                if self.active_filter.is_some() {
+                    self.scroll_visible(mag, forward)?;
+                } else {
+                    let signed = if forward { mag as i64 } else { -(mag as i64) };
+                    let proposed = shift(self.top, signed);
+                    self.top = self.clamp_relative(proposed)?;
+                }
             }
             Action::ScrollHalfWindow(n, forward) => {
                 let mag = match n {
@@ -305,29 +602,44 @@ impl App {
                         v
                     }
                     None => self.half_window(),
-                } as i64;
-                let signed = if forward { mag } else { -mag };
-                let proposed = shift(self.top, signed);
-                self.top = self.clamp_relative(proposed)?;
+                };
+                if self.active_filter.is_some() {
+                    self.scroll_visible(mag, forward)?;
+                } else {
+                    let signed = if forward { mag as i64 } else { -(mag as i64) };
+                    let proposed = shift(self.top, signed);
+                    self.top = self.clamp_relative(proposed)?;
+                }
             }
             Action::GotoLine(n) => {
                 let target = n.unwrap_or(1);
                 self.top = self.goto_absolute(target)?;
+                if n.is_none() && self.active_filter.is_some() {
+                    self.top = self.next_visible_from(1)?.unwrap_or(1);
+                }
             }
             Action::GotoLast(n) => match n {
                 Some(target) => {
                     self.top = self.goto_absolute(target)?;
                 }
                 None => {
-                    let total = self.current().buffer.total_lines()?;
-                    let content_rows = self.content_rows();
-                    self.top = if total > content_rows {
-                        total - content_rows + 1
-                    } else {
-                        1
-                    };
+                    self.buffer().ensure_full_read()?;
+                    self.top = self.tail_top()?;
                 }
             },
+            Action::GotoPercent(n) => {
+                let percent = n.unwrap_or(0).min(100) as usize;
+                let total = self.buffer().total_lines()?;
+                let target = (total * percent / 100).max(1);
+                let target = if self.active_filter.is_some() {
+                    self.next_visible_from(target)?
+                        .or(self.prev_visible_from(target)?)
+                        .unwrap_or(target)
+                } else {
+                    target
+                };
+                self.top = target.min(self.tail_top()?).max(1);
+            }
             Action::SearchInput(pattern, dir, count) => {
                 self.run_search(&pattern, dir, count, true)?;
             }
@@ -373,6 +685,7 @@ impl App {
                 self.projection.set_format(next);
                 self.projection.update_columns_from_lines(&sample);
                 self.focused_column = 0;
+                self.rebuild_filter();
                 self.pending_message = Some(format!("Format: {}", next.name()));
             }
             Action::ToggleColumnMode => {
@@ -404,40 +717,68 @@ impl App {
                     self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
-            Action::SortColumn => {
-                // Bound but not implemented: say so instead of implying a
-                // sort happened.
-                if let Some(col) = self.projection.columns.get(self.focused_column) {
-                    self.pending_message = Some(format!(
-                        "Sorting by '{}' is not supported yet",
-                        escape_controls(&col.name, false)
-                    ));
+            Action::SortColumn => self.cycle_sort()?,
+            Action::FilterInput(buf) => self.set_filter(&buf)?,
+            Action::NextFile(n) => self.switch_file(self.file_index as i64 + n as i64)?,
+            Action::PrevFile(n) => self.switch_file(self.file_index as i64 - n as i64)?,
+            Action::GotoFile(n) => {
+                let target = n.unwrap_or(1) as i64 - 1;
+                if target as usize >= self.files.len() {
+                    return Err("No such file".to_string());
+                }
+                if target as usize != self.file_index {
+                    self.switch_file(target)?;
                 }
             }
-            Action::FilterInput(buf) => {
-                if buf.trim().is_empty() {
-                    self.active_filter = None;
-                    self.pending_message = Some("Filter cleared".to_string());
+            Action::Examine(name) => self.examine(name.trim())?,
+            Action::ScrollHorizontal(n, right) => {
+                let step = n.map_or_else(|| (self.width as usize / 2).max(1), |v| v as usize);
+                if right {
+                    let max = self.max_hshift()?;
+                    self.hshift = self.hshift.saturating_add(step).min(max.max(self.hshift));
                 } else {
-                    let q = Query::parse(&buf);
-                    // Reject before applying: a pattern that cannot compile
-                    // matches nothing and would blank the view silently.
-                    if !q.is_valid() {
-                        return Err("Invalid pattern".to_string());
-                    }
-                    self.active_filter = Some(q);
-                    self.pending_message = Some(if self.projection.format.is_structured() {
-                        format!("Filter: &{}", buf)
-                    } else {
-                        format!(
-                            "Filter: &{} (no effect on plain text; {PICK_FORMAT_HINT})",
-                            buf
-                        )
-                    });
+                    self.hshift = self.hshift.saturating_sub(step);
                 }
             }
-            Action::NextFile(n) => self.switch_file(n as i64)?,
-            Action::PrevFile(n) => self.switch_file(-(n as i64))?,
+            Action::HorizontalHome => self.hshift = 0,
+            Action::HorizontalEnd => self.hshift = self.max_hshift()?,
+            Action::SetMark(c) => {
+                if !c.is_ascii_alphabetic() {
+                    return Err("Invalid mark letter".to_string());
+                }
+                self.marks.insert(
+                    c,
+                    Position {
+                        file_index: self.file_index,
+                        top: self.top,
+                    },
+                );
+                self.pending_message = Some(format!("Mark '{c}' set at line {}", self.top));
+            }
+            Action::GotoMark(c) => self.goto_mark(c)?,
+            Action::ToggleOption(c) => self.toggle_option(c)?,
+            Action::FileInfo => {
+                // Cut on the right: the name and position come first and
+                // matter most (a prompt would lose them to a left cut).
+                let info = clip_to_width(self.file_info()?, self.width as usize);
+                self.pending_message = Some(info);
+            }
+            Action::Edit => {
+                if self.help.is_some() {
+                    return Err("Cannot edit the help page".to_string());
+                }
+                let entry = &self.files[self.file_index];
+                let Some(path) = entry.buffer.path() else {
+                    return Err("Cannot edit standard input".to_string());
+                };
+                if entry.sorted.is_some() {
+                    return Err("Cannot edit a sorted view (x s to unsort)".to_string());
+                }
+                self.pending_edit = Some((path.clone(), self.top));
+            }
+            Action::Reload => self.reload()?,
+            Action::Follow => self.start_follow()?,
+            Action::Help => self.open_help(),
             Action::Quit => unreachable!("handled by caller"),
         }
         Ok(())
@@ -452,7 +793,7 @@ impl App {
         let lookahead = proposed
             .saturating_add(content_rows.saturating_sub(1))
             .max(1);
-        let buffer = &mut self.current().buffer;
+        let buffer = self.buffer();
         buffer.ensure_lines_read(lookahead)?;
         if buffer.is_eof() {
             let total = buffer.lines_cached();
@@ -473,7 +814,7 @@ impl App {
     /// call is enough to distinguish "not yet read" from "doesn't exist".
     fn goto_absolute(&mut self, target: u64) -> Result<usize, String> {
         let t = target as usize;
-        let buffer = &mut self.current().buffer;
+        let buffer = self.buffer();
         buffer.ensure_lines_read(t)?;
         if buffer.line(t).is_some() {
             Ok(t)
@@ -481,6 +822,193 @@ impl App {
             Err(format!("Cannot seek to line number {}", target))
         }
     }
+
+    // --- The `&` filter and scrolling through the lines it shows --------
+
+    /// Whether line `n` is shown under the current filter; `None` past the
+    /// end of input.
+    fn line_visible(&mut self, n: usize) -> Result<Option<bool>, String> {
+        let buffer = entry_mut(&mut self.files, self.file_index, &mut self.help).buf();
+        buffer.ensure_lines_read(n)?;
+        let Some(raw) = buffer.line(n) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.active_filter
+                .as_ref()
+                .is_none_or(|f| f.keeps(raw, &self.projection)),
+        ))
+    }
+
+    /// First shown line at or after `n`.
+    fn next_visible_from(&mut self, n: usize) -> Result<Option<usize>, String> {
+        let mut line = n.max(1);
+        loop {
+            match self.line_visible(line)? {
+                None => return Ok(None),
+                Some(true) => return Ok(Some(line)),
+                Some(false) => line += 1,
+            }
+        }
+    }
+
+    /// Last shown line at or before `n` (reading only what is cached past
+    /// the end).
+    fn prev_visible_from(&mut self, n: usize) -> Result<Option<usize>, String> {
+        let mut line = n.min(self.buffer().lines_cached());
+        while line >= 1 {
+            if self.line_visible(line)? == Some(true) {
+                return Ok(Some(line));
+            }
+            line -= 1;
+        }
+        Ok(None)
+    }
+
+    /// The top line that shows the last window of input: the last
+    /// `content_rows` shown lines, over what has been read so far (the
+    /// caller reads to the end first when that is what it needs).
+    fn tail_top(&mut self) -> Result<usize, String> {
+        let content_rows = self.content_rows();
+        let total = self.buffer().lines_cached();
+        if self.active_filter.is_none() {
+            return Ok(if total > content_rows {
+                total - content_rows + 1
+            } else {
+                1
+            });
+        }
+        let mut seen = 0;
+        let mut top = None;
+        let mut line = total;
+        while line >= 1 && seen < content_rows {
+            if self.line_visible(line)? == Some(true) {
+                seen += 1;
+                top = Some(line);
+            }
+            line -= 1;
+        }
+        Ok(top.unwrap_or(1))
+    }
+
+    /// Scrolls `n` shown lines under the filter, stopping where the last
+    /// window of shown lines begins (the filtered counterpart of
+    /// `clamp_relative`).
+    fn scroll_visible(&mut self, n: u64, forward: bool) -> Result<(), String> {
+        let mut cur = self.next_visible_from(self.top)?.unwrap_or(self.top);
+        let mut moved = 0;
+        let mut line = cur;
+        while moved < n {
+            if forward {
+                line += 1;
+            } else if line <= 1 {
+                break;
+            } else {
+                line -= 1;
+            }
+            match self.line_visible(line)? {
+                None => break,
+                Some(true) => {
+                    cur = line;
+                    moved += 1;
+                }
+                Some(false) => {}
+            }
+        }
+        if forward {
+            // Clamp only when fewer than a window of shown lines remain.
+            let rows = self.content_rows();
+            let mut ahead = 0;
+            let mut probe = cur;
+            while ahead < rows {
+                match self.line_visible(probe)? {
+                    None => break,
+                    Some(true) => ahead += 1,
+                    Some(false) => {}
+                }
+                probe += 1;
+            }
+            if ahead < rows {
+                cur = cur.min(self.tail_top()?);
+            }
+        }
+        self.top = cur.max(1);
+        Ok(())
+    }
+
+    /// Parses the filter `source` for the current format and case rule. On
+    /// plain text a selector-shaped pattern is ordinary text to find.
+    fn compile_filter(&self, source: &str) -> Query {
+        let ignore_case = self.case.ignores_case(source);
+        if self.projection.format.is_structured() {
+            Query::parse_with_case(source, ignore_case)
+        } else {
+            Query::regex(source, ignore_case)
+        }
+    }
+
+    fn set_filter(&mut self, input: &str) -> Result<(), String> {
+        if input.trim().is_empty() {
+            self.active_filter = None;
+            self.pending_message = Some("Filter cleared".to_string());
+            return Ok(());
+        }
+        let (invert, source) = match input.strip_prefix('!') {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, input.to_string()),
+        };
+        let query = self.compile_filter(&source);
+        // Reject before applying: a pattern that cannot compile matches
+        // nothing and would blank the view silently.
+        if !query.is_valid() {
+            return Err("Invalid pattern".to_string());
+        }
+        let filter = ActiveFilter {
+            source,
+            invert,
+            query,
+        };
+        let label = filter.label();
+        self.active_filter = Some(filter);
+        match self.next_visible_from(1)? {
+            None => {
+                self.pending_message = Some(format!("Filter: {label} (no matching lines)"));
+            }
+            Some(first) => {
+                // Keep the place when it is still shown, else move to the
+                // nearest shown line.
+                self.top = match self.next_visible_from(self.top)? {
+                    Some(line) => line,
+                    None => self.prev_visible_from(self.top)?.unwrap_or(first),
+                };
+                self.pending_message = Some(format!("Filter: {label}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-parses the filter and the last search after the format or the
+    /// case rule changed.
+    fn rebuild_filter(&mut self) {
+        if let Some(f) = self.active_filter.take() {
+            let query = self.compile_filter(&f.source);
+            self.active_filter = Some(ActiveFilter { query, ..f });
+        }
+        if let Some((SearchPattern::Regex(_, src), dir)) = &self.last_search
+            && let Ok(re) = self.compile_regex(src)
+        {
+            self.last_search = Some((SearchPattern::Regex(re, src.clone()), *dir));
+        }
+    }
+
+    fn compile_regex(&self, pattern: &str) -> Result<Regex, String> {
+        RegexBuilder::new(pattern)
+            .case_insensitive(self.case.ignores_case(pattern))
+            .build()
+            .map_err(|_| "Invalid pattern".to_string())
+    }
+
+    // --- Search -----------------------------------------------------------
 
     fn run_search(
         &mut self,
@@ -497,8 +1025,8 @@ impl App {
                 return self.run_search_query(&q, dir, count, fresh);
             }
         }
-        let pattern = Regex::new(pattern_src).map_err(|_| "Invalid pattern".to_string())?;
-        self.run_search_regex(&pattern, dir, count, fresh)
+        let pattern = self.compile_regex(pattern_src)?;
+        self.run_search_regex(&pattern, pattern_src, dir, count, fresh)
     }
 
     fn repeat_search(&mut self, count: u64, reverse: bool) -> Result<(), String> {
@@ -507,7 +1035,7 @@ impl App {
         };
         let dir = if reverse { dir.reversed() } else { dir };
         match pattern {
-            SearchPattern::Regex(re) => self.run_search_regex(&re, dir, count, false),
+            SearchPattern::Regex(re, src) => self.run_search_regex(&re, &src, dir, count, false),
             SearchPattern::Structured(q) => self.run_search_query(&q, dir, count, false),
         }
     }
@@ -520,6 +1048,32 @@ impl App {
         }
     }
 
+    /// Runs one search scan with `is_match`, skipping lines the filter
+    /// hides. Returns the matching line.
+    fn find_line(
+        &mut self,
+        is_match: impl Fn(&[u8], DetectedFormat) -> bool,
+        dir: Direction,
+        count: u64,
+        fresh: bool,
+    ) -> Result<Option<usize>, String> {
+        let start = self.search_start(dir, fresh);
+        let filter = &self.active_filter;
+        let projection = &self.projection;
+        let format = projection.format;
+        let buffer = entry_mut(&mut self.files, self.file_index, &mut self.help).buf();
+        search::find_by(
+            buffer,
+            |line| {
+                is_match(line, format) && filter.as_ref().is_none_or(|f| f.keeps(line, projection))
+            },
+            dir,
+            start,
+            fresh,
+            count,
+        )
+    }
+
     fn run_search_query(
         &mut self,
         query: &Query,
@@ -527,16 +1081,18 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = self.search_start(dir, fresh);
-        let format = self.projection.format;
-        let buffer = &mut self.files[self.file_index].buffer;
-        let found = search::find_by(
-            buffer,
-            |line| query.matches_line(line, format),
+        let columns: Vec<String> = self
+            .projection
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let lookup = |name: &str| columns.iter().position(|c| c == name);
+        let found = self.find_line(
+            |line, format| query.matches_line_with(line, format, &lookup),
             dir,
-            start,
-            fresh,
             count,
+            fresh,
         )?;
         // Only an original `/`/`?` (with the direction it was typed in) is
         // remembered; `N` reverses relative to it, never to itself.
@@ -563,17 +1119,29 @@ impl App {
     fn run_search_regex(
         &mut self,
         pattern: &Regex,
+        source: &str,
         dir: Direction,
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = self.search_start(dir, fresh);
-        let buffer = &mut self.current().buffer;
-        let found = search::find(buffer, pattern, dir, start, fresh, count)?;
+        let found = if self.active_filter.is_some() {
+            self.find_line(
+                |line, _| search::line_matches(line, pattern),
+                dir,
+                count,
+                fresh,
+            )?
+        } else {
+            let start = self.search_start(dir, fresh);
+            search::find(self.buffer(), pattern, dir, start, fresh, count)?
+        };
         // Remember only the typed search: storing the reversed direction
         // of an `N` would make a following `n` run backwards too.
         if fresh {
-            self.last_search = Some((SearchPattern::Regex(pattern.clone()), dir));
+            self.last_search = Some((
+                SearchPattern::Regex(pattern.clone(), source.to_string()),
+                dir,
+            ));
         }
         match found {
             Some(line) => {
@@ -584,29 +1152,507 @@ impl App {
         }
     }
 
-    fn switch_file(&mut self, delta: i64) -> Result<(), String> {
-        let target = self.file_index as i64 + delta;
+    // --- Files -------------------------------------------------------------
+
+    /// Moves the current file's view out of `App`, leaving a fresh one.
+    fn take_view(&mut self) -> ViewState {
+        let fresh = ViewState::fresh(self.opts.raw_control_chars);
+        ViewState {
+            top: std::mem::replace(&mut self.top, fresh.top),
+            projection: std::mem::replace(&mut self.projection, fresh.projection),
+            tabular_view: std::mem::replace(&mut self.tabular_view, fresh.tabular_view),
+            active_filter: std::mem::replace(&mut self.active_filter, fresh.active_filter),
+            focused_column: std::mem::replace(&mut self.focused_column, fresh.focused_column),
+            sniffer_checked: std::mem::replace(&mut self.sniffer_checked, fresh.sniffer_checked),
+        }
+    }
+
+    fn put_view(&mut self, view: ViewState) {
+        self.top = view.top;
+        self.projection = view.projection;
+        self.tabular_view = view.tabular_view;
+        self.active_filter = view.active_filter;
+        self.focused_column = view.focused_column;
+        self.sniffer_checked = view.sniffer_checked;
+    }
+
+    fn switch_file(&mut self, target: i64) -> Result<(), String> {
         if target < 0 {
             return Err("No previous file".to_string());
         }
         if target as usize >= self.files.len() {
             return Err("No next file".to_string());
         }
+        let view = self.take_view();
+        self.files[self.file_index].saved_view = Some(view);
         self.file_index = target as usize;
-        self.top = 1;
+        // A file seen before comes back as it was left (position, format,
+        // table, filter); a new one starts at the top with its own format
+        // sniff on its first draw.
+        if let Some(view) = self.files[self.file_index].saved_view.take() {
+            self.put_view(view);
+        }
         self.filename_shown = true;
         self.last_search = None;
-        // Structured-view state belongs to one file: the next file gets its
-        // own format sniff and columns on its first draw.
-        self.projection.set_format(DetectedFormat::PlainText);
-        self.sniffer_checked = false;
-        self.focused_column = 0;
         // A file switch always leaves the fresh-process bottom-anchor
         // window (§3 item 1), regardless of whether `top` numerically
         // changed (a fresh file also starts at line 1).
         self.first_render_done = true;
         Ok(())
     }
+
+    /// `:e name`: shows `name`, adding it to the file list after the
+    /// current file (or switching to it when it is already listed).
+    fn examine(&mut self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("No file name given".to_string());
+        }
+        let path = PathBuf::from(name);
+        if let Some(i) = self
+            .files
+            .iter()
+            .position(|f| f.buffer.path() == Some(&path))
+        {
+            if i != self.file_index {
+                self.switch_file(i as i64)?;
+            }
+            return Ok(());
+        }
+        let mut entry = FileEntry::new(Source::File(path));
+        entry.buffer.ensure_lines_read(1)?;
+        let at = self.file_index + 1;
+        self.files.insert(at, entry);
+        // Marks and saved views refer to indices; shift those after `at`.
+        for m in self.marks.values_mut() {
+            if m.file_index >= at {
+                m.file_index += 1;
+            }
+        }
+        if let Some(p) = &mut self.last_jump
+            && p.file_index >= at
+        {
+            p.file_index += 1;
+        }
+        self.switch_file(at as i64)
+    }
+
+    // --- Marks ---------------------------------------------------------------
+
+    fn goto_mark(&mut self, c: char) -> Result<(), String> {
+        let here = Position {
+            file_index: self.file_index,
+            top: self.top,
+        };
+        let target = match c {
+            '\'' => self.last_jump.ok_or("No previous position")?,
+            '^' => Position { top: 1, ..here },
+            '$' => {
+                self.buffer().ensure_full_read()?;
+                Position {
+                    top: self.tail_top()?,
+                    ..here
+                }
+            }
+            c if c.is_ascii_alphabetic() => *self.marks.get(&c).ok_or("Mark not set")?,
+            _ => return Err("Invalid mark letter".to_string()),
+        };
+        if target.file_index != self.file_index {
+            self.switch_file(target.file_index as i64)?;
+        }
+        let buffer = self.buffer();
+        buffer.ensure_lines_read(target.top)?;
+        // The file may have been reloaded shorter since the mark was set.
+        self.top = target.top.min(buffer.lines_cached()).max(1);
+        if here != target {
+            self.last_jump = Some(here);
+        }
+        self.first_render_done = true;
+        Ok(())
+    }
+
+    // --- Options, info, reload ---------------------------------------------
+
+    fn toggle_option(&mut self, c: char) -> Result<(), String> {
+        let message = match c {
+            'N' => {
+                self.opts.line_numbers = !self.opts.line_numbers;
+                if self.opts.line_numbers {
+                    "Line numbers: on"
+                } else {
+                    "Line numbers: off"
+                }
+            }
+            'S' => {
+                self.opts.chop_long_lines = !self.opts.chop_long_lines;
+                if self.opts.chop_long_lines {
+                    "Long lines: chopped (LEFT/RIGHT scroll sideways)"
+                } else {
+                    "Long lines: wrapped"
+                }
+            }
+            'i' => {
+                self.case = if self.case == CaseMode::Smart {
+                    CaseMode::Sensitive
+                } else {
+                    CaseMode::Smart
+                };
+                self.rebuild_filter();
+                if self.case == CaseMode::Smart {
+                    "Case: ignored in searches unless the pattern has uppercase"
+                } else {
+                    "Case: significant in searches"
+                }
+            }
+            'I' => {
+                self.case = if self.case == CaseMode::Always {
+                    CaseMode::Sensitive
+                } else {
+                    CaseMode::Always
+                };
+                self.rebuild_filter();
+                if self.case == CaseMode::Always {
+                    "Case: ignored in searches"
+                } else {
+                    "Case: significant in searches"
+                }
+            }
+            other => {
+                return Err(format!(
+                    "No -{} toggle while paging (-N -S -i -I)",
+                    escape_controls(&other.to_string(), false)
+                ));
+            }
+        };
+        self.pending_message = Some(message.to_string());
+        Ok(())
+    }
+
+    /// `=`: where the view is and what is applied to it.
+    fn file_info(&mut self) -> Result<String, String> {
+        let (bottom, at_eof) = self.last_bottom;
+        let help = self.help.is_some();
+        let file_count = self.files.len();
+        let file_index = self.file_index;
+        let following = self.following;
+        let top = self.top;
+        let entry = self.current();
+        let name = entry
+            .display()
+            .unwrap_or_else(|| "Standard input".to_string());
+        let sorted = entry
+            .sorted
+            .as_ref()
+            .map(|s| (s.column.clone(), s.descending));
+        let buffer = entry.buf();
+        // Totals need the whole input; a pipe still open would block.
+        let complete = buffer.is_eof() || buffer.path().is_some() || help || sorted.is_some();
+        let mut parts = vec![name];
+        if file_count > 1 && !help {
+            parts.push(format!("(file {} of {})", file_index + 1, file_count));
+        }
+        if complete {
+            let total = buffer.total_lines()?;
+            let bytes = buffer.total_bytes()?;
+            let offset = buffer.byte_offset_through(bottom);
+            parts.push(format!("lines {top}-{bottom}/{total}"));
+            parts.push(format!("byte {offset}/{bytes}"));
+            let percent = (bottom.min(total) * 100).checked_div(total).unwrap_or(100);
+            parts.push(format!("{percent}%"));
+        } else {
+            parts.push(format!("lines {top}-{bottom}/{}+", buffer.lines_cached()));
+        }
+        if at_eof {
+            parts.push("(END)".to_string());
+        }
+        if self.projection.format.is_structured() {
+            parts.push(format!("[{}]", self.projection.format.name()));
+        }
+        if let Some(f) = &self.active_filter {
+            parts.push(format!("[filter {}]", f.label()));
+        }
+        if let Some((column, descending)) = sorted {
+            let dir = if descending { "desc" } else { "asc" };
+            parts.push(format!(
+                "[sorted by {} {dir}]",
+                escape_controls(&column, false)
+            ));
+        }
+        if following {
+            parts.push("[following]".to_string());
+        }
+        Ok(parts.join(" "))
+    }
+
+    fn reload(&mut self) -> Result<(), String> {
+        let entry = &mut self.files[self.file_index];
+        if !entry.buffer.reload() {
+            return Err("Cannot reload standard input".to_string());
+        }
+        entry.sorted = None;
+        // Re-derive columns (the header may have changed) on the next draw.
+        self.sniffer_checked = false;
+        let fmt = self.projection.format;
+        let sample = self.sample_lines();
+        if fmt.is_structured() {
+            let sticky = self.projection.sticky_header;
+            self.projection.set_format(fmt);
+            self.projection.sticky_header = sticky;
+            self.projection.update_columns_from_lines(&sample);
+            self.sniffer_checked = true;
+        }
+        let top = self.top;
+        let buffer = self.buffer();
+        buffer.ensure_lines_read(top)?;
+        if top > buffer.lines_cached() {
+            self.top = self.tail_top()?;
+        }
+        self.pending_message = Some("Reloaded".to_string());
+        Ok(())
+    }
+
+    // --- Follow mode -----------------------------------------------------------
+
+    fn start_follow(&mut self) -> Result<(), String> {
+        let entry = &mut self.files[self.file_index];
+        let was_sorted = entry.sorted.take().is_some();
+        if !entry.buffer.is_stdin() {
+            // A file never blocks: start from its true end.
+            entry.buffer.ensure_full_read()?;
+        }
+        if was_sorted {
+            self.top = 1;
+        }
+        self.following = true;
+        self.follow_tick().map_err(|e| e.to_string())?;
+        if was_sorted {
+            self.pending_message = Some("Sort cleared to follow new input".to_string());
+        }
+        Ok(())
+    }
+
+    /// One follow-mode step: reads what has arrived and moves to the end.
+    /// Returns whether the screen needs a redraw.
+    fn follow_tick(&mut self) -> io::Result<bool> {
+        let grew = match self.buffer().read_new_input() {
+            Ok(grew) => grew,
+            Err(e) => {
+                self.following = false;
+                self.pending_message = Some(format!("{e}  (press RETURN)"));
+                return Ok(true);
+            }
+        };
+        let old_top = self.top;
+        self.top = self.tail_top().unwrap_or(self.top);
+        if self.top != old_top {
+            self.first_render_done = true;
+        }
+        Ok(grew || self.top != old_top)
+    }
+
+    /// Whether piped input the last frame was missing has arrived since
+    /// (new lines, or the end of input).
+    fn input_arrived(&mut self) -> bool {
+        let want = self.top + self.content_rows() + 1;
+        let buffer = self.buffer();
+        let before = (buffer.lines_cached(), buffer.is_eof());
+        buffer.set_nonblocking(true);
+        let result = buffer.ensure_lines_available(want);
+        buffer.set_nonblocking(false);
+        result.is_err() || (buffer.lines_cached(), buffer.is_eof()) != before
+    }
+
+    /// `v`: hands the terminal to the editor (`$VISUAL`, else `$EDITOR`,
+    /// else `vi`) at `line`, then takes it back and re-reads the file.
+    fn run_editor<W: Write>(
+        &mut self,
+        out: &mut W,
+        path: &std::path::Path,
+        line: usize,
+    ) -> io::Result<()> {
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+        let argv = editor_command(
+            std::env::var("VISUAL").ok().as_deref(),
+            std::env::var("EDITOR").ok().as_deref(),
+            path,
+            line,
+        );
+        let alternate = !self.opts.no_init;
+        if alternate {
+            execute!(out, LeaveAlternateScreen)?;
+        }
+        disable_raw_mode()?;
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status();
+        enable_raw_mode()?;
+        if alternate {
+            execute!(out, EnterAlternateScreen)?;
+        }
+        match status {
+            Ok(s) if s.success() => {
+                if let Err(e) = self.reload() {
+                    self.pending_message = Some(format!("{e}  (press RETURN)"));
+                } else {
+                    self.pending_message = None;
+                }
+            }
+            Ok(s) => {
+                self.pending_message = Some(format!("Editor exited with {s}  (press RETURN)"));
+            }
+            Err(e) => {
+                self.pending_message = Some(format!("Cannot run {}: {e}  (press RETURN)", argv[0]));
+            }
+        }
+        self.draw(out)
+    }
+
+    // --- Help ------------------------------------------------------------------
+
+    fn open_help(&mut self) {
+        if self.help.is_some() {
+            return;
+        }
+        let saved_view = self.take_view();
+        let entry = FileEntry::new(Source::Memory {
+            name: Some("HELP".to_string()),
+            bytes: crate::cli::help_page().into_bytes(),
+        });
+        self.help = Some(HelpState {
+            entry,
+            saved_view,
+            saved_hshift: std::mem::take(&mut self.hshift),
+        });
+        // The help page is plain text: no sniffing.
+        self.sniffer_checked = true;
+        self.first_render_done = true;
+    }
+
+    fn close_help(&mut self) {
+        if let Some(h) = self.help.take() {
+            self.put_view(h.saved_view);
+            self.hshift = h.saved_hshift;
+            self.decoder.reset();
+        }
+    }
+
+    // --- Horizontal scroll -------------------------------------------------------
+
+    /// How far right the view can scroll: until the end of the widest line
+    /// (or table row) in the window reaches the right edge.
+    fn max_hshift(&mut self) -> Result<usize, String> {
+        let width = self.width as usize;
+        if self.use_projection() && self.tabular_view && !self.projection.columns.is_empty() {
+            let (pinned, rest): (Vec<_>, Vec<_>) =
+                self.projection.display_columns().partition(|c| c.pinned);
+            let cells = |cols: &[&crate::projection::ColumnInfo]| {
+                cols.iter().map(|c| c.width + 1).sum::<usize>()
+            };
+            let room = width.saturating_sub(cells(&pinned));
+            return Ok(cells(&rest).saturating_sub(room));
+        }
+        let number_width = if self.opts.line_numbers { 8 } else { 0 };
+        let room = width.saturating_sub(number_width).max(1);
+        let raw_ansi = self.opts.raw_control_chars;
+        let rows = self.content_rows();
+        let mut widest = 0;
+        let mut line = self.top;
+        let mut shown = 0;
+        while shown < rows {
+            match self.line_visible(line)? {
+                None => break,
+                Some(false) => {}
+                Some(true) => {
+                    let raw = self.buffer().line(line).unwrap_or_default();
+                    widest = widest.max(screen::line_display_width(raw, raw_ansi));
+                    shown += 1;
+                }
+            }
+            line += 1;
+        }
+        Ok(widest.saturating_sub(room))
+    }
+
+    // --- Column sort -------------------------------------------------------------
+
+    /// Column mode `s`: ascending, then descending, then the file order.
+    fn cycle_sort(&mut self) -> Result<(), String> {
+        let Some(col) = self.projection.columns.get(self.focused_column) else {
+            return Ok(());
+        };
+        let column = col.name.clone();
+        let shown = escape_controls(&column, false).into_owned();
+        let entry = &self.files[self.file_index];
+        if self.help.is_some() {
+            return Ok(());
+        }
+        let next = match &entry.sorted {
+            Some(s) if s.column == column && !s.descending => Some(true),
+            Some(s) if s.column == column => None,
+            _ => Some(false),
+        };
+        match next {
+            None => {
+                self.files[self.file_index].sorted = None;
+                self.top = 1;
+                self.pending_message = Some(format!("Unsorted ('{shown}' sort cleared)"));
+            }
+            Some(descending) => {
+                let lines = self.sort_by(&column, descending)?;
+                self.top = 1;
+                let dir = if descending {
+                    "descending"
+                } else {
+                    "ascending"
+                };
+                self.pending_message = Some(format!("Sorted {lines} lines by '{shown}' ({dir})"));
+            }
+        }
+        self.first_render_done = true;
+        Ok(())
+    }
+
+    /// Replaces the view of the current file with a snapshot sorted by
+    /// `column` (stable, so equal rows keep file order). A CSV/TSV header
+    /// row stays first. Returns how many lines were sorted.
+    fn sort_by(&mut self, column: &str, descending: bool) -> Result<usize, String> {
+        let entry = &mut self.files[self.file_index];
+        entry.buffer.ensure_full_read()?;
+        let total = entry.buffer.lines_cached();
+        let has_header = matches!(
+            self.projection.format,
+            DetectedFormat::Csv | DetectedFormat::Tsv
+        );
+        let first = if has_header { 2 } else { 1 };
+        let mut keyed: Vec<(Option<SortKey>, usize)> = Vec::with_capacity(total);
+        for n in first..=total {
+            let line = entry.buffer.line(n).unwrap_or_default();
+            let value = self.projection.field_value(column, line);
+            keyed.push((SortKey::of(&value), n));
+        }
+        keyed.sort_by(|a, b| SortKey::compare(&a.0, &b.0, descending));
+        let mut bytes = Vec::with_capacity(entry.buffer.byte_offset_through(total) + total);
+        let mut push = |n: usize| {
+            bytes.extend_from_slice(entry.buffer.line(n).unwrap_or_default());
+            bytes.push(b'\n');
+        };
+        if has_header && total >= 1 {
+            push(1);
+        }
+        for (_, n) in &keyed {
+            push(*n);
+        }
+        let name = entry.display();
+        entry.sorted = Some(SortedView {
+            buffer: Buffer::new(Source::Memory { name, bytes }),
+            column: column.to_string(),
+            descending,
+        });
+        Ok(keyed.len())
+    }
+
+    // --- Drawing -----------------------------------------------------------------
 
     fn ring_bell<W: Write>(&self, out: &mut W, class: BellClass) -> io::Result<()> {
         let silenced = match class {
@@ -651,11 +1697,22 @@ impl App {
         // `blank_above` rows untouched before the content starts is enough.
         queue!(out, Clear(ClearType::All))?;
 
-        let (bottom_line, at_eof) = if self.use_projection() {
-            self.paint_projection(out, content_rows, width)?
+        // Piped input is drawn as far as it has arrived; the main loop
+        // redraws as more comes (files never wait, so nothing changes).
+        self.buffer().set_nonblocking(true);
+        let painted = if self.use_projection() {
+            self.paint_projection(out, content_rows, width)
         } else {
-            self.paint_text(out, content_rows)?
+            self.paint_text(out, content_rows)
         };
+        let buffer = self.buffer();
+        buffer.set_nonblocking(false);
+        let (bottom_line, at_eof) = painted?;
+        self.awaiting_input =
+            buffer.is_stdin() && !buffer.is_eof() && bottom_line >= buffer.lines_cached();
+        // Running out of input that is still coming is not the end.
+        let at_eof = at_eof && !self.awaiting_input;
+        self.last_bottom = (bottom_line, at_eof);
 
         // While a multi-key command (numeric prefix, `:x`, `/pattern`) is
         // still being typed, echo it in place of the computed prompt; not
@@ -664,9 +1721,15 @@ impl App {
         // sequence's captured steps. Column mode shows its own status line
         // unless a message (pin/hide feedback, an error) is pending.
         let (prompt_text, highlighted) = match self.decoder.preview() {
-            Some(preview) => (preview, false),
+            Some(preview) => (clip_to_width(preview, width), false),
             None if self.decoder.in_column_mode() && self.pending_message.is_none() => {
                 (self.column_mode_prompt(width), false)
+            }
+            None if self.pending_message.is_none() && self.following => {
+                (clip_to_width(FOLLOW_PROMPT.to_string(), width), true)
+            }
+            None if self.pending_message.is_none() && self.help.is_some() => {
+                (clip_to_width(HELP_PROMPT.to_string(), width), true)
             }
             None => self.build_prompt(bottom_line, at_eof, width),
         };
@@ -694,8 +1757,8 @@ impl App {
     /// it is shorter or unreadable; the read error itself surfaces on the
     /// draw that needs those lines).
     fn sample_lines(&mut self) -> Vec<Vec<u8>> {
-        let buffer = &mut self.current().buffer;
-        let _ = buffer.ensure_lines_read(SNIFF_SAMPLE_LINES);
+        let buffer = self.buffer();
+        let _ = buffer.ensure_lines_available(SNIFF_SAMPLE_LINES);
         (1..=SNIFF_SAMPLE_LINES)
             .map_while(|i| buffer.line(i).map(<[u8]>::to_vec))
             .collect()
@@ -711,6 +1774,7 @@ impl App {
         if detected.is_structured() {
             self.projection.set_format(detected);
             self.projection.update_columns_from_lines(&sample);
+            self.rebuild_filter();
         }
     }
 
@@ -720,12 +1784,22 @@ impl App {
         let render_opts = self.render_opts();
         let top = self.top;
         let highlight = match &self.last_search {
-            Some((SearchPattern::Regex(re), _)) => Some(re),
+            Some((SearchPattern::Regex(re, _), _)) => Some(re),
             _ => None,
         };
-        let buffer = &mut self.files[self.file_index].buffer;
-        let win = screen::render_window(buffer, top, content_rows, &render_opts, highlight)
-            .map_err(io::Error::other)?;
+        let filter = &self.active_filter;
+        let projection = &self.projection;
+        let keep = |raw: &[u8]| filter.as_ref().is_none_or(|f| f.keeps(raw, projection));
+        let buffer = entry_mut(&mut self.files, self.file_index, &mut self.help).buf();
+        let win = screen::render_window_filtered(
+            buffer,
+            top,
+            content_rows,
+            &render_opts,
+            highlight,
+            filter.is_some().then_some(&keep as screen::LineFilter),
+        )
+        .map_err(io::Error::other)?;
 
         // NOT consumed here: only `apply()` retires this flag, and only once
         // the view actually moves (see its doc comment). A redraw that
@@ -761,7 +1835,22 @@ impl App {
         content_rows: usize,
         width: usize,
     ) -> io::Result<(usize, bool)> {
-        let buffer = &mut self.files[self.file_index].buffer;
+        self.projection.hshift = self.hshift;
+        let filter = &self.active_filter;
+        let format = self.projection.format;
+        let columns: Vec<String> = self
+            .projection
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let keep = |raw: &[u8]| {
+            filter.as_ref().is_none_or(|f| {
+                let lookup = |name: &str| columns.iter().position(|c| c == name);
+                f.query.matches_line_with(raw, format, &lookup) != f.invert
+            })
+        };
+        let buffer = entry_mut(&mut self.files, self.file_index, &mut self.help).buf();
         let win = self
             .projection
             .render_window(
@@ -769,7 +1858,7 @@ impl App {
                 self.top,
                 content_rows,
                 width,
-                self.active_filter.as_ref(),
+                filter.is_some().then_some(&keep as screen::LineFilter),
                 self.tabular_view,
             )
             .map_err(io::Error::other)?;
@@ -800,7 +1889,7 @@ impl App {
                     (false, false) => "",
                 };
                 format!(
-                    "Columns: {}/{} {}{} - h/l move  p pin  . hide  q done",
+                    "Columns: {}/{} {}{} - h/l move  p pin  . hide  s sort  q done",
                     self.focused_column + 1,
                     columns.len(),
                     escape_controls(&col.name, false),
@@ -824,7 +1913,7 @@ impl App {
         let filename = self.current().display();
 
         let (total_lines, total_bytes, byte_offset) = if needs_totals {
-            let buffer = &mut self.current().buffer;
+            let buffer = self.buffer();
             let total_lines = buffer.total_lines().ok();
             let total_bytes = buffer.total_bytes().ok();
             let byte_offset = buffer.byte_offset_through(bottom_line);
@@ -867,6 +1956,25 @@ impl App {
     pub(crate) fn bench_draw<W: Write>(&mut self, out: &mut W) {
         self.draw(out).unwrap();
     }
+}
+
+/// The editor command line for `v`: `$VISUAL`, else `$EDITOR`, else `vi`
+/// (split on whitespace, so `code --wait` works), then `+LINE` and the file.
+fn editor_command(
+    visual: Option<&str>,
+    editor: Option<&str>,
+    path: &std::path::Path,
+    line: usize,
+) -> Vec<String> {
+    let chosen = [visual, editor]
+        .into_iter()
+        .flatten()
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or("vi");
+    let mut argv: Vec<String> = chosen.split_whitespace().map(str::to_string).collect();
+    argv.push(format!("+{line}"));
+    argv.push(path.display().to_string());
+    argv
 }
 
 fn shift(top: usize, delta: i64) -> usize {
@@ -950,12 +2058,8 @@ mod tests {
 
     fn test_opts(files: Vec<PathBuf>) -> Options {
         Options {
-            line_numbers: false,
-            chop_long_lines: false,
-            raw_control_chars: false,
-            prompt_mode: PromptMode::Short,
-            bell: BellMode::Normal,
             files,
+            ..Options::default()
         }
     }
 
@@ -1477,7 +2581,8 @@ mod tests {
             .apply(Action::FilterInput("(unclosed".to_string()))
             .unwrap_err();
         assert_eq!(err, "Invalid pattern");
-        assert_eq!(app.active_filter, Some(Query::parse("ERROR")));
+        let kept = app.active_filter.as_ref().map(|f| f.source.as_str());
+        assert_eq!(kept, Some("ERROR"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1488,13 +2593,6 @@ mod tests {
         app.set_size(80, 24);
         drawn_rows(&mut app);
         app.apply(Action::ToggleTabular).unwrap();
-        assert!(
-            app.pending_message
-                .as_deref()
-                .unwrap()
-                .contains("no effect")
-        );
-        app.apply(Action::FilterInput("line".to_string())).unwrap();
         assert!(
             app.pending_message
                 .as_deref()
@@ -1527,7 +2625,7 @@ mod tests {
         let (code, m) = key('s');
         app.handle_key(&mut out, code, m).unwrap();
         let rows = drawn_rows(&mut app);
-        assert_eq!(rows[&23], "Sorting by 'msg' is not supported yet");
+        assert_eq!(rows[&23], "Sorted 60 lines by 'msg' (ascending)");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1603,6 +2701,431 @@ mod tests {
             );
         }
         assert!(rows[&1].ends_with('>'), "a cut row carries the chop marker");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- Feature expansion: filter, marks, sideways scroll, options, ----
+    // --- follow, help, :e, sort, initial commands, -F -------------------
+
+    fn app_on(path: &std::path::Path, w: u16, h: u16) -> App {
+        let mut app = App::new(test_opts(vec![path.to_path_buf()]));
+        app.set_size(w, h);
+        drawn_rows(&mut app);
+        app
+    }
+
+    #[test]
+    fn plain_text_filter_shows_scrolls_and_searches_only_matching_lines() {
+        // Every 10th line carries TEN; the window has 5 content rows.
+        let mut content = String::new();
+        for n in 1..=100 {
+            let tag = if n % 10 == 0 { " TEN" } else { "" };
+            content.push_str(&format!("line {n}{tag}\n"));
+        }
+        let path = temp_file(&content);
+        let mut app = app_on(&path, 40, 6);
+        app.apply(Action::FilterInput("TEN".to_string())).unwrap();
+        assert_eq!(app.top, 10, "moves to the first shown line");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "line 10 TEN");
+        assert_eq!(rows[&4], "line 50 TEN");
+
+        app.apply(Action::ScrollLines(2)).unwrap();
+        assert_eq!(app.top, 30, "j counts shown lines");
+        app.apply(Action::ScrollWindow(None, true)).unwrap();
+        assert_eq!(app.top, 60, "clamped to the last window of shown lines");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&4], "line 100 TEN");
+        assert!(app.last_bottom.1, "at the end");
+        app.apply(Action::ScrollLines(-1)).unwrap();
+        assert_eq!(app.top, 50);
+        app.apply(Action::GotoLine(None)).unwrap();
+        assert_eq!(app.top, 10);
+        app.apply(Action::GotoLast(None)).unwrap();
+        assert_eq!(app.top, 60);
+
+        // A search only lands on shown lines: "line 5" first matches line 5,
+        // which is hidden; the first shown match is line 50.
+        app.apply(Action::GotoLine(None)).unwrap();
+        app.apply(Action::SearchInput("line 5".into(), Direction::Forward, 1))
+            .unwrap();
+        assert_eq!(app.top, 50);
+
+        // Inverted, then cleared.
+        app.apply(Action::FilterInput("!TEN".to_string())).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(
+            rows.values().take(5).all(|r| !r.contains("TEN")),
+            "{rows:?}"
+        );
+        assert_eq!(app.pending_message.as_deref(), Some("Filter: &!TEN"));
+        app.apply(Action::FilterInput(String::new())).unwrap();
+        assert!(app.active_filter.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so() {
+        let path = lines_fixture(30);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::FilterInput("NOWHERE".to_string()))
+            .unwrap();
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Filter: &NOWHERE (no matching lines)")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn csv_filter_and_search_use_header_column_names() {
+        let path = temp_file("id,status,path\n1,200,/a\n2,503,/b\n3,200,/c\n4,500,/d\n");
+        let mut app = app_on(&path, 80, 24);
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        app.apply(Action::SearchInput(
+            ".status >= 500".into(),
+            Direction::Forward,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(app.top, 3);
+        app.apply(Action::FilterInput(".status >= 500".to_string()))
+            .unwrap();
+        app.apply(Action::ToggleTabular).unwrap();
+        let rows = drawn_rows(&mut app);
+        let shown: Vec<_> = rows.values().filter(|r| r.contains('/')).cloned().collect();
+        assert_eq!(shown.len(), 2, "{rows:?}");
+        assert!(shown[0].contains("503") && shown[1].contains("500"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn marks_and_quote_quote_return_to_earlier_places() {
+        let path = lines_fixture(200);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoLine(Some(50))).unwrap();
+        app.apply(Action::SetMark('a')).unwrap();
+        app.apply(Action::GotoLine(Some(120))).unwrap();
+        app.apply(Action::GotoMark('a')).unwrap();
+        assert_eq!(app.top, 50);
+        app.apply(Action::GotoMark('\'')).unwrap();
+        assert_eq!(app.top, 120, "'' goes back to before the mark jump");
+        app.apply(Action::GotoMark('\'')).unwrap();
+        assert_eq!(app.top, 50, "and '' again toggles");
+        app.apply(Action::GotoMark('$')).unwrap();
+        assert_eq!(app.top, 178);
+        app.apply(Action::GotoMark('^')).unwrap();
+        assert_eq!(app.top, 1);
+        assert_eq!(
+            app.apply(Action::GotoMark('z')).unwrap_err(),
+            "Mark not set"
+        );
+        assert_eq!(
+            app.apply(Action::SetMark('1')).unwrap_err(),
+            "Invalid mark letter"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn marks_and_positions_are_kept_per_file() {
+        let a = lines_fixture(200);
+        let b = lines_fixture(100);
+        let mut app = App::new(test_opts(vec![a.clone(), b.clone()]));
+        app.set_size(80, 24);
+        app.apply(Action::GotoLine(Some(40))).unwrap();
+        app.apply(Action::SetMark('m')).unwrap();
+        app.apply(Action::NextFile(1)).unwrap();
+        assert_eq!(app.top, 1);
+        app.apply(Action::GotoLine(Some(30))).unwrap();
+        app.apply(Action::PrevFile(1)).unwrap();
+        assert_eq!(app.top, 40, ":p returns to where file 1 was left");
+        app.apply(Action::NextFile(1)).unwrap();
+        assert_eq!(app.top, 30);
+        app.apply(Action::GotoMark('m')).unwrap();
+        assert_eq!((app.file_index, app.top), (0, 40), "a mark switches file");
+        app.apply(Action::GotoFile(Some(2))).unwrap();
+        assert_eq!(app.file_index, 1);
+        assert_eq!(
+            app.apply(Action::GotoFile(Some(9))).unwrap_err(),
+            "No such file"
+        );
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
+    fn percent_goes_proportionally_and_never_past_the_last_window() {
+        let path = lines_fixture(200);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoPercent(Some(50))).unwrap();
+        assert_eq!(app.top, 100);
+        app.apply(Action::GotoPercent(Some(100))).unwrap();
+        assert_eq!(app.top, 178);
+        app.apply(Action::GotoPercent(None)).unwrap();
+        assert_eq!(app.top, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn option_toggles_change_the_view_and_the_case_rule() {
+        let path = temp_file("alpha\nBeta\ngamma\n");
+        let mut app = app_on(&path, 80, 24);
+        assert_eq!(
+            app.apply(Action::SearchInput("beta".into(), Direction::Forward, 1))
+                .unwrap_err(),
+            "Pattern not found"
+        );
+        app.apply(Action::ToggleOption('i')).unwrap();
+        app.apply(Action::SearchInput("beta".into(), Direction::Forward, 1))
+            .unwrap();
+        assert_eq!(app.top, 2, "-i: lowercase pattern ignores case");
+        app.apply(Action::GotoLine(None)).unwrap();
+        assert!(
+            app.apply(Action::SearchInput("BETA".into(), Direction::Forward, 1))
+                .is_err(),
+            "-i: an uppercase letter makes the pattern case-sensitive"
+        );
+        app.apply(Action::ToggleOption('I')).unwrap();
+        app.apply(Action::SearchInput("BETA".into(), Direction::Forward, 1))
+            .unwrap();
+        assert_eq!(app.top, 2);
+
+        app.apply(Action::ToggleOption('N')).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&0].starts_with("      2 Beta"), "{:?}", rows[&0]);
+        assert_eq!(app.pending_message.as_deref(), Some("Line numbers: on"));
+        assert!(app.apply(Action::ToggleOption('z')).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sideways_scroll_moves_by_half_a_screen_and_stops_at_the_longest_line() {
+        let line = format!("start{}end", "-".repeat(100));
+        let path = temp_file(&format!("{line}\nshort\n"));
+        let mut opts = test_opts(vec![path.clone()]);
+        opts.chop_long_lines = true;
+        let mut app = App::new(opts);
+        app.set_size(40, 6);
+        app.apply(Action::ScrollHorizontal(None, true)).unwrap();
+        assert_eq!(app.hshift, 20);
+        // A fresh short file is bottom-anchored: the long line is row 3.
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&3].starts_with("-----"), "{rows:?}");
+        app.apply(Action::HorizontalEnd).unwrap();
+        assert_eq!(app.hshift, 108 - 40);
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&3].ends_with("end"), "{:?}", rows[&3]);
+        app.apply(Action::ScrollHorizontal(None, true)).unwrap();
+        assert_eq!(app.hshift, 68, "no scrolling into emptiness");
+        app.apply(Action::ScrollHorizontal(Some(8), false)).unwrap();
+        assert_eq!(app.hshift, 60);
+        app.apply(Action::HorizontalHome).unwrap();
+        assert_eq!(app.hshift, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn help_page_replaces_the_view_until_q() {
+        let path = lines_fixture(200);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoLine(Some(77))).unwrap();
+        let mut out = Vec::new();
+        let (c, m) = key('h');
+        app.handle_key(&mut out, c, m).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&0].starts_with("rless "), "{:?}", rows[&0]);
+        assert_eq!(rows[&23], HELP_PROMPT);
+        app.apply(Action::SearchInput("follow".into(), Direction::Forward, 1))
+            .unwrap();
+        let (c, m) = key('q');
+        assert_eq!(
+            app.handle_key(&mut out, c, m).unwrap(),
+            KeyOutcome::Continue,
+            "q closes help instead of quitting"
+        );
+        assert!(app.help.is_none());
+        assert_eq!(app.top, 77);
+        let (c, m) = key('q');
+        assert_eq!(app.handle_key(&mut out, c, m).unwrap(), KeyOutcome::Quit);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn examine_opens_a_new_file_after_the_current_one() {
+        let a = lines_fixture(10);
+        let b = temp_file("other file\n");
+        let mut app = app_on(&a, 80, 24);
+        app.apply(Action::Examine(b.display().to_string())).unwrap();
+        assert_eq!((app.file_index, app.files.len()), (1, 2));
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "other file");
+        // Examining a listed file switches to it.
+        app.apply(Action::Examine(a.display().to_string())).unwrap();
+        assert_eq!((app.file_index, app.files.len()), (0, 2));
+        let err = app
+            .apply(Action::Examine("/nonexistent/rless-x".into()))
+            .unwrap_err();
+        assert!(err.contains("No such file"), "{err}");
+        assert_eq!(app.files.len(), 2, "a missing file is not added");
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
+    fn column_sort_cycles_ascending_descending_and_off() {
+        let path = temp_file("name,ms\nb,250\na,1200\nc,90\nd,\n");
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::ToggleTabular).unwrap();
+        app.apply(Action::NextColumn).unwrap(); // focus "ms"
+        app.apply(Action::SortColumn).unwrap();
+        let order = |app: &mut App| {
+            let rows = drawn_rows(app);
+            (0..5u16).map(|r| rows[&r].clone()).collect::<Vec<_>>()
+        };
+        let rows = order(&mut app);
+        assert!(rows[0].starts_with("name"), "header stays first: {rows:?}");
+        assert!(rows[1].starts_with("c "));
+        assert!(rows[2].starts_with("b "));
+        assert!(rows[3].starts_with("a "));
+        assert!(rows[4].starts_with("d "), "blank sorts last");
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Sorted 4 lines by 'ms' (ascending)")
+        );
+        app.apply(Action::SortColumn).unwrap();
+        let rows = order(&mut app);
+        assert!(rows[1].starts_with("a ") && rows[4].starts_with("d "));
+        app.apply(Action::SortColumn).unwrap();
+        let rows = order(&mut app);
+        assert!(rows[1].starts_with("b "), "file order again: {rows:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_info_reports_position_size_and_applied_views() {
+        let path = jsonl_fixture();
+        let mut app = app_on(&path, 200, 24);
+        app.apply(Action::FilterInput(".status >= 500".into()))
+            .unwrap();
+        drawn_rows(&mut app);
+        app.apply(Action::FileInfo).unwrap();
+        let info = app.pending_message.clone().unwrap();
+        assert!(info.contains(&path.display().to_string()), "{info}");
+        assert!(info.contains("lines 2-"), "{info}");
+        assert!(info.contains("/60 byte "), "{info}");
+        assert!(info.contains("[jsonl] [filter &.status >= 500]"), "{info}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_shows_lines_appended_to_the_file() {
+        let path = lines_fixture(30);
+        let mut app = app_on(&path, 80, 11);
+        app.apply(Action::Follow).unwrap();
+        assert!(app.following);
+        assert_eq!(app.top, 21);
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&10], FOLLOW_PROMPT);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"appended 31\nappended 32\n").unwrap();
+        drop(f);
+        assert!(app.follow_tick().unwrap());
+        assert_eq!(app.top, 23);
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&9], "appended 32");
+        assert!(!app.follow_tick().unwrap(), "nothing new, no redraw");
+        let mut out = Vec::new();
+        let (c, m) = key('j');
+        app.handle_key(&mut out, c, m).unwrap();
+        assert!(!app.following, "a key stops following");
+        assert_eq!(app.top, 23, "and is consumed by stopping");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_picks_up_a_rewritten_file() {
+        let path = temp_file("old 1\nold 2\n");
+        let mut app = app_on(&path, 80, 24);
+        std::fs::write(&path, "new 1\n").unwrap();
+        app.apply(Action::Reload).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(rows.values().any(|r| r == "new 1"), "{rows:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn initial_commands_run_before_the_first_screen() {
+        let path = lines_fixture(200);
+        let mut opts = test_opts(vec![path.clone()]);
+        opts.initial_commands = vec!["/^050 ".to_string(), "5j".to_string()];
+        let mut app = App::new(opts);
+        app.set_size(80, 24);
+        assert_eq!(app.run_initial_commands(), KeyOutcome::Continue);
+        assert_eq!(app.top, 55);
+
+        let mut opts = test_opts(vec![path.clone()]);
+        opts.initial_commands = vec!["/NOT_THERE".to_string()];
+        let mut app = App::new(opts);
+        app.run_initial_commands();
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Pattern not found  (press RETURN)")
+        );
+
+        let mut opts = test_opts(vec![path.clone()]);
+        opts.initial_commands = vec!["q".to_string()];
+        assert_eq!(App::new(opts).run_initial_commands(), KeyOutcome::Quit);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quit_if_one_screen_prints_short_input_only() {
+        let short = temp_file("a\tb\nsecond \u{1}\n");
+        let mut app = App::new(test_opts(vec![short.clone()]));
+        app.set_size(80, 24);
+        let out = app.one_screen_output().unwrap().unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("a       b\nsecond "), "{text:?}");
+        assert!(text.ends_with("^A\x1b[39m\x1b[49m\n"), "{text:?}");
+
+        let long = lines_fixture(30);
+        let mut app = App::new(test_opts(vec![long.clone()]));
+        app.set_size(80, 24);
+        assert!(app.one_screen_output().unwrap().is_none());
+        let _ = std::fs::remove_file(short);
+        let _ = std::fs::remove_file(long);
+    }
+
+    #[test]
+    fn editor_command_prefers_visual_then_editor_then_vi() {
+        let p = std::path::Path::new("/tmp/f.log");
+        assert_eq!(
+            editor_command(Some("code --wait"), Some("nano"), p, 42),
+            ["code", "--wait", "+42", "/tmp/f.log"]
+        );
+        assert_eq!(
+            editor_command(Some(" "), Some("nano"), p, 1),
+            ["nano", "+1", "/tmp/f.log"]
+        );
+        assert_eq!(editor_command(None, None, p, 7), ["vi", "+7", "/tmp/f.log"]);
+    }
+
+    #[test]
+    fn edit_is_refused_for_stdin_and_queued_for_a_file() {
+        let path = lines_fixture(30);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoLine(Some(9))).unwrap();
+        app.apply(Action::Edit).unwrap();
+        assert_eq!(app.pending_edit, Some((path.clone(), 9)));
+        let mut stdin_app = App::new(test_opts(vec![]));
+        assert_eq!(
+            stdin_app.apply(Action::Edit).unwrap_err(),
+            "Cannot edit standard input"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

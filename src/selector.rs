@@ -36,7 +36,9 @@ pub struct SelectorPredicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     Regex(RegexQuery),
-    Structured(Vec<SelectorPredicate>),
+    /// Alternatives joined by `||`, each a list of predicates joined by
+    /// `&&`: a line matches when every predicate of any one group holds.
+    Structured(Vec<Vec<SelectorPredicate>>),
 }
 
 /// A plain-regex query: the source pattern plus its compiled form, built
@@ -47,29 +49,36 @@ pub enum Query {
 #[derive(Debug, Clone)]
 pub struct RegexQuery {
     pub source: String,
+    ignore_case: bool,
     compiled: std::cell::OnceCell<Option<regex::Regex>>,
 }
 
 impl RegexQuery {
-    pub fn new(source: String) -> Self {
+    pub fn new(source: String, ignore_case: bool) -> Self {
         RegexQuery {
             source,
+            ignore_case,
             compiled: std::cell::OnceCell::new(),
         }
     }
 
     fn regex(&self) -> Option<&regex::Regex> {
         self.compiled
-            .get_or_init(|| regex::Regex::new(&self.source).ok())
+            .get_or_init(|| {
+                regex::RegexBuilder::new(&self.source)
+                    .case_insensitive(self.ignore_case)
+                    .build()
+                    .ok()
+            })
             .as_ref()
     }
 }
 
-/// Equality is defined by the source pattern alone; the compiled cache is
-/// derived state.
+/// Equality is defined by the source pattern and case rule alone; the
+/// compiled cache is derived state.
 impl PartialEq for RegexQuery {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
+        self.source == other.source && self.ignore_case == other.ignore_case
     }
 }
 
@@ -79,20 +88,40 @@ thread_local! {
     static SPAN_SCRATCH: std::cell::RefCell<Vec<FieldSpan>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Maps a field name to its position for formats whose fields are
+/// positional (CSV/TSV: the header row names the columns).
+pub type ColumnLookup<'a> = &'a dyn Fn(&str) -> Option<usize>;
+
+#[cfg(test)]
+fn no_columns(_: &str) -> Option<usize> {
+    None
+}
+
 impl Query {
-    /// Parses a raw search or filter prompt string into either a JQ dot-selector Query or a plain regex.
+    /// Parses a raw search or filter prompt string into either a JQ
+    /// dot-selector Query or a plain (case-sensitive) regex.
     pub fn parse(input: &str) -> Self {
+        Self::parse_with_case(input, false)
+    }
+
+    /// Like `parse`; a plain-regex query ignores letter case when
+    /// `ignore_case` is set (`-i`/`-I`).
+    pub fn parse_with_case(input: &str, ignore_case: bool) -> Self {
         let trimmed = input.trim();
         let body = trimmed
             .trim_start_matches('/')
             .trim_start_matches('&')
             .trim();
-        if (body.starts_with('.') || body.starts_with('@') || body.starts_with("dur"))
-            && let Some(pred) = parse_single_predicate(body)
-        {
-            return Query::Structured(vec![pred]);
+        if let Some(groups) = parse_predicate_groups(body) {
+            return Query::Structured(groups);
         }
-        Query::Regex(RegexQuery::new(input.to_string()))
+        Query::Regex(RegexQuery::new(input.to_string(), ignore_case))
+    }
+
+    /// `input` as a plain regex, even when it looks like a selector (on
+    /// plain text, `.status >= 500` is text to find, as in less).
+    pub fn regex(input: &str, ignore_case: bool) -> Self {
+        Query::Regex(RegexQuery::new(input.to_string(), ignore_case))
     }
 
     /// False for a plain-regex query whose pattern does not compile (such a
@@ -106,7 +135,19 @@ impl Query {
     }
 
     /// Evaluates the query against a raw line and its format.
+    #[cfg(test)]
     pub fn matches_line(&self, line: &[u8], format: DetectedFormat) -> bool {
+        self.matches_line_with(line, format, &no_columns)
+    }
+
+    /// `matches_line`, resolving CSV/TSV field names through `columns`
+    /// (those formats have no keys in the line itself).
+    pub fn matches_line_with(
+        &self,
+        line: &[u8],
+        format: DetectedFormat,
+        columns: ColumnLookup,
+    ) -> bool {
         match self {
             Query::Regex(q) => {
                 if let Some(re) = q.regex()
@@ -116,20 +157,77 @@ impl Query {
                 }
                 false
             }
-            Query::Structured(preds) => {
+            Query::Structured(groups) => {
                 if !format.is_structured() {
                     return false;
                 }
                 SPAN_SCRATCH.with(|scratch| {
                     let spans = &mut *scratch.borrow_mut();
                     StructuralClassifier::scan_fields(format, line, spans);
-                    preds
-                        .iter()
-                        .all(|pred| evaluate_predicate(pred, line, spans))
+                    groups.iter().any(|preds| {
+                        preds
+                            .iter()
+                            .all(|pred| evaluate_predicate(pred, line, spans, format, columns))
+                    })
                 })
             }
         }
     }
+}
+
+/// Splits `s` on the two-character `sep` wherever it is outside a quoted
+/// string.
+fn split_unquoted<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+    let bytes = s.as_bytes();
+    let sep = sep.as_bytes();
+    let mut parts = Vec::new();
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_quote = false;
+            }
+        } else if b == b'"' {
+            in_quote = true;
+        } else if bytes[i..].starts_with(sep) {
+            parts.push(&s[start..i]);
+            i += sep.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// `.a == 1 && .b > 2 || .c == "x"`: `&&` binds tighter than `||`. Every
+/// operand must be a field predicate, or the whole input is not a selector
+/// (it is then searched as a regex, as in less).
+fn parse_predicate_groups(body: &str) -> Option<Vec<Vec<SelectorPredicate>>> {
+    let looks_like_selector =
+        |p: &str| p.starts_with('.') || p.starts_with('@') || p.starts_with("dur");
+    let mut groups = Vec::new();
+    for alt in split_unquoted(body, "||") {
+        let mut group = Vec::new();
+        for part in split_unquoted(alt, "&&") {
+            let part = part.trim();
+            if !looks_like_selector(part) {
+                return None;
+            }
+            group.push(parse_single_predicate(part)?);
+        }
+        groups.push(group);
+    }
+    Some(groups)
 }
 
 fn parse_single_predicate(s: &str) -> Option<SelectorPredicate> {
@@ -254,19 +352,75 @@ fn parse_duration_literal(s: &str) -> Option<u64> {
     }
 }
 
-fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]) -> bool {
-    let target_span = spans.iter().find(|span| {
-        let k = span.key(line);
-        if let Ok(s) = std::str::from_utf8(k) {
-            s.trim_matches('"') == pred.field_path
-        } else {
-            false
+/// The value of `path` in `line`: a top-level key (JSON lines, logfmt),
+/// a header-named column (CSV/TSV, via `columns`), or a dotted path into
+/// nested JSON objects (`user.id`).
+#[inline]
+fn lookup_field<'l>(
+    path: &str,
+    line: &'l [u8],
+    spans: &[FieldSpan],
+    format: DetectedFormat,
+    columns: ColumnLookup,
+) -> Option<(&'l [u8], FieldType)> {
+    if matches!(format, DetectedFormat::Csv | DetectedFormat::Tsv) {
+        let idx = columns(path).or_else(|| {
+            // `col_3` names the third column of a header-less file.
+            path.strip_prefix("col_")?
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1)
+        })?;
+        let span = spans.get(idx)?;
+        return Some((span.value(line), span.val_type));
+    }
+    match spans.iter().find(|span| key_is(span, line, path)) {
+        Some(span) => Some((span.value(line), span.val_type)),
+        None if format == DetectedFormat::JsonLines && path.contains('.') => {
+            lookup_nested(path, line, spans)
         }
-    });
+        None => None,
+    }
+}
+
+#[inline]
+fn key_is(span: &FieldSpan, line: &[u8], key: &str) -> bool {
+    std::str::from_utf8(span.key(line)).is_ok_and(|k| k.trim_matches('"') == key)
+}
+
+/// `a.b.c` in a JSON line: the value of `b.c` inside the object at `a`.
+#[cold]
+fn lookup_nested<'l>(
+    path: &str,
+    line: &'l [u8],
+    spans: &[FieldSpan],
+) -> Option<(&'l [u8], FieldType)> {
+    let (head, rest) = path.split_once('.')?;
+    let span = spans
+        .iter()
+        .find(|span| span.val_type == FieldType::Object && key_is(span, line, head))?;
+    let start = span.val_offset as usize;
+    let inner = &line[start..start + span.val_len as usize];
+    let mut inner_spans = Vec::new();
+    StructuralClassifier::scan_json_line(inner, &mut inner_spans);
+    if let Some(span) = inner_spans.iter().find(|span| key_is(span, inner, rest)) {
+        return Some((span.value(inner), span.val_type));
+    }
+    lookup_nested(rest, inner, &inner_spans)
+}
+
+fn evaluate_predicate(
+    pred: &SelectorPredicate,
+    line: &[u8],
+    spans: &[FieldSpan],
+    format: DetectedFormat,
+    columns: ColumnLookup,
+) -> bool {
+    let target = lookup_field(&pred.field_path, line, spans, format, columns);
 
     match &pred.operand {
         Operand::Null => {
-            let exists = target_span.is_some() && target_span.unwrap().val_type != FieldType::Null;
+            let exists = target.is_some_and(|(_, ty)| ty != FieldType::Null);
             match pred.op {
                 Operator::Equal => !exists,
                 Operator::NotEqual => exists,
@@ -274,8 +428,7 @@ fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]
             }
         }
         Operand::String(target_s) => {
-            if let Some(span) = target_span {
-                let raw_val = span.value(line);
+            if let Some((raw_val, _)) = target {
                 let lossy = String::from_utf8_lossy(raw_val);
                 let val_str = lossy.trim_matches('"');
                 match pred.op {
@@ -289,27 +442,24 @@ fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]
             }
         }
         Operand::Number(target_n) => {
-            if let Some(span) = target_span {
-                let raw_val = span.value(line);
-                if let Ok(s) = std::str::from_utf8(raw_val)
-                    && let Ok(num) = s.trim_matches('"').parse::<f64>()
-                {
-                    return match pred.op {
-                        Operator::Equal => (num - target_n).abs() < f64::EPSILON,
-                        Operator::NotEqual => (num - target_n).abs() >= f64::EPSILON,
-                        Operator::GreaterThan => num > *target_n,
-                        Operator::GreaterThanOrEqual => num >= *target_n,
-                        Operator::LessThan => num < *target_n,
-                        Operator::LessThanOrEqual => num <= *target_n,
-                        _ => false,
-                    };
-                }
+            if let Some((raw_val, _)) = target
+                && let Ok(s) = std::str::from_utf8(raw_val)
+                && let Ok(num) = s.trim_matches('"').parse::<f64>()
+            {
+                return match pred.op {
+                    Operator::Equal => (num - target_n).abs() < f64::EPSILON,
+                    Operator::NotEqual => (num - target_n).abs() >= f64::EPSILON,
+                    Operator::GreaterThan => num > *target_n,
+                    Operator::GreaterThanOrEqual => num >= *target_n,
+                    Operator::LessThan => num < *target_n,
+                    Operator::LessThanOrEqual => num <= *target_n,
+                    _ => false,
+                };
             }
             false
         }
         Operand::Boolean(target_b) => {
-            if let Some(span) = target_span {
-                let raw_val = span.value(line);
+            if let Some((raw_val, _)) = target {
                 let b_val = raw_val == b"true";
                 match pred.op {
                     Operator::Equal => b_val == *target_b,
@@ -321,22 +471,20 @@ fn evaluate_predicate(pred: &SelectorPredicate, line: &[u8], spans: &[FieldSpan]
             }
         }
         Operand::DurationMillis(target_ms) => {
-            if let Some(span) = target_span {
-                let raw_val = span.value(line);
-                if let Ok(s) = std::str::from_utf8(raw_val)
-                    && let Ok(num) = s.trim_matches('"').parse::<f64>()
-                {
-                    let ms = num as u64;
-                    return match pred.op {
-                        Operator::Equal => ms == *target_ms,
-                        Operator::NotEqual => ms != *target_ms,
-                        Operator::GreaterThan => ms > *target_ms,
-                        Operator::GreaterThanOrEqual => ms >= *target_ms,
-                        Operator::LessThan => ms < *target_ms,
-                        Operator::LessThanOrEqual => ms <= *target_ms,
-                        _ => false,
-                    };
-                }
+            if let Some((raw_val, _)) = target
+                && let Ok(s) = std::str::from_utf8(raw_val)
+                && let Ok(num) = s.trim_matches('"').parse::<f64>()
+            {
+                let ms = num as u64;
+                return match pred.op {
+                    Operator::Equal => ms == *target_ms,
+                    Operator::NotEqual => ms != *target_ms,
+                    Operator::GreaterThan => ms > *target_ms,
+                    Operator::GreaterThanOrEqual => ms >= *target_ms,
+                    Operator::LessThan => ms < *target_ms,
+                    Operator::LessThanOrEqual => ms <= *target_ms,
+                    _ => false,
+                };
             }
             false
         }
@@ -421,5 +569,69 @@ mod tests {
 
         assert!(q.matches_line(line_match, DetectedFormat::JsonLines));
         assert!(!q.matches_line(line_mismatch, DetectedFormat::JsonLines));
+    }
+
+    #[test]
+    fn and_or_combine_predicates_with_and_binding_tighter() {
+        let q = Query::parse(r#"&.level == "ERROR" && .ms > 250 || .status >= 500"#);
+        let Query::Structured(groups) = &q else {
+            panic!("expected a selector query");
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        let f = DetectedFormat::JsonLines;
+        assert!(q.matches_line(br#"{"level":"ERROR","ms":300}"#, f));
+        assert!(!q.matches_line(br#"{"level":"ERROR","ms":100}"#, f));
+        assert!(q.matches_line(br#"{"level":"INFO","status":503}"#, f));
+        assert!(!q.matches_line(br#"{"level":"INFO","status":200}"#, f));
+    }
+
+    #[test]
+    fn operators_inside_quotes_do_not_split_predicates() {
+        let q = Query::parse(r#".msg == "a && b || c""#);
+        let Query::Structured(groups) = &q else {
+            panic!("expected a selector query");
+        };
+        assert_eq!(groups.len(), 1);
+        assert!(q.matches_line(br#"{"msg":"a && b || c"}"#, DetectedFormat::JsonLines));
+    }
+
+    #[test]
+    fn a_non_selector_operand_makes_the_whole_input_a_regex() {
+        assert!(matches!(Query::parse(".a == 1 && plain"), Query::Regex(_)));
+    }
+
+    #[test]
+    fn dotted_paths_reach_into_nested_json_objects() {
+        let q = Query::parse(".user.id == 42");
+        let f = DetectedFormat::JsonLines;
+        assert!(q.matches_line(br#"{"user":{"id":42,"name":"a"},"x":1}"#, f));
+        assert!(!q.matches_line(br#"{"user":{"id":7},"x":1}"#, f));
+        assert!(!q.matches_line(br#"{"user":"42"}"#, f));
+        let deep = Query::parse(r#".a.b.c == "z""#);
+        assert!(deep.matches_line(br#"{"a":{"b":{"c":"z"}}}"#, f));
+        // A literal dotted key still wins over a nested lookup.
+        let literal = Query::parse(".a.b == 1");
+        assert!(literal.matches_line(br#"{"a.b":1}"#, f));
+    }
+
+    #[test]
+    fn csv_fields_are_found_by_header_name_or_position() {
+        let names = ["id", "status", "path"];
+        let lookup = |name: &str| names.iter().position(|n| *n == name);
+        let q = Query::parse(".status >= 500");
+        assert!(q.matches_line_with(b"1,503,/a", DetectedFormat::Csv, &lookup));
+        assert!(!q.matches_line_with(b"2,200,/b", DetectedFormat::Csv, &lookup));
+        let by_pos = Query::parse(".col_3 == /b");
+        assert!(by_pos.matches_line(b"2,200,/b", DetectedFormat::Csv));
+        assert!(by_pos.matches_line(b"2\t200\t/b", DetectedFormat::Tsv));
+    }
+
+    #[test]
+    fn regex_queries_can_ignore_case() {
+        let q = Query::parse_with_case("error", true);
+        assert!(q.matches_line(b"an ERROR here", DetectedFormat::PlainText));
+        assert_ne!(q, Query::parse("error"));
+        assert!(!Query::parse("error").matches_line(b"ERROR", DetectedFormat::PlainText));
     }
 }

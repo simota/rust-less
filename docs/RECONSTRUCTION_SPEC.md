@@ -31,6 +31,13 @@ spec and for Phase 4: **mark (`m`/`'`), follow (`F`), filter (`&`), `-i`, `-I`, 
 screen (`h`), editor (`v`), horizontal scroll (`ESC-(` / `ESC-)`), `-p`, `-F`, `-X`**. No baseline
 scenario exercises them; implementing them is not required for Phase 4/5 parity.
 
+> **Later extension (2026-11):** all 12 are now implemented as extensions on
+> top of the parity core (see `README.md`). They remain outside this spec's
+> parity scope: no baseline scenario captures them, so they are verified by
+> the unit/integration tests in `src/` and by hand in tmux, not by
+> `make parity`. Implementing them changed no behavior the 40 scenarios pin
+> (still 40/40).
+
 Horizontal scroll is out of scope **even under `-S`**: `opt-chop-long-lines` (feature
 `opt-chop-long-lines-S`) verifies only that long lines are truncated with a trailing `>` marker
 (§2, `opt-chop-long-lines`); the `RIGHT-ARROW` reveal-of-chopped-content behavior that

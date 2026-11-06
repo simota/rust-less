@@ -24,6 +24,9 @@ pub struct RenderOpts {
     pub line_numbers: bool,
     pub chop: bool,
     pub raw_ansi: bool,
+    /// Display columns cut from the start of every line (horizontal
+    /// scroll, `ESC-)`/RIGHTARROW). Line numbers are not shifted.
+    pub hshift: usize,
 }
 
 /// One content-producing unit inside a display row, before spans are
@@ -135,6 +138,11 @@ fn scan_escape(bytes: &[u8], i: usize) -> Option<(usize, Option<&[u8]>)> {
 /// display row (§ no scenario disambiguates cross-row tab stops, so the
 /// simplest, most conventional choice — one running counter per logical
 /// line — is used).
+// Forced inline (and `decode_utf8_char` below): the renderer runs this per
+// character, and with two instantiations of `render_line_impl` the
+// compiler otherwise outlines it, costing several percent of every frame
+// (measured with callgrind on `make bench`).
+#[inline(always)]
 fn decode_piece(bytes: &[u8], i: usize, col: usize) -> (Piece<'_>, usize) {
     let b = bytes[i];
     if b == b'\t' {
@@ -201,6 +209,7 @@ fn caret_piece(ch: char) -> Piece<'static> {
 /// (including a truncated/incomplete multi-byte sequence) — the caller then
 /// falls back to a per-byte hex token, matching the LESSBINFMT behavior
 /// confirmed by `utf8-malformed` (not LESSUTFBINFMT's `<U+%04lX>`).
+#[inline(always)]
 fn decode_utf8_char(bytes: &[u8]) -> Option<(char, &str)> {
     let b0 = *bytes.first()?;
     let len = if b0 < 0x80 {
@@ -236,6 +245,21 @@ fn render_logical_line(
     opts: &RenderOpts,
     max_rows: usize,
 ) -> Vec<DisplayRow> {
+    // Two instantiations: the unshifted one (every frame unless the user
+    // scrolled sideways) compiles to the loop with no trace of the shift.
+    if opts.hshift > 0 {
+        render_line_impl::<true>(bytes, line_no, opts, max_rows)
+    } else {
+        render_line_impl::<false>(bytes, line_no, opts, max_rows)
+    }
+}
+
+fn render_line_impl<const SHIFTED: bool>(
+    bytes: &[u8],
+    line_no: usize,
+    opts: &RenderOpts,
+    max_rows: usize,
+) -> Vec<DisplayRow> {
     let number_prefix_width = if opts.line_numbers { 8 } else { 0 };
     let content_width = opts.width.saturating_sub(number_prefix_width).max(1);
 
@@ -244,6 +268,11 @@ fn render_logical_line(
     let mut row_col = 0usize;
     let mut line_col = 0usize;
     let mut i = 0usize;
+
+    if SHIFTED {
+        // Horizontal scroll: drop the first `hshift` columns once, up front.
+        (i, line_col, row_col) = skip_left_columns(bytes, opts, &mut current);
+    }
 
     'outer: while i < bytes.len() {
         if opts.raw_ansi
@@ -304,6 +333,54 @@ fn render_logical_line(
     rows.into_iter()
         .map(|pieces| finalize_row(pieces, line_no, opts))
         .collect()
+}
+
+/// Drops the first `opts.hshift` display columns of `bytes`, keeping
+/// escape sequences (colour still applies after the cut) in `current`. A
+/// wide character or tab cut by the left edge leaves its visible part as
+/// blanks. Returns the byte index, line column and row column to continue
+/// rendering from.
+#[inline(never)]
+fn skip_left_columns<'a>(
+    bytes: &'a [u8],
+    opts: &RenderOpts,
+    current: &mut Vec<Piece<'a>>,
+) -> (usize, usize, usize) {
+    let mut i = 0;
+    let mut line_col = 0;
+    let mut row_col = 0;
+    while i < bytes.len() && line_col < opts.hshift {
+        if opts.raw_ansi
+            && bytes[i] == 0x1b
+            && let Some((next_i, raw)) = scan_escape(bytes, i)
+        {
+            if let Some(seq) = raw {
+                current.push(Piece {
+                    text: match String::from_utf8_lossy(seq) {
+                        std::borrow::Cow::Borrowed(s) => PieceText::Borrowed(s),
+                        std::borrow::Cow::Owned(s) => PieceText::Owned(s),
+                    },
+                    width: 0,
+                    reverse: false,
+                });
+            }
+            i = next_i;
+            continue;
+        }
+        let (width, consumed) = piece_width(bytes, i, line_col);
+        i += consumed;
+        line_col += width;
+        if line_col > opts.hshift {
+            let visible = line_col - opts.hshift;
+            current.push(Piece {
+                text: PieceText::Spaces(visible),
+                width: visible,
+                reverse: false,
+            });
+            row_col = visible;
+        }
+    }
+    (i, line_col, row_col)
 }
 
 fn finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> DisplayRow {
@@ -383,6 +460,59 @@ fn highlight_matches(row: DisplayRow, pattern: &Regex) -> DisplayRow {
     out
 }
 
+/// Display width of a whole logical line as the core view draws it (tabs
+/// expanded, control characters in caret notation, escape sequences free
+/// under `-R`). Used to find how far right a horizontal scroll can go.
+pub fn line_display_width(bytes: &[u8], raw_ansi: bool) -> usize {
+    let mut col = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if raw_ansi
+            && bytes[i] == 0x1b
+            && let Some((next_i, _)) = scan_escape(bytes, i)
+        {
+            i = next_i;
+            continue;
+        }
+        let (width, consumed) = piece_width(bytes, i, col);
+        i += consumed;
+        col += width;
+    }
+    col
+}
+
+/// The display width and byte length of the piece `decode_piece` would
+/// decode at `bytes[i]`, without building it. Kept separate so the
+/// renderer's per-character loop stays the only caller of `decode_piece`
+/// (a second caller stopped the compiler inlining it there).
+fn piece_width(bytes: &[u8], i: usize, col: usize) -> (usize, usize) {
+    if bytes[i] == b'\t' {
+        return (8 - (col % 8), 1);
+    }
+    // The same decoding as `decode_utf8_char`, written out here so that
+    // function also keeps a single caller.
+    let b0 = bytes[i];
+    let len = match b0 {
+        0x00..=0x7f => 1,
+        _ if b0 & 0xE0 == 0xC0 => 2,
+        _ if b0 & 0xF0 == 0xE0 => 3,
+        _ if b0 & 0xF8 == 0xF0 => 4,
+        _ => return (4, 1),
+    };
+    let Some(ch) = bytes
+        .get(i..i + len)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|t| t.chars().next())
+    else {
+        return (4, 1); // malformed: shown as a 4-column <XX> token
+    };
+    if (ch as u32) < 0x20 || ch as u32 == 0x7f {
+        (2, len)
+    } else {
+        (UnicodeWidthChar::width(ch).unwrap_or(1), len)
+    }
+}
+
 pub struct WindowRender {
     pub rows: Vec<DisplayRow>,
     /// Logical line number of the last line represented in `rows` (the one
@@ -405,6 +535,36 @@ pub fn render_window(
     opts: &RenderOpts,
     highlight: Option<&Regex>,
 ) -> Result<WindowRender, String> {
+    render_window_impl(buffer, top, content_rows, opts, highlight, |_| true)
+}
+
+/// A line predicate: lines it rejects are not displayed (`&` filter).
+pub type LineFilter<'a> = &'a dyn Fn(&[u8]) -> bool;
+
+/// `render_window`, showing only the lines `keep` accepts (all when `None`).
+pub fn render_window_filtered(
+    buffer: &mut Buffer,
+    top: usize,
+    content_rows: usize,
+    opts: &RenderOpts,
+    highlight: Option<&Regex>,
+    keep: Option<LineFilter>,
+) -> Result<WindowRender, String> {
+    match keep {
+        None => render_window_impl(buffer, top, content_rows, opts, highlight, |_| true),
+        Some(f) => render_window_impl(buffer, top, content_rows, opts, highlight, f),
+    }
+}
+
+#[inline]
+fn render_window_impl(
+    buffer: &mut Buffer,
+    top: usize,
+    content_rows: usize,
+    opts: &RenderOpts,
+    highlight: Option<&Regex>,
+    keep: impl Fn(&[u8]) -> bool,
+) -> Result<WindowRender, String> {
     let mut rows: Vec<DisplayRow> = Vec::new();
     let mut row_lines: Vec<usize> = Vec::new();
     let mut line_no = top.max(1);
@@ -416,6 +576,10 @@ pub fn render_window(
             at_eof = true;
             break;
         };
+        if !keep(raw) {
+            line_no += 1;
+            continue;
+        }
         // `rows.len() < content_rows` here (the loop exits as soon as the
         // window is full), so at least one row is always requested.
         let mut line_rows = render_logical_line(raw, line_no, opts, content_rows - rows.len());
@@ -452,10 +616,17 @@ pub fn render_window(
     // (e.g. `nav-boundary-eof-bof`'s clamp to top=178 on a 200-line file,
     // 23 content rows) still shows `(END)`.
     if !at_eof && rows.len() == content_rows {
-        let next = line_no + 1;
-        buffer.ensure_lines_read(next)?;
-        if buffer.line(next).is_none() {
-            at_eof = true;
+        let mut next = line_no + 1;
+        loop {
+            buffer.ensure_lines_read(next)?;
+            match buffer.line(next) {
+                None => {
+                    at_eof = true;
+                    break;
+                }
+                Some(raw) if keep(raw) => break,
+                Some(_) => next += 1,
+            }
         }
     }
 
@@ -476,6 +647,7 @@ mod tests {
             line_numbers: false,
             chop: false,
             raw_ansi: false,
+            hshift: 0,
         }
     }
 
@@ -653,6 +825,7 @@ mod tests {
                     line_numbers: flags & 1 != 0,
                     chop: flags & 2 != 0,
                     raw_ansi: flags & 4 != 0,
+                    hshift: 0,
                 };
                 for bytes in &samples {
                     let full = render_logical_line(bytes, 7, &o, usize::MAX);
@@ -745,5 +918,82 @@ mod tests {
         assert_eq!(win.bottom_line, 23);
         assert!(!win.at_eof);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn horizontal_shift_cuts_columns_from_the_left_only() {
+        let mut o = opts(10);
+        o.chop = true;
+        o.hshift = 5;
+        let rows = render_logical_line(b"0123456789abcdefghij", 1, &o, usize::MAX);
+        assert_eq!(text_only(&rows[0]), "56789abcd>");
+        o.line_numbers = true;
+        o.width = 14;
+        let rows = render_logical_line(b"0123456789", 42, &o, usize::MAX);
+        assert_eq!(text_only(&rows[0]), "     42 56789");
+        // Shifted past the end: an empty row, not a missing one.
+        o.hshift = 50;
+        let rows = render_logical_line(b"short", 1, &o, usize::MAX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(text_only(&rows[0]), "      1 ");
+    }
+
+    #[test]
+    fn a_wide_character_cut_by_the_left_edge_becomes_blank() {
+        let mut o = opts(10);
+        o.hshift = 1;
+        let rows = render_logical_line("\u{6f22}ab".as_bytes(), 1, &o, usize::MAX);
+        assert_eq!(text_only(&rows[0]), " ab");
+    }
+
+    #[test]
+    fn line_display_width_counts_tabs_carets_and_skips_escapes() {
+        assert_eq!(line_display_width(b"a\tb", false), 9);
+        assert_eq!(line_display_width(b"\x01x", false), 3);
+        assert_eq!(line_display_width(b"\x1b[31mred", true), 3);
+        assert_eq!(line_display_width("\u{6f22}".as_bytes(), false), 2);
+    }
+
+    #[test]
+    fn filtered_window_skips_rejected_lines_and_knows_the_end() {
+        let mut content = Vec::new();
+        for n in 1..=10 {
+            content.extend_from_slice(format!("line {n}\n").as_bytes());
+        }
+        let mut buf = Buffer::new(crate::buffer::Source::Memory {
+            name: None,
+            bytes: content,
+        });
+        let even = |raw: &[u8]| raw.last().is_some_and(|b| (b - b'0').is_multiple_of(2));
+        let w = render_window_filtered(&mut buf, 1, 4, &opts(20), None, Some(&even)).unwrap();
+        let texts: Vec<_> = w.rows.iter().map(text_only).collect();
+        assert_eq!(texts, ["line 2", "line 4", "line 6", "line 8"]);
+        assert_eq!(w.bottom_line, 8);
+        // Only "line 10" ends in 0 and follows; the window is exactly full
+        // with 4 rows starting at 4, so the peek must find the end.
+        let w = render_window_filtered(&mut buf, 4, 4, &opts(20), None, Some(&even)).unwrap();
+        assert_eq!(w.bottom_line, 10);
+        assert!(w.at_eof);
+    }
+
+    #[test]
+    fn piece_width_agrees_with_decode_piece() {
+        let sample = "a\tb\u{1}\u{7f}\u{6f22}\u{301}e\u{1F600}"
+            .as_bytes()
+            .to_vec();
+        let mut bytes = sample.clone();
+        bytes.extend_from_slice(b"\xff\xe4\x80x");
+        let mut i = 0;
+        let mut col = 0;
+        while i < bytes.len() {
+            let (piece, consumed) = decode_piece(&bytes, i, col);
+            assert_eq!(
+                piece_width(&bytes, i, col),
+                (piece.width, consumed),
+                "at byte {i}"
+            );
+            i += consumed;
+            col += piece.width;
+        }
     }
 }
