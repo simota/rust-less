@@ -119,7 +119,7 @@ impl Buffer {
         while self.line_ends.len() < up_to {
             let prev_end = self.data.len();
             self.data.resize(line_start(prev_end), 0);
-            let n = match read_line_into(reader.as_mut(), &mut self.data) {
+            let n = match reader.read_until(b'\n', &mut self.data) {
                 Ok(n) => n,
                 Err(e) => {
                     // read_until keeps whatever it read before failing;
@@ -211,40 +211,6 @@ impl Buffer {
         // `data` holds the cached lines' bytes (newlines excluded) plus zero
         // padding, which can never be ESC.
         Ok(self.data.contains(&0x1b))
-    }
-}
-
-/// Appends one line (through its `\n`, if any) from `reader` to `out` and
-/// returns the number of bytes appended (0 at EOF). Same contract as
-/// `BufRead::read_until(b'\n', out)` — including retrying `Interrupted` and
-/// keeping already-appended bytes on error — but finds the newline with the
-/// `memchr` crate's vectorized search instead of the standard library's
-/// word-at-a-time one, which dominated whole-file ingest.
-fn read_line_into(reader: &mut dyn BufRead, out: &mut Vec<u8>) -> io::Result<usize> {
-    let mut read = 0;
-    loop {
-        let (done, used) = {
-            let available = match reader.fill_buf() {
-                Ok(buf) => buf,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            match memchr::memchr(b'\n', available) {
-                Some(i) => {
-                    out.extend_from_slice(&available[..=i]);
-                    (true, i + 1)
-                }
-                None => {
-                    out.extend_from_slice(available);
-                    (false, available.len())
-                }
-            }
-        };
-        reader.consume(used);
-        read += used;
-        if done || used == 0 {
-            return Ok(read);
-        }
     }
 }
 
@@ -399,50 +365,6 @@ mod tests {
         }
         assert_eq!(buf.total_bytes().unwrap(), content.len());
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn read_line_into_matches_read_until_across_refills_and_interrupts() {
-        /// Yields its data in 3-byte reads, failing every other call with
-        /// `Interrupted` (which `read_until` retries).
-        struct Choppy {
-            data: Vec<u8>,
-            pos: usize,
-            calls: usize,
-        }
-        impl io::Read for Choppy {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.calls += 1;
-                if self.calls.is_multiple_of(2) {
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                let n = buf.len().min(3).min(self.data.len() - self.pos);
-                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-                self.pos += n;
-                Ok(n)
-            }
-        }
-        let data = b"\nab\nlonger line here\n\n\xffx\r\nno newline".to_vec();
-        let mk = || {
-            BufReader::with_capacity(
-                4,
-                Choppy {
-                    data: data.clone(),
-                    pos: 0,
-                    calls: 0,
-                },
-            )
-        };
-        let (mut ours, mut std_reader) = (mk(), mk());
-        loop {
-            let (mut a, mut b) = (b"pre".to_vec(), b"pre".to_vec());
-            let n = read_line_into(&mut ours, &mut a).unwrap();
-            assert_eq!(n, std_reader.read_until(b'\n', &mut b).unwrap());
-            assert_eq!(a, b);
-            if n == 0 {
-                break;
-            }
-        }
     }
 
     #[test]

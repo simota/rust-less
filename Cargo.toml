@@ -19,9 +19,6 @@ path = "src/main.rs"
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-# Already in the build as a dependency of `regex`; used directly for the
-# vectorized newline search in buffer ingest.
-memchr = "2"
 unicode-width = "0.2"
 
 [profile.release]
