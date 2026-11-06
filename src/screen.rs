@@ -230,6 +230,12 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, &str)> {
 /// so the rows returned are exactly the first `max_rows` rows a full render
 /// would produce (a very long wrapped line no longer costs time and memory
 /// proportional to its whole length when only a window's worth is shown).
+///
+/// Pieces are written straight into the row's coalesced spans
+/// (`RowBuilder`) instead of being collected per row first, and a run of
+/// printable ASCII that fits in the row is handled as one piece: each such
+/// byte is one column wide and can neither wrap nor chop before the row is
+/// full, so the run yields exactly the spans the byte-by-byte path would.
 fn render_logical_line(
     bytes: &[u8],
     line_no: usize,
@@ -238,20 +244,36 @@ fn render_logical_line(
 ) -> Vec<DisplayRow> {
     let number_prefix_width = if opts.line_numbers { 8 } else { 0 };
     let content_width = opts.width.saturating_sub(number_prefix_width).max(1);
+    let prefix = RowPrefix::new(line_no, opts);
 
-    let mut rows: Vec<Vec<Piece>> = Vec::new();
-    let mut current: Vec<Piece> = Vec::new();
+    let mut rows: Vec<DisplayRow> = Vec::new();
+    let mut current = RowBuilder::new(&prefix);
     let mut row_col = 0usize;
     let mut line_col = 0usize;
     let mut i = 0usize;
 
     'outer: while i < bytes.len() {
+        let b = bytes[i];
+        if is_printable_ascii(b) && row_col < content_width {
+            let room = content_width - row_col;
+            let run = bytes[i..]
+                .iter()
+                .take(room)
+                .take_while(|&&c| is_printable_ascii(c))
+                .count();
+            let text = std::str::from_utf8(&bytes[i..i + run]).expect("printable ASCII");
+            current.push_ascii_run(text);
+            i += run;
+            row_col += run;
+            line_col += run;
+            continue;
+        }
         if opts.raw_ansi
-            && bytes[i] == 0x1b
+            && b == 0x1b
             && let Some((next_i, raw)) = scan_escape(bytes, i)
         {
             if let Some(seq) = raw {
-                current.push(Piece {
+                current.push(&Piece {
                     text: match String::from_utf8_lossy(seq) {
                         std::borrow::Cow::Borrowed(s) => PieceText::Borrowed(s),
                         std::borrow::Cow::Owned(s) => PieceText::Owned(s),
@@ -271,76 +293,156 @@ fn render_logical_line(
             if row_col + piece.width > content_width {
                 // Free exactly one column for the '>' marker, then stop.
                 if row_col == content_width {
-                    current.pop();
+                    current.pop_last_piece();
                 }
-                current.push(Piece {
+                current.push(&Piece {
                     text: PieceText::inline(">"),
                     width: 1,
                     reverse: false,
                 });
-                rows.push(std::mem::take(&mut current));
+                rows.push(current.take());
                 break 'outer;
             }
         } else if row_col + piece.width > content_width && row_col > 0 {
-            rows.push(std::mem::take(&mut current));
+            rows.push(current.take());
             if rows.len() >= max_rows {
                 // `piece` (and everything after it) would start row
                 // `max_rows + 1`, which no caller displays.
                 break 'outer;
             }
+            current = RowBuilder::new(&prefix);
             row_col = 0;
         }
         row_col += piece.width;
-        current.push(piece);
+        current.push(&piece);
     }
-    // The chop branch above already pushes its final (truncated) row and
-    // resets `current` before breaking; only push here for the ordinary
-    // wrap-to-completion path (also covers a genuinely empty line, which
-    // never enters the loop and must still produce exactly one row).
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(current);
+    // The chop branch above already takes its final (truncated) row before
+    // breaking, leaving `current` with no pieces; only push here for the
+    // ordinary wrap-to-completion path (also covers a genuinely empty line,
+    // which never enters the loop and must still produce exactly one row).
+    if current.pieces > 0 || rows.is_empty() {
+        rows.push(current.take());
     }
-
-    rows.into_iter()
-        .map(|pieces| finalize_row(pieces, line_no, opts))
-        .collect()
+    rows
 }
 
-fn finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> DisplayRow {
-    let mut spans: Vec<Span> = Vec::new();
-    if opts.raw_ansi {
-        // "Color resets to normal at the start of every line" (§2
-        // `opt-raw-control-chars-R`): an unclosed sequence (`ESC[35m` with
-        // no matching reset) must not bleed into the next row. Rows are
-        // drawn via cursor positioning, not literal newlines, so the
-        // terminal's SGR state otherwise persists across them regardless of
-        // wrap vs. logical-line boundaries — reset unconditionally at the
-        // start of every row (harmless no-op when already default).
-        spans.push(Span {
-            text: "\x1b[0m".to_string(),
-            reverse: false,
-        });
-    }
-    if opts.line_numbers {
-        spans.push(Span {
-            text: format!("{:>7} ", line_no),
-            reverse: false,
-        });
-    }
-    for piece in pieces {
-        match spans.last_mut() {
-            Some(last) if last.reverse == piece.reverse => piece.text.push_to(&mut last.text),
-            _ => {
-                let mut text = String::new();
-                piece.text.push_to(&mut text);
-                spans.push(Span {
-                    text,
-                    reverse: piece.reverse,
-                });
-            }
+/// Space through `~`: one column wide, never a control character.
+#[inline]
+fn is_printable_ascii(b: u8) -> bool {
+    (0x20..0x7f).contains(&b)
+}
+
+/// The spans every display row of one logical line starts with (the `-R`
+/// color reset, then the `-N` line number), formatted once per line.
+struct RowPrefix {
+    reset: bool,
+    number: Option<String>,
+}
+
+impl RowPrefix {
+    fn new(line_no: usize, opts: &RenderOpts) -> Self {
+        RowPrefix {
+            reset: opts.raw_ansi,
+            number: opts.line_numbers.then(|| format!("{:>7} ", line_no)),
         }
     }
-    spans
+}
+
+/// One display row under construction: pieces are coalesced into spans by
+/// reverse/non-reverse runs as they arrive.
+struct RowBuilder {
+    spans: DisplayRow,
+    /// Pieces pushed so far (prefix spans excluded).
+    pieces: usize,
+    /// The last piece pushed, for `pop_last_piece`: its byte length and
+    /// whether it opened a span of its own.
+    last: Option<(usize, bool)>,
+}
+
+impl RowBuilder {
+    fn new(prefix: &RowPrefix) -> Self {
+        let mut spans = DisplayRow::new();
+        if prefix.reset {
+            // "Color resets to normal at the start of every line" (§2
+            // `opt-raw-control-chars-R`): an unclosed sequence (`ESC[35m`
+            // with no matching reset) must not bleed into the next row.
+            // Rows are drawn via cursor positioning, not literal newlines,
+            // so the terminal's SGR state otherwise persists across them
+            // regardless of wrap vs. logical-line boundaries — reset
+            // unconditionally at the start of every row (harmless no-op
+            // when already default).
+            spans.push(Span {
+                text: "\x1b[0m".to_string(),
+                reverse: false,
+            });
+        }
+        if let Some(number) = &prefix.number {
+            spans.push(Span {
+                text: number.clone(),
+                reverse: false,
+            });
+        }
+        RowBuilder {
+            spans,
+            pieces: 0,
+            last: None,
+        }
+    }
+
+    /// Opens a new span unless the last one has the same reverse state;
+    /// returns whether it did.
+    fn span_for(&mut self, reverse: bool) -> (&mut String, bool) {
+        let opened = !matches!(self.spans.last(), Some(last) if last.reverse == reverse);
+        if opened {
+            self.spans.push(Span {
+                text: String::new(),
+                reverse,
+            });
+        }
+        let last = self.spans.last_mut().expect("pushed above");
+        (&mut last.text, opened)
+    }
+
+    fn push(&mut self, piece: &Piece) {
+        let (text, opened) = self.span_for(piece.reverse);
+        let before = text.len();
+        piece.text.push_to(text);
+        let len = text.len() - before;
+        self.pieces += 1;
+        self.last = Some((len, opened));
+    }
+
+    /// Pushes a non-empty printable-ASCII run: the same spans as pushing
+    /// each byte as its own non-reverse piece.
+    fn push_ascii_run(&mut self, run: &str) {
+        let (text, opened) = self.span_for(false);
+        text.push_str(run);
+        self.pieces += run.len();
+        // Only the run's last byte is the last piece: its own span exists
+        // only if the run is that one byte and it opened the span.
+        self.last = Some((1, opened && run.len() == 1));
+    }
+
+    /// Removes the last piece pushed (no-op if none), leaving the spans as
+    /// if it had never been pushed.
+    fn pop_last_piece(&mut self) {
+        let Some((len, opened)) = self.last.take() else {
+            return;
+        };
+        if opened {
+            self.spans.pop();
+        } else if let Some(span) = self.spans.last_mut() {
+            span.text.truncate(span.text.len() - len);
+        }
+        self.pieces -= 1;
+    }
+
+    /// Hands over the finished row, leaving this builder without pieces.
+    fn take(&mut self) -> DisplayRow {
+        self.pieces = 0;
+        self.last = None;
+        std::mem::take(&mut self.spans)
+    }
 }
 
 /// Applies search-match highlighting to a rendered content row: any span of
@@ -476,6 +578,181 @@ mod tests {
             line_numbers: false,
             chop: false,
             raw_ansi: false,
+        }
+    }
+
+    /// The pre-`RowBuilder` implementation, kept verbatim as the oracle for
+    /// `row_builder_matches_reference_render`.
+    fn reference_render_logical_line(
+        bytes: &[u8],
+        line_no: usize,
+        opts: &RenderOpts,
+        max_rows: usize,
+    ) -> Vec<DisplayRow> {
+        let number_prefix_width = if opts.line_numbers { 8 } else { 0 };
+        let content_width = opts.width.saturating_sub(number_prefix_width).max(1);
+
+        let mut rows: Vec<Vec<Piece>> = Vec::new();
+        let mut current: Vec<Piece> = Vec::new();
+        let mut row_col = 0usize;
+        let mut line_col = 0usize;
+        let mut i = 0usize;
+
+        'outer: while i < bytes.len() {
+            if opts.raw_ansi
+                && bytes[i] == 0x1b
+                && let Some((next_i, raw)) = scan_escape(bytes, i)
+            {
+                if let Some(seq) = raw {
+                    current.push(Piece {
+                        text: match String::from_utf8_lossy(seq) {
+                            std::borrow::Cow::Borrowed(s) => PieceText::Borrowed(s),
+                            std::borrow::Cow::Owned(s) => PieceText::Owned(s),
+                        },
+                        width: 0,
+                        reverse: false,
+                    });
+                }
+                i = next_i;
+                continue;
+            }
+            let (piece, consumed) = decode_piece(bytes, i, line_col);
+            i += consumed;
+            line_col += piece.width;
+
+            if opts.chop {
+                if row_col + piece.width > content_width {
+                    // Free exactly one column for the '>' marker, then stop.
+                    if row_col == content_width {
+                        current.pop();
+                    }
+                    current.push(Piece {
+                        text: PieceText::inline(">"),
+                        width: 1,
+                        reverse: false,
+                    });
+                    rows.push(std::mem::take(&mut current));
+                    break 'outer;
+                }
+            } else if row_col + piece.width > content_width && row_col > 0 {
+                rows.push(std::mem::take(&mut current));
+                if rows.len() >= max_rows {
+                    // `piece` (and everything after it) would start row
+                    // `max_rows + 1`, which no caller displays.
+                    break 'outer;
+                }
+                row_col = 0;
+            }
+            row_col += piece.width;
+            current.push(piece);
+        }
+        // The chop branch above already pushes its final (truncated) row and
+        // resets `current` before breaking; only push here for the ordinary
+        // wrap-to-completion path (also covers a genuinely empty line, which
+        // never enters the loop and must still produce exactly one row).
+        if !current.is_empty() || rows.is_empty() {
+            rows.push(current);
+        }
+
+        rows.into_iter()
+            .map(|pieces| reference_finalize_row(pieces, line_no, opts))
+            .collect()
+    }
+
+    fn reference_finalize_row(pieces: Vec<Piece>, line_no: usize, opts: &RenderOpts) -> DisplayRow {
+        let mut spans: Vec<Span> = Vec::new();
+        if opts.raw_ansi {
+            // "Color resets to normal at the start of every line" (§2
+            // `opt-raw-control-chars-R`): an unclosed sequence (`ESC[35m` with
+            // no matching reset) must not bleed into the next row. Rows are
+            // drawn via cursor positioning, not literal newlines, so the
+            // terminal's SGR state otherwise persists across them regardless of
+            // wrap vs. logical-line boundaries — reset unconditionally at the
+            // start of every row (harmless no-op when already default).
+            spans.push(Span {
+                text: "\x1b[0m".to_string(),
+                reverse: false,
+            });
+        }
+        if opts.line_numbers {
+            spans.push(Span {
+                text: format!("{:>7} ", line_no),
+                reverse: false,
+            });
+        }
+        for piece in pieces {
+            match spans.last_mut() {
+                Some(last) if last.reverse == piece.reverse => piece.text.push_to(&mut last.text),
+                _ => {
+                    let mut text = String::new();
+                    piece.text.push_to(&mut text);
+                    spans.push(Span {
+                        text,
+                        reverse: piece.reverse,
+                    });
+                }
+            }
+        }
+        spans
+    }
+
+    #[test]
+    fn row_builder_matches_reference_render() {
+        // Alphabet weighted toward the cases that interact with run
+        // batching, wrap, chop and the chop marker's pop: printable ASCII,
+        // tabs, control bytes, ESC sequences (valid, malformed, OSC 8),
+        // wide and zero-width characters, and malformed UTF-8.
+        const ATOMS: &[&[u8]] = &[
+            b"a",
+            b"Z",
+            b" ",
+            b"~",
+            b"abcdefgh",
+            b"0123456789",
+            b"\t",
+            b"\x01",
+            b"\x7f",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b[2;5H",
+            b"\x1b[",
+            b"\x1b]8;;http://x\x07",
+            b"\x1b]8;;u\x1b\\",
+            b"\x1b",
+            "\u{6f22}".as_bytes(),
+            "\u{2713}".as_bytes(),
+            "\u{301}".as_bytes(),
+            "\u{1F600}".as_bytes(),
+            b"\xff",
+            b"\xe4\xb8",
+            b"\xc3",
+        ];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..20_000 {
+            let atoms = (next() % 40) as usize;
+            let mut line = Vec::new();
+            for _ in 0..atoms {
+                line.extend_from_slice(ATOMS[(next() % ATOMS.len() as u64) as usize]);
+            }
+            let o = RenderOpts {
+                width: [1, 2, 3, 5, 8, 9, 10, 13, 80][(next() % 9) as usize],
+                line_numbers: next() % 2 == 0,
+                chop: next() % 2 == 0,
+                raw_ansi: next() % 2 == 0,
+            };
+            let max_rows = 1 + (next() % 6) as usize;
+            let line_no = 1 + (next() % 1000) as usize;
+            assert_eq!(
+                render_logical_line(&line, line_no, &o, max_rows),
+                reference_render_logical_line(&line, line_no, &o, max_rows),
+                "case {case}: line {line:?} opts {o:?} max_rows {max_rows}"
+            );
         }
     }
 
