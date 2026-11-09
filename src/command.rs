@@ -2,26 +2,35 @@
 //! half-window N, current file index and the multi-file list, the
 //! "first draw of this process" flag, and dispatches decoded `Action`s to
 //! `buffer`/`screen`/`search`/`prompt`.
+//!
+//! With no filter and no sort active, every command keeps the exact
+//! less-compatible line semantics the parity baseline checks. Once a filter
+//! (`&`) or a column sort is active, navigation and search run over the
+//! positions of a `view::ViewIndex` instead, so hidden lines are never
+//! visited.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
-use crate::buffer::{Buffer, Source};
-use crate::cli::{BellMode, Options, PromptMode};
+use crate::buffer::{Buffer, Growth, Source};
+use crate::cli::{BellMode, CaseMode, KEYS_HELP, Options, PromptMode};
 use crate::input::{Action, Decoded, Decoder};
-use crate::projection::{ProjectionEngine, clip_to_width, escape_controls};
+use crate::projection::{ProjectionEngine, WindowLines, clip_to_width, escape_controls};
 use crate::prompt::{self, PromptContext};
 use crate::screen::{self, RenderOpts};
 use crate::search::{self, Direction};
 use crate::selector::Query;
 use crate::sniffer::{DetectedFormat, FormatSniffer};
+use crate::view::{LineFilter, SortKey, ViewIndex};
 
 struct FileEntry {
     buffer: Buffer,
@@ -52,8 +61,35 @@ enum SearchPattern {
     Structured(Query),
 }
 
+/// The column the view is sorted by.
+#[derive(Debug, Clone, PartialEq)]
+struct SortSpec {
+    column: String,
+    descending: bool,
+}
+
+/// A full-screen text page drawn over the file (help, column statistics).
+struct Overlay {
+    title: String,
+    lines: Vec<String>,
+    top: usize,
+}
+
+/// A place in the input: for marks and `''`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    file: usize,
+    line: usize,
+}
+
 /// How many leading lines the format sniffer and column derivation sample.
 const SNIFF_SAMPLE_LINES: usize = 16;
+
+/// How often follow mode looks for new input.
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+/// Most-frequent values listed by the column statistics page.
+const STATS_TOP_VALUES: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyOutcome {
@@ -84,12 +120,27 @@ pub struct App {
     /// Structured-view state of the *current* file; reset on `:n`/`:p`.
     projection: ProjectionEngine,
     tabular_view: bool,
-    active_filter: Option<Query>,
+    /// The `&` filter. Kept across files (as in less); read as a selector
+    /// on a structured file and as a regex elsewhere.
+    filter: Option<LineFilter>,
+    /// Column sort of the current file (cleared on `:n`/`:p`).
+    sort: Option<SortSpec>,
+    /// Lines shown while a filter or sort is active (derived state: `None`
+    /// whenever it must be rebuilt).
+    view: Option<ViewIndex>,
+    case: CaseMode,
     /// Index into `projection.columns` of the column-mode focus.
     focused_column: usize,
     /// Whether the current file's format has been sniffed (once per file,
     /// on its first draw).
     sniffer_checked: bool,
+    marks: HashMap<char, Position>,
+    /// Where the last jump (g, G, search, mark) started, for `''`.
+    previous_position: Option<Position>,
+    /// Display columns scrolled off to the left.
+    hscroll: usize,
+    following: bool,
+    overlay: Option<Overlay>,
     /// Reused frame buffer for `draw` (kept to avoid regrowing it per frame).
     frame_buf: Vec<u8>,
 }
@@ -110,6 +161,7 @@ impl App {
         };
         let mut projection = ProjectionEngine::new(DetectedFormat::PlainText);
         projection.raw_ansi = opts.raw_control_chars;
+        let case = opts.case;
         App {
             opts,
             files,
@@ -125,9 +177,17 @@ impl App {
             decoder: Decoder::new(),
             projection,
             tabular_view: false,
-            active_filter: None,
+            filter: None,
+            sort: None,
+            view: None,
+            case,
             focused_column: 0,
             sniffer_checked: false,
+            marks: HashMap::new(),
+            previous_position: None,
+            hscroll: 0,
+            following: false,
+            overlay: None,
             frame_buf: Vec::new(),
         }
     }
@@ -152,11 +212,19 @@ impl App {
             line_numbers: self.opts.line_numbers,
             chop: self.opts.chop_long_lines,
             raw_ansi: self.opts.raw_control_chars,
+            hscroll: self.hscroll,
         }
     }
 
     fn current(&mut self) -> &mut FileEntry {
         &mut self.files[self.file_index]
+    }
+
+    fn position(&self) -> Position {
+        Position {
+            file: self.file_index,
+            line: self.top,
+        }
     }
 
     /// Eagerly validates the very first file before any terminal state is
@@ -165,6 +233,80 @@ impl App {
     pub fn validate_first_file(&mut self) -> Result<(), String> {
         self.files[0].buffer.ensure_lines_read(1)?;
         Ok(())
+    }
+
+    /// `-F`: when there is one input and it fits on one screen, returns it
+    /// rendered as the pager would show it (so the caller can print it and
+    /// exit instead of starting the pager).
+    pub fn one_screen_output(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.files.len() != 1 {
+            return Ok(None);
+        }
+        let rows = self.content_rows();
+        let opts = self.render_opts();
+        let buffer = &mut self.files[0].buffer;
+        // A pipe must not look short just because its producer is slow to
+        // start (`git log` computing): wait for a screenful or the end.
+        while buffer.is_open_stream() && buffer.lines_cached() <= rows {
+            buffer.ensure_lines_read(rows + 1)?;
+        }
+        let win = screen::render_window(buffer, 1, rows, &opts, None)?;
+        if !win.at_eof || win.rows.len() > rows {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        for row in &win.rows {
+            write_spans(&mut out, row).map_err(|e| e.to_string())?;
+            if self.opts.raw_control_chars {
+                out.extend_from_slice(b"\x1b[0m");
+            }
+            out.push(b'\n');
+        }
+        // An empty line renders as no row at all; an empty input prints nothing.
+        if buffer.lines_cached() == 0 {
+            out.clear();
+        }
+        Ok(Some(out))
+    }
+
+    /// Runs the `+CMD` / `-p` startup commands before the first screen, as
+    /// if their keys had been typed. A failure becomes the first screen's
+    /// message.
+    pub fn run_initial_commands(&mut self) {
+        let commands = std::mem::take(&mut self.opts.initial_commands);
+        if commands.is_empty() {
+            return;
+        }
+        self.ensure_format_sniffed();
+        for cmd in commands {
+            let mut actions = Vec::new();
+            if !cmd.is_empty() && cmd.chars().all(|c| c.is_ascii_digit()) {
+                actions.push(Action::GotoLine(cmd.parse().ok()));
+            } else {
+                for c in cmd.chars() {
+                    if let Decoded::Action(a) =
+                        self.decoder.feed(KeyCode::Char(c), KeyModifiers::NONE)
+                    {
+                        actions.push(a);
+                    }
+                }
+                // A pattern or file name typed on the command line ends there.
+                if self.decoder.preview().is_some()
+                    && let Decoded::Action(a) =
+                        self.decoder.feed(KeyCode::Enter, KeyModifiers::NONE)
+                {
+                    actions.push(a);
+                }
+            }
+            for action in actions {
+                if action == Action::Quit {
+                    continue;
+                }
+                if let Err(msg) = self.apply(action) {
+                    self.pending_message = Some(format!("{}  (press RETURN)", msg));
+                }
+            }
+        }
     }
 
     fn binary_prompt_text(&self) -> String {
@@ -193,8 +335,21 @@ impl App {
             }
         }
 
+        self.run_initial_commands();
         self.draw(out)?;
         loop {
+            let waiting = self.following || self.files[self.file_index].buffer.is_open_stream();
+            if waiting && !event::poll(FOLLOW_POLL)? {
+                let redraw = if self.following {
+                    self.follow_tick()
+                } else {
+                    self.stream_tick()
+                };
+                if redraw {
+                    self.draw(out)?;
+                }
+                continue;
+            }
             match event::read()? {
                 Event::Resize(w, h) => {
                     self.set_size(w, h);
@@ -203,6 +358,18 @@ impl App {
                 Event::Key(k) => {
                     if k.kind != KeyEventKind::Press {
                         continue;
+                    }
+                    if self.following {
+                        // Any key stops following; keys that are not
+                        // "stop" keys then also run as usual (so `q` quits).
+                        self.stop_follow();
+                        let is_stop = matches!(k.code, KeyCode::Esc | KeyCode::Char('F'))
+                            || (k.code == KeyCode::Char('c')
+                                && k.modifiers.contains(KeyModifiers::CONTROL));
+                        if is_stop {
+                            self.draw(out)?;
+                            continue;
+                        }
                     }
                     match self.handle_key(out, k.code, k.modifiers)? {
                         KeyOutcome::Quit => return Ok(0),
@@ -224,6 +391,11 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> io::Result<KeyOutcome> {
+        if self.overlay.is_some() {
+            self.overlay_key(code);
+            self.draw(out)?;
+            return Ok(KeyOutcome::Continue);
+        }
         if self.pending_message.is_some() {
             // Any key dismisses a "(press RETURN)" message; per
             // `nav-goto-line/after-50G-mid-file` (baseline top lands on 50
@@ -269,6 +441,29 @@ impl App {
         Ok(KeyOutcome::Continue)
     }
 
+    /// Keys while the help or statistics page is shown: scroll it, or close
+    /// it with any other key.
+    fn overlay_key(&mut self, code: KeyCode) {
+        let page = self.content_rows();
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let max_top = overlay.lines.len().saturating_sub(page);
+        match code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => overlay.top += 1,
+            KeyCode::Char('k') | KeyCode::Up => overlay.top = overlay.top.saturating_sub(1),
+            KeyCode::Char(' ') | KeyCode::Char('f') | KeyCode::PageDown => overlay.top += page,
+            KeyCode::Char('b') | KeyCode::PageUp => overlay.top = overlay.top.saturating_sub(page),
+            KeyCode::Char('g') => overlay.top = 0,
+            KeyCode::Char('G') => overlay.top = max_top,
+            _ => {
+                self.overlay = None;
+                return;
+            }
+        }
+        overlay.top = overlay.top.min(max_top);
+    }
+
     /// Dispatches `action`, then marks the fresh-process bottom-anchor
     /// window closed once the view actually moves (top-of-window line or
     /// current file changes). §3 item 1's flag must NOT be consumed by the
@@ -279,14 +474,42 @@ impl App {
     fn apply(&mut self, action: Action) -> Result<(), String> {
         let old_top = self.top;
         let old_file_index = self.file_index;
+        let is_jump = matches!(
+            action,
+            Action::GotoLine(_)
+                | Action::GotoLast(_)
+                | Action::SearchInput(..)
+                | Action::RepeatSearch(_)
+                | Action::RepeatSearchReverse(_)
+                | Action::GotoMark(_)
+        );
+        let before = self.position();
         let result = self.apply_inner(action);
-        if result.is_ok() && (self.top != old_top || self.file_index != old_file_index) {
+        let moved = self.top != old_top || self.file_index != old_file_index;
+        if result.is_ok() && moved {
             self.first_render_done = true;
+            if is_jump {
+                self.previous_position = Some(before);
+            }
         }
         result
     }
 
     fn apply_inner(&mut self, action: Action) -> Result<(), String> {
+        let is_nav = matches!(
+            action,
+            Action::ScrollLines(_)
+                | Action::ScrollWindow(..)
+                | Action::ScrollHalfWindow(..)
+                | Action::GotoLine(_)
+                | Action::GotoLast(_)
+        );
+        if is_nav {
+            self.ensure_view()?;
+            if self.view.is_some() {
+                return self.apply_view_nav(action);
+            }
+        }
         match action {
             Action::ScrollLines(n) => {
                 let proposed = shift(self.top, n);
@@ -299,13 +522,7 @@ impl App {
                 self.top = self.clamp_relative(proposed)?;
             }
             Action::ScrollHalfWindow(n, forward) => {
-                let mag = match n {
-                    Some(v) => {
-                        self.sticky_half = Some(v);
-                        v
-                    }
-                    None => self.half_window(),
-                } as i64;
+                let mag = self.half_window_magnitude(n);
                 let signed = if forward { mag } else { -mag };
                 let proposed = shift(self.top, signed);
                 self.top = self.clamp_relative(proposed)?;
@@ -348,6 +565,10 @@ impl App {
                 // Only JSON lines expand; elsewhere the key would change
                 // nothing visible, so say why instead.
                 if self.projection.format == DetectedFormat::JsonLines {
+                    self.ensure_view()?;
+                    if self.view.is_some() {
+                        self.normalize_view_top()?;
+                    }
                     self.projection.toggle_expand(self.top);
                 } else {
                     self.pending_message =
@@ -373,6 +594,8 @@ impl App {
                 self.projection.set_format(next);
                 self.projection.update_columns_from_lines(&sample);
                 self.focused_column = 0;
+                self.sort = None;
+                self.view = None;
                 self.pending_message = Some(format!("Format: {}", next.name()));
             }
             Action::ToggleColumnMode => {
@@ -382,11 +605,13 @@ impl App {
                 if self.focused_column > 0 {
                     self.focused_column -= 1;
                 }
+                self.scroll_focus_into_view();
             }
             Action::NextColumn => {
                 if self.focused_column + 1 < self.projection.columns.len() {
                     self.focused_column += 1;
                 }
+                self.scroll_focus_into_view();
             }
             Action::PinColumn => {
                 if let Some(col) = self.projection.columns.get_mut(self.focused_column) {
@@ -404,43 +629,34 @@ impl App {
                     self.pending_message = Some(format!("Column '{}' {}", name, state));
                 }
             }
-            Action::SortColumn => {
-                // Bound but not implemented: say so instead of implying a
-                // sort happened.
-                if let Some(col) = self.projection.columns.get(self.focused_column) {
-                    self.pending_message = Some(format!(
-                        "Sorting by '{}' is not supported yet",
-                        escape_controls(&col.name, false)
-                    ));
-                }
-            }
-            Action::FilterInput(buf) => {
-                if buf.trim().is_empty() {
-                    self.active_filter = None;
-                    self.pending_message = Some("Filter cleared".to_string());
-                } else {
-                    let q = Query::parse(&buf);
-                    // Reject before applying: a pattern that cannot compile
-                    // matches nothing and would blank the view silently.
-                    if !q.is_valid() {
-                        return Err("Invalid pattern".to_string());
-                    }
-                    self.active_filter = Some(q);
-                    self.pending_message = Some(if self.projection.format.is_structured() {
-                        format!("Filter: &{}", buf)
-                    } else {
-                        format!(
-                            "Filter: &{} (no effect on plain text; {PICK_FORMAT_HINT})",
-                            buf
-                        )
-                    });
-                }
-            }
+            Action::SortColumn => self.cycle_sort()?,
+            Action::ColumnStats => self.show_column_stats()?,
+            Action::FilterInput(buf) => self.set_filter(&buf)?,
             Action::NextFile(n) => self.switch_file(n as i64)?,
             Action::PrevFile(n) => self.switch_file(-(n as i64))?,
+            Action::Follow => self.start_follow()?,
+            Action::SetMark(c) => {
+                self.marks.insert(c, self.position());
+                self.pending_message = Some(format!("Mark '{c}' set at line {}", self.top));
+            }
+            Action::GotoMark(c) => self.goto_mark(c)?,
+            Action::Help => self.show_help(),
+            Action::ToggleOption(c) => self.toggle_option(c)?,
+            Action::HScroll(n, right) => self.horizontal_scroll(n, right),
+            Action::SaveView { path, force } => self.save_view(&path, force)?,
             Action::Quit => unreachable!("handled by caller"),
         }
         Ok(())
+    }
+
+    fn half_window_magnitude(&mut self, n: Option<u64>) -> i64 {
+        (match n {
+            Some(v) => {
+                self.sticky_half = Some(v);
+                v
+            }
+            None => self.half_window(),
+        }) as i64
     }
 
     /// Relative-scroll clamp: reads just far enough ahead to know whether
@@ -482,6 +698,658 @@ impl App {
         }
     }
 
+    // ------------------------------------------------- filtered / sorted view
+
+    /// True when a filter or an applicable sort asks for a view.
+    fn view_wanted(&self) -> bool {
+        self.filter.is_some() || self.sort_applies()
+    }
+
+    fn sort_applies(&self) -> bool {
+        self.sort.as_ref().is_some_and(|s| {
+            self.projection.format.is_structured()
+                && self.projection.columns.iter().any(|c| c.name == s.column)
+        })
+    }
+
+    /// Builds the view if one is wanted and none is current (or a sorted
+    /// one went stale because follow mode appended lines).
+    fn ensure_view(&mut self) -> Result<(), String> {
+        if !self.view_wanted() {
+            self.view = None;
+            return Ok(());
+        }
+        if self
+            .view
+            .as_ref()
+            .is_some_and(|v| !v.is_stale(&self.files[self.file_index].buffer))
+        {
+            return Ok(());
+        }
+        let columns = self.column_names();
+        let buffer = &mut self.files[self.file_index].buffer;
+        let format = self.projection.format;
+        let keep_first = matches!(format, DetectedFormat::Csv | DetectedFormat::Tsv);
+        let sort = self.sort.clone().filter(|s| {
+            format.is_structured() && self.projection.columns.iter().any(|c| c.name == s.column)
+        });
+        let view = match sort {
+            Some(spec) => {
+                let proj = &self.projection;
+                let mut spans = Vec::new();
+                ViewIndex::sorted(
+                    buffer,
+                    self.filter.clone(),
+                    format,
+                    columns,
+                    keep_first,
+                    spec.descending,
+                    |raw| {
+                        SortKey::from_value(
+                            proj.field_value(&spec.column, raw, &mut spans).as_deref(),
+                        )
+                    },
+                )?
+            }
+            None => ViewIndex::filtered(
+                self.filter.clone().expect("view_wanted: a filter"),
+                format,
+                columns,
+                keep_first,
+            ),
+        };
+        self.view = Some(view);
+        Ok(())
+    }
+
+    /// Column names of a positional (CSV/TSV) file, for selector queries;
+    /// empty for formats whose fields carry their own keys.
+    fn column_names(&self) -> Vec<String> {
+        match self.projection.format {
+            DetectedFormat::Csv | DetectedFormat::Tsv => self
+                .projection
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn view_and_buffer(&mut self) -> (&mut ViewIndex, &mut Buffer) {
+        (
+            self.view.as_mut().expect("caller checked the view"),
+            &mut self.files[self.file_index].buffer,
+        )
+    }
+
+    /// Position of the window top in the view, moving `top` onto a visible
+    /// line when it sits on a hidden one (the next visible line; the last
+    /// page if none follows; the first row of a sorted view). `None` when
+    /// the view is empty.
+    fn normalize_view_top(&mut self) -> Result<Option<usize>, String> {
+        let rows = self.content_rows();
+        let top = self.top;
+        let (view, buffer) = self.view_and_buffer();
+        let pos = match view.position_of(buffer, top)? {
+            Some(p) => p,
+            None if view.is_sorted() => 0,
+            None => view.total(buffer)?.saturating_sub(rows),
+        };
+        let line = view.line_at(buffer, pos)?;
+        Ok(line.map(|l| {
+            self.top = l;
+            pos
+        }))
+    }
+
+    /// Moves the top to view position `pos`, clamped so a window never
+    /// starts past the last full page (like `clamp_relative`).
+    fn view_move_to(&mut self, proposed: usize) -> Result<(), String> {
+        let rows = self.content_rows();
+        let (view, buffer) = self.view_and_buffer();
+        view.lines_from(buffer, proposed, rows)?;
+        let (known, complete) = view.known(buffer);
+        let target = if complete {
+            proposed.min(known.saturating_sub(rows))
+        } else {
+            proposed
+        };
+        if let Some(line) = view.line_at(buffer, target)? {
+            self.top = line;
+        }
+        Ok(())
+    }
+
+    fn apply_view_nav(&mut self, action: Action) -> Result<(), String> {
+        let Some(pos) = self.normalize_view_top()? else {
+            return Ok(()); // nothing visible: nowhere to go
+        };
+        let rows = self.content_rows() as i64;
+        let delta = match action {
+            Action::ScrollLines(n) => n,
+            Action::ScrollWindow(n, forward) => {
+                let mag = n.map_or(rows, |v| v as i64);
+                if forward { mag } else { -mag }
+            }
+            Action::ScrollHalfWindow(n, forward) => {
+                let mag = self.half_window_magnitude(n);
+                if forward { mag } else { -mag }
+            }
+            Action::GotoLine(None) => return self.view_move_to(0),
+            Action::GotoLine(Some(n)) | Action::GotoLast(Some(n)) => return self.view_goto(n),
+            Action::GotoLast(None) => {
+                let (view, buffer) = self.view_and_buffer();
+                let total = view.total(buffer)?;
+                return self.view_move_to(total.saturating_sub(rows as usize));
+            }
+            _ => unreachable!("only navigation reaches here"),
+        };
+        self.view_move_to((pos as i64 + delta).max(0) as usize)
+    }
+
+    /// `N g` in a view: row N of a sorted view; in a filtered view, buffer
+    /// line N (or the next line the filter shows), since `-N` numbers the
+    /// rows by buffer line.
+    fn view_goto(&mut self, n: u64) -> Result<(), String> {
+        let not_found = || format!("Cannot seek to line number {}", n);
+        let (view, buffer) = self.view_and_buffer();
+        let line = if view.is_sorted() {
+            view.line_at(buffer, n.saturating_sub(1) as usize)?
+        } else {
+            let t = n as usize;
+            buffer.ensure_lines_read(t)?;
+            if buffer.line(t).is_none() {
+                return Err(not_found());
+            }
+            match view.position_of(buffer, t)? {
+                Some(p) => view.line_at(buffer, p)?,
+                None => return Err(format!("No line at or after line {} matches the filter", n)),
+            }
+        };
+        self.top = line.ok_or_else(not_found)?;
+        Ok(())
+    }
+
+    /// Search over the view's positions (hidden lines never match).
+    fn view_search(
+        &mut self,
+        is_match: &dyn Fn(&[u8]) -> bool,
+        dir: Direction,
+        count: u64,
+        fresh: bool,
+    ) -> Result<Option<usize>, String> {
+        let Some(top_pos) = self.normalize_view_top()? else {
+            return Ok(None);
+        };
+        let rows = self.content_rows();
+        let (view, buffer) = self.view_and_buffer();
+        let mut remaining = count.max(1);
+        let mut found = None;
+        match dir {
+            Direction::Forward => {
+                let mut p = if fresh { top_pos } else { top_pos + 1 };
+                while let Some(line) = view.line_at(buffer, p)? {
+                    if is_match(buffer.line(line).unwrap_or_default()) {
+                        found = Some(line);
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    p += 1;
+                }
+            }
+            Direction::Backward => {
+                let total = view.total(buffer)?;
+                let start = if fresh {
+                    Some((top_pos + rows - 1).min(total.saturating_sub(1)))
+                } else {
+                    top_pos.checked_sub(1)
+                };
+                if let Some(start) = start {
+                    for p in (0..=start).rev() {
+                        let line = view.line_at(buffer, p)?.expect("p < total");
+                        if is_match(buffer.line(line).unwrap_or_default()) {
+                            found = Some(line);
+                            remaining -= 1;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn set_filter(&mut self, buf: &str) -> Result<(), String> {
+        if buf.trim().is_empty() {
+            self.filter = None;
+            self.view = None;
+            self.pending_message = Some("Filter cleared".to_string());
+            return Ok(());
+        }
+        let filter = LineFilter::new(buf, self.case.folds(buf));
+        let format = self.projection.format;
+        // Reject before applying: a pattern that cannot compile matches
+        // nothing and would blank the view silently.
+        filter.check(format)?;
+        let kind = if filter.is_structured_on(format) {
+            "selector"
+        } else if buf.starts_with('!') {
+            "hiding regex matches"
+        } else {
+            "regex"
+        };
+        self.filter = Some(filter);
+        self.view = None;
+        self.first_render_done = true;
+        self.ensure_view()?;
+        let shown = escape_controls(buf, false);
+        self.pending_message = Some(match self.normalize_view_top()? {
+            Some(_) => format!("Filter: &{shown} ({kind})"),
+            None => format!("Filter: &{shown} ({kind}): no matching lines"),
+        });
+        Ok(())
+    }
+
+    /// Column mode `s`: ascending, then descending, then off.
+    fn cycle_sort(&mut self) -> Result<(), String> {
+        let Some(col) = self.projection.columns.get(self.focused_column) else {
+            return Err(format!(
+                "Sort: needs a structured file ({PICK_FORMAT_HINT})"
+            ));
+        };
+        let name = col.name.clone();
+        let shown = escape_controls(&name, false).into_owned();
+        self.sort = match &self.sort {
+            Some(s) if s.column == name && !s.descending => Some(SortSpec {
+                column: name,
+                descending: true,
+            }),
+            Some(s) if s.column == name => None,
+            _ => Some(SortSpec {
+                column: name,
+                descending: false,
+            }),
+        };
+        self.view = None;
+        self.first_render_done = true;
+        self.projection.sorted_by = self.sort.as_ref().map(|s| (s.column.clone(), s.descending));
+        if self.sort.is_some()
+            && let Some(col) = self.projection.columns.get_mut(self.focused_column)
+        {
+            // Room for the header's sort arrow next to the full name.
+            let name_width =
+                unicode_width::UnicodeWidthStr::width(escape_controls(&col.name, false).as_ref());
+            col.width = col.width.max(name_width + 1);
+        }
+        self.ensure_view()?;
+        match self.sort.as_ref().map(|s| s.descending) {
+            None => {
+                self.pending_message = Some("Sort off".to_string());
+                if self.view.is_some() {
+                    self.normalize_view_top()?;
+                }
+            }
+            Some(desc) => {
+                let (view, buffer) = self.view_and_buffer();
+                view.total(buffer)?;
+                let total = view.known_rows(buffer).0;
+                if let Some(first) = view.line_at(buffer, 0)? {
+                    self.top = first;
+                }
+                let dir = if desc { "descending" } else { "ascending" };
+                self.pending_message = Some(format!("Sorted by '{shown}' {dir} ({total} lines)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Column mode `i`: a page with the focused column's value counts and,
+    /// for numbers and durations, a numeric summary. Covers the lines the
+    /// view shows (all lines without a filter).
+    fn show_column_stats(&mut self) -> Result<(), String> {
+        let Some(col) = self.projection.columns.get(self.focused_column) else {
+            return Err(format!(
+                "Statistics: need a structured file ({PICK_FORMAT_HINT})"
+            ));
+        };
+        let name = col.name.clone();
+        self.ensure_view()?;
+        let format = self.projection.format;
+        let skip_header = matches!(format, DetectedFormat::Csv | DetectedFormat::Tsv);
+        let lines: Vec<usize> = match self.view.as_mut() {
+            Some(view) => view
+                .all_lines(&mut self.files[self.file_index].buffer)?
+                .to_vec(),
+            None => {
+                let total = self.files[self.file_index].buffer.total_lines()?;
+                (1..=total).collect()
+            }
+        };
+        let buffer = &self.files[self.file_index].buffer;
+        let mut spans = Vec::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut numbers: Vec<f64> = Vec::new();
+        let (mut rows, mut missing) = (0usize, 0usize);
+        for &n in &lines {
+            if skip_header && n == 1 {
+                continue;
+            }
+            let Some(raw) = buffer.line(n) else { continue };
+            rows += 1;
+            match self.projection.field_value(&name, raw, &mut spans) {
+                None => missing += 1,
+                Some(v) => {
+                    if let SortKey::Number(x) = SortKey::from_value(Some(&v)) {
+                        numbers.push(x);
+                    }
+                    *counts.entry(v).or_default() += 1;
+                }
+            }
+        }
+        let shown_name = escape_controls(&name, false).into_owned();
+        let mut out = Vec::new();
+        let scope = match &self.filter {
+            Some(f) => format!("lines matching &{}", escape_controls(&f.source, false)),
+            None => "all lines".to_string(),
+        };
+        out.push(format!(
+            "Column '{shown_name}' ({}), {scope}",
+            format.name()
+        ));
+        out.push(String::new());
+        let present = rows - missing;
+        out.push(format!(
+            "  rows {rows}   with a value {present}   missing {missing}   distinct {}",
+            counts.len()
+        ));
+        if !numbers.is_empty() && numbers.len() * 2 >= present {
+            numbers.sort_by(f64::total_cmp);
+            let pct = |q: f64| numbers[((numbers.len() - 1) as f64 * q).round() as usize];
+            let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+            out.push(format!(
+                "  numeric ({} values): min {}  p50 {}  p90 {}  p99 {}  max {}  mean {}",
+                numbers.len(),
+                fmt_num(numbers[0]),
+                fmt_num(pct(0.5)),
+                fmt_num(pct(0.9)),
+                fmt_num(pct(0.99)),
+                fmt_num(numbers[numbers.len() - 1]),
+                fmt_num(mean)
+            ));
+        }
+        out.push(String::new());
+        let mut top: Vec<(String, usize)> = counts.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let listed = top.len().min(STATS_TOP_VALUES);
+        out.push(format!(
+            "  most frequent values ({listed} of {}):",
+            top.len()
+        ));
+        let max = top.first().map_or(1, |t| t.1).max(1);
+        for (value, n) in top.into_iter().take(STATS_TOP_VALUES) {
+            let share = 100.0 * n as f64 / rows.max(1) as f64;
+            let bar = "#".repeat((20 * n).div_ceil(max));
+            out.push(format!(
+                "  {n:>8} {share:>5.1}%  {bar:<20}  {}",
+                escape_controls(&value, false)
+            ));
+        }
+        self.overlay = Some(Overlay {
+            title: format!("Statistics: '{shown_name}'"),
+            lines: out,
+            top: 0,
+        });
+        Ok(())
+    }
+
+    fn show_help(&mut self) {
+        let mut lines = vec![
+            "rless keys (also listed by rless --help)".to_string(),
+            String::new(),
+        ];
+        lines.extend(KEYS_HELP.lines().map(str::to_string));
+        self.overlay = Some(Overlay {
+            title: "Help".to_string(),
+            lines,
+            top: 0,
+        });
+    }
+
+    // ------------------------------------------------------------ follow
+
+    fn start_follow(&mut self) -> Result<(), String> {
+        self.current().buffer.set_follow(true);
+        self.following = true;
+        self.first_render_done = true;
+        if let Err(e) = self.follow_to_end() {
+            self.stop_follow();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn stop_follow(&mut self) {
+        if self.following {
+            self.following = false;
+            self.current().buffer.set_follow(false);
+        }
+    }
+
+    /// Reads what has arrived and shows the last page of it.
+    fn follow_to_end(&mut self) -> Result<(), String> {
+        let growth = self.current().buffer.poll_growth()?;
+        if growth == Growth::Reset {
+            self.view = None;
+            self.top = 1;
+            self.projection.expanded_lines.clear();
+        }
+        self.apply_inner(Action::GotoLast(None))
+    }
+
+    /// One follow-mode poll; true when the screen needs a redraw.
+    fn follow_tick(&mut self) -> bool {
+        let growth = match self.current().buffer.poll_growth() {
+            Ok(g) => g,
+            Err(e) => {
+                self.stop_follow();
+                self.pending_message = Some(format!("{e}  (press RETURN)"));
+                return true;
+            }
+        };
+        if growth == Growth::None {
+            return false;
+        }
+        if growth == Growth::Reset {
+            self.view = None;
+            self.top = 1;
+            self.projection.expanded_lines.clear();
+            self.pending_message =
+                Some("File was truncated or replaced: reading it again".to_string());
+        }
+        if let Err(e) = self.apply_inner(Action::GotoLast(None)) {
+            self.pending_message = Some(format!("{e}  (press RETURN)"));
+        }
+        true
+    }
+
+    /// A pipe still delivering (not in follow mode): reads what has arrived
+    /// for the lines the screen shows; true when the screen needs a redraw.
+    fn stream_tick(&mut self) -> bool {
+        let want = if self.view.is_some() {
+            self.files[self.file_index].buffer.lines_cached() + 4096
+        } else {
+            self.top + self.content_rows()
+        };
+        let buffer = &mut self.files[self.file_index].buffer;
+        let was_open = buffer.is_open_stream();
+        match buffer.read_ready(want) {
+            Ok(grew) => grew || (was_open && !buffer.is_open_stream()),
+            Err(e) => {
+                self.pending_message = Some(format!("{e}  (press RETURN)"));
+                true
+            }
+        }
+    }
+
+    // ------------------------------------------------- marks, options, misc
+
+    fn goto_mark(&mut self, c: char) -> Result<(), String> {
+        let target = if c == '\'' {
+            self.previous_position
+                .ok_or_else(|| "No previous position".to_string())?
+        } else {
+            *self
+                .marks
+                .get(&c)
+                .ok_or_else(|| format!("Mark '{c}' is not set"))?
+        };
+        if target.file != self.file_index {
+            self.switch_file(target.file as i64 - self.file_index as i64)?;
+        }
+        self.current().buffer.ensure_lines_read(target.line)?;
+        self.top = target.line.max(1);
+        Ok(())
+    }
+
+    fn toggle_option(&mut self, c: char) -> Result<(), String> {
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        let msg = match c {
+            'N' => {
+                self.opts.line_numbers = !self.opts.line_numbers;
+                format!("Line numbers: {}", on_off(self.opts.line_numbers))
+            }
+            'S' => {
+                self.opts.chop_long_lines = !self.opts.chop_long_lines;
+                if !self.opts.chop_long_lines {
+                    self.hscroll = 0;
+                    self.projection.hscroll = 0;
+                }
+                format!("Chop long lines: {}", on_off(self.opts.chop_long_lines))
+            }
+            'i' | 'I' => {
+                let wanted = if c == 'i' {
+                    CaseMode::Smart
+                } else {
+                    CaseMode::Always
+                };
+                self.case = if self.case == wanted {
+                    CaseMode::Sensitive
+                } else {
+                    wanted
+                };
+                if let Some(f) = &self.filter {
+                    let source = f.source.clone();
+                    self.filter = Some(LineFilter::new(&source, self.case.folds(&source)));
+                    self.view = None;
+                }
+                match self.case {
+                    CaseMode::Sensitive => "Case: searches and filters match case".to_string(),
+                    CaseMode::Smart => {
+                        "Case: ignored unless the pattern has an uppercase letter".to_string()
+                    }
+                    CaseMode::Always => "Case: always ignored".to_string(),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "No such option: -{} (in the pager: -N -S -i -I)",
+                    escape_controls(&c.to_string(), false)
+                ));
+            }
+        };
+        self.pending_message = Some(msg);
+        Ok(())
+    }
+
+    fn table_shown(&self) -> bool {
+        self.use_projection() && self.tabular_view
+    }
+
+    fn horizontal_scroll(&mut self, n: Option<u64>, right: bool) {
+        if !self.opts.chop_long_lines && !self.table_shown() {
+            self.pending_message = Some("Nothing to scroll: lines wrap (try -S)".to_string());
+            return;
+        }
+        let step = n.map_or((self.width as usize / 2).max(1), |v| v as usize);
+        self.hscroll = if right {
+            self.hscroll.saturating_add(step)
+        } else {
+            self.hscroll.saturating_sub(step)
+        };
+        self.projection.hscroll = self.hscroll;
+    }
+
+    /// In the table view, scrolls sideways just enough to show the focused
+    /// column.
+    fn scroll_focus_into_view(&mut self) {
+        if !self.table_shown() {
+            return;
+        }
+        let Some(focused) = self.projection.columns.get(self.focused_column) else {
+            return;
+        };
+        if focused.hidden {
+            return;
+        }
+        let mut start = 0;
+        for col in self.projection.display_columns() {
+            if std::ptr::eq(col, focused) {
+                break;
+            }
+            start += col.width + 1;
+        }
+        let end = start + focused.width + 1;
+        let width = self.width as usize;
+        if start < self.hscroll {
+            self.hscroll = start;
+        } else if end > self.hscroll + width {
+            self.hscroll = end.saturating_sub(width).min(start);
+        }
+        self.projection.hscroll = self.hscroll;
+    }
+
+    /// `:w path`: writes the lines the view shows (all lines without a
+    /// filter or sort), in view order, as they are in the input.
+    fn save_view(&mut self, path: &str, force: bool) -> Result<(), String> {
+        if path.is_empty() {
+            return Err("Usage: :w file  (:w! file overwrites)".to_string());
+        }
+        let target = Path::new(path);
+        let shown = escape_controls(path, false).into_owned();
+        if let Some(current) = self.files[self.file_index].display()
+            && same_file(Path::new(&current), target)
+        {
+            return Err(format!("{shown} is the file being viewed"));
+        }
+        if target.exists() && !force {
+            return Err(format!("{shown} exists (:w! {shown} overwrites)"));
+        }
+        self.ensure_view()?;
+        let lines: Vec<usize> = match self.view.as_mut() {
+            Some(view) => view
+                .all_lines(&mut self.files[self.file_index].buffer)?
+                .to_vec(),
+            None => (1..=self.current().buffer.total_lines()?).collect(),
+        };
+        let buffer = &self.files[self.file_index].buffer;
+        let write = || -> io::Result<()> {
+            let mut w = io::BufWriter::new(std::fs::File::create(target)?);
+            for &n in &lines {
+                w.write_all(buffer.line(n).unwrap_or_default())?;
+                w.write_all(b"\n")?;
+            }
+            w.flush()
+        };
+        write().map_err(|e| format!("{shown}: {e}"))?;
+        self.pending_message = Some(format!("Saved {} lines to {shown}", lines.len()));
+        Ok(())
+    }
+
     fn run_search(
         &mut self,
         pattern_src: &str,
@@ -489,15 +1357,19 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
+        let fold = self.case.folds(pattern_src);
         // A selector query only means something on a structured file; on
         // plain text `/.status >= 500` is an ordinary regex, as in less.
         if self.projection.format.is_structured() {
-            let q = Query::parse(pattern_src);
+            let q = Query::parse_with_case(pattern_src, fold);
             if let Query::Structured(_) = q {
                 return self.run_search_query(&q, dir, count, fresh);
             }
         }
-        let pattern = Regex::new(pattern_src).map_err(|_| "Invalid pattern".to_string())?;
+        let pattern = RegexBuilder::new(pattern_src)
+            .case_insensitive(fold)
+            .build()
+            .map_err(|_| "Invalid pattern".to_string())?;
         self.run_search_regex(&pattern, dir, count, fresh)
     }
 
@@ -527,17 +1399,28 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = self.search_start(dir, fresh);
         let format = self.projection.format;
-        let buffer = &mut self.files[self.file_index].buffer;
-        let found = search::find_by(
-            buffer,
-            |line| query.matches_line(line, format),
-            dir,
-            start,
-            fresh,
-            count,
-        )?;
+        let columns = self.column_names();
+        self.ensure_view()?;
+        let found = if self.view.is_some() {
+            self.view_search(
+                &|line| query.matches_fields(line, format, &columns),
+                dir,
+                count,
+                fresh,
+            )?
+        } else {
+            let start = self.search_start(dir, fresh);
+            let buffer = &mut self.files[self.file_index].buffer;
+            search::find_by(
+                buffer,
+                |line| query.matches_fields(line, format, &columns),
+                dir,
+                start,
+                fresh,
+                count,
+            )?
+        };
         // Only an original `/`/`?` (with the direction it was typed in) is
         // remembered; `N` reverses relative to it, never to itself.
         if fresh {
@@ -567,9 +1450,19 @@ impl App {
         count: u64,
         fresh: bool,
     ) -> Result<(), String> {
-        let start = self.search_start(dir, fresh);
-        let buffer = &mut self.current().buffer;
-        let found = search::find(buffer, pattern, dir, start, fresh, count)?;
+        self.ensure_view()?;
+        let found = if self.view.is_some() {
+            self.view_search(
+                &|line| search::line_matches(line, pattern),
+                dir,
+                count,
+                fresh,
+            )?
+        } else {
+            let start = self.search_start(dir, fresh);
+            let buffer = &mut self.current().buffer;
+            search::find(buffer, pattern, dir, start, fresh, count)?
+        };
         // Remember only the typed search: storing the reversed direction
         // of an `N` would make a following `n` run backwards too.
         if fresh {
@@ -592,15 +1485,22 @@ impl App {
         if target as usize >= self.files.len() {
             return Err("No next file".to_string());
         }
+        self.stop_follow();
         self.file_index = target as usize;
         self.top = 1;
         self.filename_shown = true;
         self.last_search = None;
         // Structured-view state belongs to one file: the next file gets its
-        // own format sniff and columns on its first draw.
+        // own format sniff and columns on its first draw. The filter is
+        // kept (as in less) and re-read for the new file's format.
         self.projection.set_format(DetectedFormat::PlainText);
+        self.projection.sorted_by = None;
         self.sniffer_checked = false;
         self.focused_column = 0;
+        self.sort = None;
+        self.view = None;
+        self.hscroll = 0;
+        self.projection.hscroll = 0;
         // A file switch always leaves the fresh-process bottom-anchor
         // window (§3 item 1), regardless of whether `top` numerically
         // changed (a fresh file also starts at line 1).
@@ -651,11 +1551,25 @@ impl App {
         // `blank_above` rows untouched before the content starts is enough.
         queue!(out, Clear(ClearType::All))?;
 
+        if self.overlay.is_some() {
+            return self.paint_overlay(out, content_rows, width);
+        }
+
+        if let Err(e) = self.ensure_view() {
+            // Keep the screen usable: drop the view and say why.
+            self.filter = None;
+            self.sort = None;
+            self.view = None;
+            self.pending_message = Some(format!("{e}  (press RETURN)"));
+        }
+
         let (bottom_line, at_eof) = if self.use_projection() {
             self.paint_projection(out, content_rows, width)?
         } else {
             self.paint_text(out, content_rows)?
         };
+        // A pipe that is still open has no end yet, whatever has arrived.
+        let at_eof = at_eof && !self.files[self.file_index].buffer.is_open_stream();
 
         // While a multi-key command (numeric prefix, `:x`, `/pattern`) is
         // still being typed, echo it in place of the computed prompt; not
@@ -667,6 +1581,16 @@ impl App {
             Some(preview) => (preview, false),
             None if self.decoder.in_column_mode() && self.pending_message.is_none() => {
                 (self.column_mode_prompt(width), false)
+            }
+            None if self.following && self.pending_message.is_none() => {
+                let tag = self.view_tag().map(|t| format!("{t} ")).unwrap_or_default();
+                (
+                    clip_to_width(
+                        format!("{tag}Following: waiting for data... (any key stops)"),
+                        width,
+                    ),
+                    true,
+                )
             }
             None => self.build_prompt(bottom_line, at_eof, width),
         };
@@ -680,14 +1604,41 @@ impl App {
         Ok(())
     }
 
-    /// The structured views (table, expanded lines, filter) replace the
-    /// less-compatible text view only on a structured file and only once
-    /// one of them is switched on.
+    fn paint_overlay(
+        &mut self,
+        out: &mut Vec<u8>,
+        content_rows: usize,
+        width: usize,
+    ) -> io::Result<()> {
+        let overlay = self.overlay.as_ref().expect("checked by caller");
+        let end = (overlay.top + content_rows).min(overlay.lines.len());
+        for (row, line) in overlay.lines[overlay.top..end].iter().enumerate() {
+            queue!(
+                out,
+                MoveTo(0, row as u16),
+                Print(clip_to_width(line.clone(), width))
+            )?;
+        }
+        let status = format!(
+            "{} - lines {}-{} of {} - j/k/Space/b scroll, any other key closes",
+            overlay.title,
+            overlay.top + 1,
+            end,
+            overlay.lines.len()
+        );
+        queue!(out, MoveTo(0, content_rows as u16))?;
+        write_standout(out, &clip_to_width(status, width))
+    }
+
+    /// The structured views (table, expanded lines, filter, sort) replace
+    /// the less-compatible text view only on a structured file and only
+    /// once one of them is switched on.
     fn use_projection(&self) -> bool {
         self.projection.format.is_structured()
             && (self.tabular_view
                 || !self.projection.expanded_lines.is_empty()
-                || self.active_filter.is_some())
+                || self.filter.is_some()
+                || self.sort_applies())
     }
 
     /// The first `SNIFF_SAMPLE_LINES` lines of the current file (fewer if
@@ -711,12 +1662,17 @@ impl App {
         if detected.is_structured() {
             self.projection.set_format(detected);
             self.projection.update_columns_from_lines(&sample);
+            // The filter now reads as a selector: rebuild the view.
+            self.view = None;
         }
     }
 
     /// Paints the less-compatible text view. Returns `(bottom_line, at_eof)`
     /// for the prompt.
     fn paint_text(&mut self, out: &mut Vec<u8>, content_rows: usize) -> io::Result<(usize, bool)> {
+        if self.view.is_some() {
+            return self.paint_text_view(out, content_rows);
+        }
         let render_opts = self.render_opts();
         let top = self.top;
         let highlight = match &self.last_search {
@@ -753,6 +1709,41 @@ impl App {
         Ok((win.bottom_line, win.at_eof))
     }
 
+    /// The text view of a filtered file: the core renderer (wrapping, `-N`
+    /// with buffer line numbers, highlighting) over the view's lines.
+    fn paint_text_view(
+        &mut self,
+        out: &mut Vec<u8>,
+        content_rows: usize,
+    ) -> io::Result<(usize, bool)> {
+        let pos = self.normalize_view_top().map_err(io::Error::other)?;
+        let render_opts = self.render_opts();
+        let (view, buffer) = self.view_and_buffer();
+        let lines = match pos {
+            Some(p) => view
+                .lines_from(buffer, p, content_rows + 1)
+                .map_err(io::Error::other)?
+                .to_vec(),
+            None => Vec::new(),
+        };
+        let highlight = match &self.last_search {
+            Some((SearchPattern::Regex(re), _)) => Some(re),
+            _ => None,
+        };
+        let buffer = &self.files[self.file_index].buffer;
+        let (rows, bottom, complete) =
+            screen::render_lines(buffer, &lines, content_rows, &render_opts, highlight);
+        for (i, row) in rows.iter().enumerate() {
+            queue!(out, MoveTo(0, i as u16))?;
+            write_spans(out, row)?;
+        }
+        for r in rows.len()..content_rows {
+            queue!(out, MoveTo(0, r as u16), Print("~"))?;
+        }
+        let at_eof = complete && lines.len() <= content_rows;
+        Ok((bottom.unwrap_or(self.top), at_eof))
+    }
+
     /// Paints a structured view (rows already escaped and width-clipped by
     /// `ProjectionEngine::render_window`). Returns `(bottom_line, at_eof)`.
     fn paint_projection(
@@ -761,17 +1752,20 @@ impl App {
         content_rows: usize,
         width: usize,
     ) -> io::Result<(usize, bool)> {
+        let pos = if self.view.is_some() {
+            Some(self.normalize_view_top().map_err(io::Error::other)?)
+        } else {
+            None
+        };
         let buffer = &mut self.files[self.file_index].buffer;
+        let lines = match (pos, self.view.as_mut()) {
+            (Some(Some(p)), Some(view)) => WindowLines::View(view, p),
+            (Some(None), Some(view)) => WindowLines::View(view, usize::MAX),
+            _ => WindowLines::From(self.top),
+        };
         let win = self
             .projection
-            .render_window(
-                buffer,
-                self.top,
-                content_rows,
-                width,
-                self.active_filter.as_ref(),
-                self.tabular_view,
-            )
+            .render_window(buffer, lines, content_rows, width, self.tabular_view)
             .map_err(io::Error::other)?;
         let mut row = 0u16;
         if let Some(header) = &win.header {
@@ -783,7 +1777,17 @@ impl App {
             queue!(out, MoveTo(0, row), Print(text))?;
             row += 1;
         }
-        Ok((win.bottom_line, win.at_eof))
+        if self.view.is_some() {
+            for r in row as usize..content_rows {
+                queue!(out, MoveTo(0, r as u16), Print("~"))?;
+            }
+        }
+        let bottom = if win.bottom_line == 0 {
+            self.top
+        } else {
+            win.bottom_line
+        };
+        Ok((bottom, win.at_eof))
     }
 
     /// Status line of column mode: which column has focus (by name, with
@@ -793,14 +1797,25 @@ impl App {
         let text = match columns.get(self.focused_column) {
             None => "Columns: none (needs a structured file) - q done".to_string(),
             Some(col) => {
-                let state = match (col.pinned, col.hidden) {
-                    (true, true) => " (pinned, hidden)",
-                    (true, false) => " (pinned)",
-                    (false, true) => " (hidden)",
-                    (false, false) => "",
+                let mut flags = Vec::new();
+                if col.pinned {
+                    flags.push("pinned");
+                }
+                if col.hidden {
+                    flags.push("hidden");
+                }
+                match &self.sort {
+                    Some(s) if s.column == col.name && s.descending => flags.push("sorted desc"),
+                    Some(s) if s.column == col.name => flags.push("sorted asc"),
+                    _ => {}
+                }
+                let state = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", flags.join(", "))
                 };
                 format!(
-                    "Columns: {}/{} {}{} - h/l move  p pin  . hide  q done",
+                    "Columns: {}/{} {}{} - h/l move  p pin  . hide  s sort  i stats  q done",
                     self.focused_column + 1,
                     columns.len(),
                     escape_controls(&col.name, false),
@@ -809,6 +1824,32 @@ impl App {
             }
         };
         clip_to_width(text, width)
+    }
+
+    /// `[&filter, sort col asc, 42 lines, col 41+]`: the active view state,
+    /// shown ahead of the prompt so a filtered or sorted screen is never
+    /// mistaken for the whole file. `None` when nothing is active.
+    fn view_tag(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(f) = &self.filter {
+            let src = escape_controls(&f.source, false);
+            let src = clip_to_width(src.into_owned(), 40);
+            parts.push(format!("&{src}"));
+        }
+        if let Some(s) = self.sort.as_ref().filter(|_| self.sort_applies()) {
+            let dir = if s.descending { "desc" } else { "asc" };
+            parts.push(format!("sort {} {dir}", escape_controls(&s.column, false)));
+        }
+        if let Some(view) = &self.view {
+            let (n, complete) = view.known_rows(&self.files[self.file_index].buffer);
+            if complete {
+                parts.push(format!("{n} {}", if n == 1 { "line" } else { "lines" }));
+            }
+        }
+        if self.hscroll > 0 {
+            parts.push(format!("col {}+", self.hscroll + 1));
+        }
+        (!parts.is_empty()).then(|| format!("[{}]", parts.join(", ")))
     }
 
     fn build_prompt(&mut self, bottom_line: usize, at_eof: bool, width: usize) -> (String, bool) {
@@ -822,8 +1863,9 @@ impl App {
             None
         };
         let filename = self.current().display();
+        let view_tag = self.view_tag();
 
-        let (total_lines, total_bytes, byte_offset) = if needs_totals {
+        let (mut total_lines, total_bytes, byte_offset) = if needs_totals {
             let buffer = &mut self.current().buffer;
             let total_lines = buffer.total_lines().ok();
             let total_bytes = buffer.total_bytes().ok();
@@ -832,24 +1874,57 @@ impl App {
         } else {
             (None, None, 0)
         };
+        // A sorted view's rows are not in line order: count rows, not
+        // buffer lines, so `lines a-b/N` and the percentage stay true.
+        let (mut top_line, mut bottom_line) = (self.top, bottom_line);
+        if needs_totals && self.view.as_ref().is_some_and(ViewIndex::is_sorted) {
+            let (top, bottom) = (top_line, bottom_line);
+            let (view, buffer) = self.view_and_buffer();
+            if let (Ok(Some(t)), Ok(Some(b)), Ok(n)) = (
+                view.position_of(buffer, top),
+                view.position_of(buffer, bottom),
+                view.total(buffer),
+            ) {
+                (top_line, bottom_line, total_lines) = (t + 1, b + 1, Some(n));
+            }
+        }
 
         let ctx = PromptContext {
             filename: filename.as_deref(),
             show_filename: self.filename_shown,
             file_index,
             file_count,
-            top_line: self.top,
+            top_line,
             bottom_line,
             total_lines,
             at_eof,
             next_filename: next_filename.as_deref(),
             byte_offset,
             total_bytes,
+            view_tag: view_tag.as_deref(),
         };
         let (text, highlighted) =
             prompt::render(self.pending_message.as_deref(), mode, &ctx, width);
         self.filename_shown = false;
         (text, highlighted)
+    }
+}
+
+/// True when `a` and `b` name the same existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// A statistic without needless decimals: `200`, `12.5`, `0.333`.
+fn fmt_num(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        let s = format!("{x:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -949,14 +2024,7 @@ mod tests {
     }
 
     fn test_opts(files: Vec<PathBuf>) -> Options {
-        Options {
-            line_numbers: false,
-            chop_long_lines: false,
-            raw_control_chars: false,
-            prompt_mode: PromptMode::Short,
-            bell: BellMode::Normal,
-            files,
-        }
+        Options::for_files(files)
     }
 
     /// Reconstructs each 0-indexed terminal row's plain visible text from a
@@ -1338,7 +2406,7 @@ mod tests {
         // 3. Structured filter: &.level == "ERROR"
         app.apply(Action::FilterInput(".level == \"ERROR\"".to_string()))
             .unwrap();
-        assert!(app.active_filter.is_some());
+        assert!(app.filter.is_some());
 
         // 4. Tabular toggle: 'c'
         app.apply(Action::ToggleTabular).unwrap();
@@ -1477,7 +2545,10 @@ mod tests {
             .apply(Action::FilterInput("(unclosed".to_string()))
             .unwrap_err();
         assert_eq!(err, "Invalid pattern");
-        assert_eq!(app.active_filter, Some(Query::parse("ERROR")));
+        assert_eq!(
+            app.filter.as_ref().map(|f| f.source.as_str()),
+            Some("ERROR")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1494,12 +2565,11 @@ mod tests {
                 .unwrap()
                 .contains("no effect")
         );
+        // A filter works on plain text too (as in less): it says what it is.
         app.apply(Action::FilterInput("line".to_string())).unwrap();
-        assert!(
-            app.pending_message
-                .as_deref()
-                .unwrap()
-                .contains("no effect")
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Filter: &line (regex)")
         );
         let _ = std::fs::remove_file(path);
     }
@@ -1527,7 +2597,7 @@ mod tests {
         let (code, m) = key('s');
         app.handle_key(&mut out, code, m).unwrap();
         let rows = drawn_rows(&mut app);
-        assert_eq!(rows[&23], "Sorting by 'msg' is not supported yet");
+        assert_eq!(rows[&23], "Sorted by 'msg' ascending (60 lines)");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1603,6 +2673,512 @@ mod tests {
             );
         }
         assert!(rows[&1].ends_with('>'), "a cut row carries the chop marker");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- Feature expansion (docs/fvi/FVI_REPORT.md, tasks T03-T21) -------
+
+    fn feed(app: &mut App, keys: &str) {
+        let mut out: Vec<u8> = Vec::new();
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                c => KeyCode::Char(c),
+            };
+            app.handle_key(&mut out, code, KeyModifiers::NONE).unwrap();
+        }
+    }
+
+    fn app_for(path: &Path, w: u16, h: u16) -> App {
+        let mut app = App::new(test_opts(vec![path.to_path_buf()]));
+        app.set_size(w, h);
+        drawn_rows(&mut app);
+        app
+    }
+
+    fn mixed_log() -> PathBuf {
+        let levels = ["INFO", "DEBUG", "ERROR", "WARN"];
+        let content: String = (1..=100)
+            .map(|i| format!("{} request {}\n", levels[i % 4], i))
+            .collect();
+        temp_file(&content)
+    }
+
+    #[test]
+    fn plain_text_filter_shows_only_matching_lines_with_their_numbers() {
+        let path = mixed_log();
+        let mut app = App::new(Options {
+            line_numbers: true,
+            ..test_opts(vec![path.clone()])
+        });
+        app.set_size(60, 6);
+        feed(&mut app, "&ERROR\n");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0].trim_start(), "2 ERROR request 2");
+        assert_eq!(rows[&1].trim_start(), "6 ERROR request 6");
+        assert_eq!(rows[&5], "Filter: &ERROR (regex)");
+        feed(&mut app, "j");
+        assert_eq!(
+            app.top, 6,
+            "j moves to the next shown line, never a hidden one"
+        );
+        feed(&mut app, "G");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&4].trim_start(), "98 ERROR request 98");
+        assert_eq!(rows[&5], "[&ERROR, 25 lines] (END)");
+        // Past the end: clamps, the top stays (the bell rings).
+        let top = app.top;
+        feed(&mut app, "j");
+        assert_eq!(app.top, top);
+        feed(&mut app, "g");
+        assert_eq!(app.top, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn negated_filter_hides_lines_and_empty_filter_clears() {
+        let path = mixed_log();
+        let mut app = app_for(&path, 60, 5);
+        feed(&mut app, "&!INFO|DEBUG\n");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "ERROR request 2");
+        assert_eq!(rows[&1], "WARN request 3");
+        assert_eq!(rows[&2], "ERROR request 6");
+        feed(&mut app, "&\n");
+        assert!(app.filter.is_none());
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "ERROR request 2", "clearing keeps the place");
+        assert_eq!(rows[&1], "WARN request 3");
+        assert_eq!(rows[&2], "INFO request 4");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_and_window_moves_inside_a_filter_skip_hidden_lines() {
+        let path = mixed_log();
+        let mut app = app_for(&path, 60, 5);
+        feed(&mut app, "&ERROR|WARN\n");
+        // "request 1" also appears in hidden lines (1, 10, 12...).
+        feed(&mut app, "/request 1\n");
+        assert_eq!(app.top, 10, "line 1 is hidden, 10 is ERROR");
+        feed(&mut app, "n");
+        assert_eq!(app.top, 11);
+        feed(&mut app, "N");
+        assert_eq!(app.top, 10);
+        feed(&mut app, "g f");
+        // 4 content rows: f moves 4 shown lines (2,3,6,7 -> 10).
+        feed(&mut app, "g");
+        feed(&mut app, "f");
+        assert_eq!(app.top, 10);
+        feed(&mut app, "50g");
+        assert_eq!(app.top, 50, "50 is ERROR: shown");
+        feed(&mut app, "52g");
+        assert_eq!(app.top, 54, "52 is hidden: the next shown line");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn filter_on_a_line_with_no_match_says_so() {
+        let path = mixed_log();
+        let mut app = app_for(&path, 60, 5);
+        feed(&mut app, "&NOPE\n");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "~");
+        assert_eq!(rows[&4], "Filter: &NOPE (regex): no matching lines");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compound_and_nested_selector_filters() {
+        let content: String = (1..=20)
+            .map(|i| {
+                format!(
+                    "{{\"level\":\"{}\",\"ms\":{},\"user\":{{\"id\":{}}},\"msg\":\"{}\"}}\n",
+                    if i % 2 == 0 { "ERROR" } else { "INFO" },
+                    i * 50,
+                    i % 3,
+                    if i % 5 == 0 { "db timeout" } else { "ok" }
+                )
+            })
+            .collect();
+        let path = temp_file(&content);
+        let mut app = app_for(&path, 120, 12);
+        feed(&mut app, "&.level == \"ERROR\" && .user.id == 1\n");
+        let view_lines = |app: &mut App| {
+            let (view, buffer) = app.view_and_buffer();
+            view.all_lines(buffer).unwrap().to_vec()
+        };
+        assert_eq!(view_lines(&mut app), [4, 10, 16]);
+        feed(&mut app, "&.msg =~ \"time(out)?\" || .ms >= 900\n");
+        assert_eq!(view_lines(&mut app), [5, 10, 15, 18, 19, 20]);
+        feed(&mut app, "&!(.level == \"INFO\") && .ms < 0.3s\n");
+        assert_eq!(view_lines(&mut app), [2, 4]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn scores_csv() -> PathBuf {
+        temp_file("id,name,score\n1,ann,40\n2,bob,95\n3,cy,\n4,dee,7\n5,eve,95\n")
+    }
+
+    #[test]
+    fn selector_filter_and_search_work_on_csv_columns() {
+        let path = scores_csv();
+        let mut app = app_for(&path, 80, 10);
+        assert_eq!(app.projection.format, DetectedFormat::Csv);
+        feed(&mut app, "&.score >= 90\n");
+        let (view, buffer) = app.view_and_buffer();
+        assert_eq!(
+            view.all_lines(buffer).unwrap(),
+            [1, 3, 6],
+            "header row kept first"
+        );
+        feed(&mut app, "&\n");
+        feed(&mut app, "/.name == \"dee\"\n");
+        assert_eq!(app.top, 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_sort_cycles_ascending_descending_off() {
+        let path = scores_csv();
+        let mut app = app_for(&path, 80, 10);
+        feed(&mut app, "cH");
+        feed(&mut app, "xlls");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&9], "Sorted by 'score' ascending (5 lines)");
+        assert!(rows[&0].contains("score↑"), "{}", rows[&0]);
+        // Numeric order; the missing value last.
+        let names: Vec<String> = (1..=5).map(|r| rows[&r].clone()).collect();
+        assert!(names[0].starts_with("4 "), "{names:?}");
+        assert!(names[1].starts_with("1 "), "{names:?}");
+        assert!(
+            names[4].starts_with("3 "),
+            "missing value sorts last: {names:?}"
+        );
+        feed(&mut app, "s");
+        let rows = drawn_rows(&mut app);
+        assert!(
+            rows[&1].starts_with("2 "),
+            "descending, ties keep file order"
+        );
+        assert!(rows[&2].starts_with("5 "));
+        assert!(rows[&5].starts_with("3 "), "missing still last");
+        feed(&mut app, "s");
+        assert_eq!(app.pending_message.as_deref(), Some("Sort off"));
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&1].starts_with("1 "));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn column_statistics_page_counts_values_and_summarises_numbers() {
+        let path = scores_csv();
+        let mut app = app_for(&path, 100, 16);
+        feed(&mut app, "xlli");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "Column 'score' (csv), all lines");
+        assert!(rows[&2].contains("rows 5   with a value 4   missing 1   distinct 3"));
+        assert!(
+            rows[&3].contains("min 7") && rows[&3].contains("max 95"),
+            "{}",
+            rows[&3]
+        );
+        assert!(
+            rows[&6].trim_start().starts_with("2  40.0%"),
+            "{}",
+            rows[&6]
+        );
+        assert!(rows[&6].ends_with("95"));
+        assert!(rows[&15].starts_with("Statistics: 'score'"));
+        // Any other key closes the page; the file is back.
+        feed(&mut app, "q");
+        assert!(app.overlay.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn marks_and_quote_quote_return_to_earlier_places() {
+        let path = lines_fixture(200);
+        let mut app = app_for(&path, 80, 24);
+        feed(&mut app, "30gma");
+        feed(&mut app, "150g");
+        feed(&mut app, "'a");
+        assert_eq!(app.top, 30);
+        feed(&mut app, "''");
+        assert_eq!(app.top, 150, "'' goes back to before the last jump");
+        feed(&mut app, "''");
+        assert_eq!(app.top, 30);
+        feed(&mut app, "'z");
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Mark 'z' is not set  (press RETURN)")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn help_page_lists_the_keys_and_scrolls() {
+        let path = lines_fixture(10);
+        let mut app = app_for(&path, 80, 10);
+        feed(&mut app, "h");
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&0].starts_with("rless keys"));
+        assert!(rows[&9].starts_with("Help - lines 1-9 of"));
+        feed(&mut app, "j");
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&9].starts_with("Help - lines 2-10 of"));
+        feed(&mut app, "x");
+        assert!(app.overlay.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn options_toggle_inside_the_pager() {
+        let path = mixed_log();
+        let mut app = app_for(&path, 40, 5);
+        feed(&mut app, "-N");
+        assert_eq!(app.pending_message.as_deref(), Some("Line numbers: on"));
+        feed(&mut app, "\n");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "      1 DEBUG request 1");
+        feed(&mut app, "-i");
+        feed(&mut app, "/error\n");
+        assert_eq!(app.top, 2, "-i folds case for a lowercase pattern");
+        feed(&mut app, "/Error\n");
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .starts_with("Pattern not found"),
+            "smart case: an uppercase letter makes it exact"
+        );
+        feed(&mut app, "\n-Z");
+        assert!(
+            app.pending_message
+                .as_deref()
+                .unwrap()
+                .starts_with("No such option: -Z")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn horizontal_scroll_with_chop_and_in_the_table() {
+        let path = lines_fixture(10);
+        let mut app = App::new(Options {
+            chop_long_lines: true,
+            ..test_opts(vec![path.clone()])
+        });
+        app.set_size(20, 5);
+        drawn_rows(&mut app);
+        app.apply(Action::HScroll(Some(4), true)).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "line 1 of 10 :: pla>");
+        assert_eq!(rows[&4], "[col 5+]");
+        app.apply(Action::HScroll(None, false)).unwrap();
+        assert_eq!(app.hscroll, 0);
+        let _ = std::fs::remove_file(path);
+
+        // Wrapped text has nothing hidden: say so instead of shifting.
+        let path = lines_fixture(10);
+        let mut app = app_for(&path, 20, 5);
+        app.apply(Action::HScroll(None, true)).unwrap();
+        assert_eq!(app.hscroll, 0);
+        assert_eq!(
+            app.pending_message.as_deref(),
+            Some("Nothing to scroll: lines wrap (try -S)")
+        );
+        let _ = std::fs::remove_file(path);
+
+        let path = jsonl_fixture();
+        let mut app = app_for(&path, 20, 5);
+        feed(&mut app, "c\n");
+        app.apply(Action::HScroll(Some(7), true)).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&0].starts_with("│200   │"), "{}", rows[&0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_writes_the_current_view_and_protects_existing_files() {
+        let path = mixed_log();
+        let mut app = app_for(&path, 60, 5);
+        let out = std::env::temp_dir().join(format!("rust-less-save-{}.log", rand_suffix()));
+        let out_s = out.display().to_string();
+        feed(&mut app, "&WARN\n");
+        app.apply(Action::SaveView {
+            path: out_s.clone(),
+            force: false,
+        })
+        .unwrap();
+        let saved = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(saved.lines().count(), 25);
+        assert!(saved.starts_with("WARN request 3\nWARN request 7\n"));
+        assert_eq!(
+            app.pending_message,
+            Some(format!("Saved 25 lines to {out_s}"))
+        );
+        let err = app
+            .apply(Action::SaveView {
+                path: out_s.clone(),
+                force: false,
+            })
+            .unwrap_err();
+        assert!(err.contains("exists"), "{err}");
+        feed(&mut app, "\n&\n");
+        app.apply(Action::SaveView {
+            path: out_s.clone(),
+            force: true,
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 100);
+        let err = app
+            .apply(Action::SaveView {
+                path: path.display().to_string(),
+                force: true,
+            })
+            .unwrap_err();
+        assert!(err.ends_with("is the file being viewed"), "{err}");
+        let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_shows_appended_lines_and_survives_truncation() {
+        use std::io::Write as _;
+        let path = lines_fixture(30);
+        let mut app = app_for(&path, 80, 6);
+        app.apply(Action::Follow).unwrap();
+        assert!(app.following);
+        assert_eq!(app.top, 26, "follow starts at the last page");
+        assert!(!app.follow_tick(), "nothing new");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"new line A\nunfinished").unwrap();
+        f.flush().unwrap();
+        assert!(app.follow_tick());
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&4], "new line A", "the unfinished line is held back");
+        assert!(rows[&5].contains("Following"), "{}", rows[&5]);
+        f.write_all(b" now done\n").unwrap();
+        f.flush().unwrap();
+        assert!(app.follow_tick());
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&4], "unfinished now done", "joined, not split in two");
+        // Truncated in place (log rotation by copytruncate).
+        std::fs::write(&path, "fresh 1\nfresh 2\n").unwrap();
+        assert!(app.follow_tick());
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "fresh 1");
+        assert!(rows[&5].starts_with("File was truncated or replaced"));
+        app.stop_follow();
+        assert!(!app.following);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_keeps_a_filter_live() {
+        use std::io::Write as _;
+        let path = mixed_log();
+        let mut app = app_for(&path, 60, 4);
+        feed(&mut app, "&ERROR\nF");
+        assert!(app.following);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"INFO quiet\nERROR loud\n").unwrap();
+        f.flush().unwrap();
+        assert!(app.follow_tick());
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&2], "ERROR loud");
+        assert_eq!(rows[&1], "ERROR request 98");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_commands_position_the_first_screen() {
+        let path = lines_fixture(200);
+        let run = |cmds: &[&str]| {
+            let mut app = App::new(Options {
+                initial_commands: cmds.iter().map(|c| c.to_string()).collect(),
+                ..test_opts(vec![path.clone()])
+            });
+            app.set_size(80, 24);
+            app.run_initial_commands();
+            app
+        };
+        assert_eq!(run(&["G"]).top, 178);
+        assert_eq!(run(&["50"]).top, 50);
+        assert_eq!(run(&["/line 120 "]).top, 120);
+        let filtered = run(&["&7 of"]);
+        assert!(filtered.filter.is_some());
+        assert_eq!(filtered.top, 7);
+        let bad = run(&["9999"]);
+        assert_eq!(
+            bad.pending_message.as_deref(),
+            Some("Cannot seek to line number 9999  (press RETURN)")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quit_if_one_screen_prints_short_input_only() {
+        let short = temp_file("a\x07b\nsecond\n");
+        let mut app = App::new(test_opts(vec![short.clone()]));
+        app.set_size(80, 24);
+        let out = app.one_screen_output().unwrap().unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("^G"),
+            "control characters stay escaped: {text:?}"
+        );
+        assert!(text.ends_with("second\n"));
+        let long = lines_fixture(30);
+        let mut app = App::new(test_opts(vec![long.clone()]));
+        app.set_size(80, 24);
+        assert!(app.one_screen_output().unwrap().is_none());
+        let _ = std::fs::remove_file(short);
+        let _ = std::fs::remove_file(long);
+    }
+
+    #[test]
+    fn filter_follows_into_the_next_file_and_rereads_for_its_format() {
+        let jsonl = jsonl_fixture();
+        let plain = mixed_log();
+        let mut app = App::new(test_opts(vec![jsonl.clone(), plain.clone()]));
+        app.set_size(80, 6);
+        drawn_rows(&mut app);
+        feed(&mut app, "&ERROR\n");
+        feed(&mut app, ":n");
+        let rows = drawn_rows(&mut app);
+        assert_eq!(
+            rows[&0], "ERROR request 2",
+            "the filter is kept, as in less"
+        );
+        assert!(rows[&5].contains("[&ERROR"), "and shown: {}", rows[&5]);
+        feed(&mut app, ":p");
+        let rows = drawn_rows(&mut app);
+        assert!(rows[&0].contains("\"level\":\"ERROR\""), "{}", rows[&0]);
+        let _ = std::fs::remove_file(jsonl);
+        let _ = std::fs::remove_file(plain);
+    }
+
+    #[test]
+    fn long_prompt_counts_rows_of_a_sorted_view() {
+        let path = scores_csv();
+        let mut app = App::new(Options {
+            prompt_mode: PromptMode::Long,
+            ..test_opts(vec![path.clone()])
+        });
+        app.set_size(80, 4);
+        drawn_rows(&mut app);
+        feed(&mut app, "cxllsq\n");
+        let rows = drawn_rows(&mut app);
+        // q dismissed the sort message, so Enter moved one row down.
+        assert!(rows[&3].contains("lines 2-4/6 66%"), "{}", rows[&3]);
         let _ = std::fs::remove_file(path);
     }
 }

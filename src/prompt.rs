@@ -28,6 +28,9 @@ pub struct PromptContext<'a> {
     pub next_filename: Option<&'a str>,
     pub byte_offset: usize,
     pub total_bytes: Option<usize>,
+    /// Active filter / sort state (`[&ERROR, 42 lines]`), shown first.
+    /// `None` keeps the less-compatible prompt exactly.
+    pub view_tag: Option<&'a str>,
 }
 
 /// Renders the full prompt row: `pending` (a transient message such as
@@ -57,6 +60,9 @@ pub fn render(
 
 fn build_segments(mode: Mode, ctx: &PromptContext) -> Vec<String> {
     let mut parts = Vec::new();
+    if let Some(tag) = ctx.view_tag {
+        parts.push(tag.to_string());
+    }
     match mode {
         Mode::Short => {
             if ctx.show_filename {
@@ -190,6 +196,7 @@ mod tests {
             next_filename: None,
             byte_offset: 0,
             total_bytes: None,
+            view_tag: None,
         }
     }
 

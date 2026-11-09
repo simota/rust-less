@@ -116,7 +116,7 @@ pub fn find_by(
 }
 
 #[inline]
-fn line_matches(raw: &[u8], pattern: &Regex) -> bool {
+pub fn line_matches(raw: &[u8], pattern: &Regex) -> bool {
     // Search over a lossy UTF-8 view; malformed bytes cannot participate in
     // a text match anyway, and no baseline scenario searches such content.
     // Valid lines (the norm) are checked with `str::from_utf8`, whose

@@ -5,14 +5,17 @@
 //! many lines as a caller actually asks for are ever read from disk.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 
 pub enum Source {
     File(PathBuf),
-    /// Read through an ordinary `BufReader`: crossterm reads keyboard
-    /// events from the controlling tty on Unix, not from `std::io::stdin()`,
-    /// so piping content over stdin does not conflict with key handling.
+    /// Read on a background thread and handed over in chunks (see
+    /// `StreamReader`): crossterm reads keyboard events from the controlling
+    /// tty on Unix, not from `std::io::stdin()`, so piping content over
+    /// stdin does not conflict with key handling, and follow mode can ask
+    /// "is a new line ready?" without blocking.
     Stdin,
 }
 
@@ -22,12 +25,151 @@ pub enum Source {
 /// tty still returns whatever is available, so it never waits to fill it.
 const READ_BUF_CAPACITY: usize = 64 * 1024;
 
+/// Chunks the stdin thread may read ahead of the pager (back-pressure:
+/// a huge pipe is not slurped into memory before anyone scrolls).
+const STREAM_CHANNEL_CHUNKS: usize = 8;
+
+/// A read from a pipe waits for more data only while the producer keeps
+/// sending: once it has been idle this long, the read returns what has
+/// arrived (a live `kubectl logs -f | rless` shows its first screen
+/// instead of hanging; `cat big | rless` never idles, so `G` still reaches
+/// its true end).
+const STREAM_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a stream read may wait for its next chunk.
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    /// Until the producer has been idle for `STREAM_IDLE`.
+    WhileFlowing,
+    /// Not at all.
+    No,
+}
+
 /// Each cached line starts at a multiple of this offset in the byte store.
 /// Word-aligned line starts keep `str::from_utf8` (run on every line by
 /// search and filters) on its aligned word-at-a-time path; unaligned starts
 /// measurably slowed line scans. Costs 3.5 padding bytes per line on
 /// average, far below the per-line allocation overhead this layout replaces.
 const LINE_ALIGN: usize = 8;
+
+/// What a follow-mode poll found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Growth {
+    /// Nothing new.
+    None,
+    /// New lines were appended.
+    Appended,
+    /// The file was truncated or replaced (log rotation) and has been
+    /// re-read from the start: every line number may now mean another line.
+    Reset,
+}
+
+enum ReadOutcome {
+    /// One line (with its newline, if it had one) was appended.
+    Line,
+    /// The input has ended.
+    Eof,
+    /// No complete line is available yet (pipes, and files in follow mode).
+    Pending,
+}
+
+/// Stdin, read on a background thread in chunks.
+struct StreamReader {
+    rx: Receiver<Result<Vec<u8>, String>>,
+    chunk: Vec<u8>,
+    pos: usize,
+    /// `chunk[pos..scanned]` is known to hold no newline.
+    scanned: usize,
+    closed: bool,
+}
+
+impl StreamReader {
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::sync_channel(STREAM_CHANNEL_CHUNKS);
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            loop {
+                let mut buf = vec![0u8; READ_BUF_CAPACITY];
+                let msg = match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(describe_io_error(&e)),
+                };
+                let failed = msg.is_err();
+                if tx.send(msg).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        StreamReader {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+            scanned: 0,
+            closed: false,
+        }
+    }
+
+    /// Appends the next line to `out`, waiting for data as `wait` allows;
+    /// returns `Pending` when no complete line has arrived in time (a
+    /// partial line stays here until its newline does).
+    fn read_line(&mut self, out: &mut Vec<u8>, wait: Wait) -> Result<ReadOutcome, String> {
+        loop {
+            let from = self.scanned.max(self.pos);
+            if let Some(i) = self.chunk[from..].iter().position(|&b| b == b'\n') {
+                let end = from + i + 1;
+                out.extend_from_slice(&self.chunk[self.pos..end]);
+                self.pos = end;
+                self.scanned = end;
+                return Ok(ReadOutcome::Line);
+            }
+            self.scanned = self.chunk.len();
+            if self.closed {
+                if self.pos == self.chunk.len() {
+                    return Ok(ReadOutcome::Eof);
+                }
+                out.extend_from_slice(&self.chunk[self.pos..]);
+                self.pos = self.chunk.len();
+                return Ok(ReadOutcome::Line);
+            }
+            let next = match wait {
+                Wait::WhileFlowing => match self.rx.recv_timeout(STREAM_IDLE) {
+                    Ok(c) => Some(c),
+                    Err(RecvTimeoutError::Timeout) => return Ok(ReadOutcome::Pending),
+                    Err(RecvTimeoutError::Disconnected) => None,
+                },
+                Wait::No => match self.rx.try_recv() {
+                    Ok(c) => Some(c),
+                    Err(TryRecvError::Empty) => return Ok(ReadOutcome::Pending),
+                    Err(TryRecvError::Disconnected) => None,
+                },
+            };
+            match next {
+                Some(Ok(c)) => {
+                    self.chunk.drain(..self.pos);
+                    self.scanned -= self.pos;
+                    self.pos = 0;
+                    self.chunk.extend_from_slice(&c);
+                }
+                Some(Err(e)) => return Err(e),
+                None => self.closed = true,
+            }
+        }
+    }
+}
+
+enum Reader {
+    File {
+        inner: BufReader<File>,
+        /// (device, inode) of the opened file, to notice log rotation.
+        identity: Option<(u64, u64)>,
+    },
+    Stream(StreamReader),
+}
 
 /// One input file (or stdin), with lines read incrementally and cached.
 ///
@@ -39,7 +181,7 @@ const LINE_ALIGN: usize = 8;
 /// copy.
 pub struct Buffer {
     source: Source,
-    reader: Option<Box<dyn BufRead>>,
+    reader: Option<Reader>,
     open_error: Option<String>,
     /// Content of every cached line, newlines excluded, with zero padding
     /// between lines up to the next `LINE_ALIGN` boundary.
@@ -53,6 +195,11 @@ pub struct Buffer {
     /// slot kept absent; use `byte_totals.get(n - 1)`).
     byte_totals: Vec<usize>,
     eof: bool,
+    /// Follow mode: never block, and hold back a line until its newline
+    /// arrives (it is still being written).
+    follow: bool,
+    /// Bytes of a file's unfinished last line, held back in follow mode.
+    partial: Vec<u8>,
 }
 
 impl Buffer {
@@ -65,6 +212,8 @@ impl Buffer {
             line_ends: Vec::new(),
             byte_totals: Vec::new(),
             eof: false,
+            follow: false,
+            partial: Vec::new(),
         }
     }
 
@@ -75,6 +224,10 @@ impl Buffer {
         }
     }
 
+    pub fn is_stream(&self) -> bool {
+        matches!(self.source, Source::Stdin)
+    }
+
     fn ensure_open(&mut self) -> Result<(), String> {
         if self.reader.is_some() || self.open_error.is_some() {
             return match &self.open_error {
@@ -82,62 +235,110 @@ impl Buffer {
                 None => Ok(()),
             };
         }
-        let reader: Box<dyn BufRead> = match &self.source {
+        let reader = match &self.source {
             Source::File(path) => match File::open(path) {
-                Ok(f) => Box::new(BufReader::with_capacity(READ_BUF_CAPACITY, f)),
+                Ok(f) => Reader::File {
+                    identity: file_identity(&f),
+                    inner: BufReader::with_capacity(READ_BUF_CAPACITY, f),
+                },
                 Err(e) => {
                     let msg = format!("{}: {}", path.display(), describe_io_error(&e));
                     self.open_error = Some(msg.clone());
                     return Err(msg);
                 }
             },
-            Source::Stdin => Box::new(BufReader::with_capacity(READ_BUF_CAPACITY, io::stdin())),
+            Source::Stdin => Reader::Stream(StreamReader::spawn()),
         };
         self.reader = Some(reader);
         Ok(())
     }
 
-    /// Reads lines until at least `up_to` lines are cached, or EOF.
+    /// Reads lines until at least `up_to` lines are cached, or EOF. A pipe
+    /// may stop short of both when its producer is idle (see
+    /// `STREAM_IDLE`); in follow mode nothing waits at all.
     #[inline]
     pub fn ensure_lines_read(&mut self, up_to: usize) -> Result<(), String> {
         // Fast path for line-by-line scans over cached lines (search,
-        // filters, rendering): a cached line implies the source opened, so
-        // this returns exactly what the full path would. `up_to == 0` takes
+        // filters, rendering): a cached line implies the source opened (a
+        // follow-mode reset clears the lines along with the reader), so
+        // this returns exactly what `read_lines` would. `up_to == 0` takes
         // the full path, which still reports an open error.
         if up_to > 0 && self.line_ends.len() >= up_to {
             return Ok(());
         }
-        self.read_more_lines(up_to)
+        let wait = if self.follow {
+            Wait::No
+        } else {
+            Wait::WhileFlowing
+        };
+        self.read_lines(up_to, wait)
     }
 
-    fn read_more_lines(&mut self, up_to: usize) -> Result<(), String> {
+    /// Reads, without waiting, the lines up to `up_to` that have already
+    /// arrived. True when any line was added.
+    pub fn read_ready(&mut self, up_to: usize) -> Result<bool, String> {
+        let before = self.line_ends.len();
+        self.read_lines(up_to, Wait::No)?;
+        Ok(self.line_ends.len() > before)
+    }
+
+    /// True for a pipe that may still deliver more lines.
+    pub fn is_open_stream(&self) -> bool {
+        self.is_stream() && !self.eof && self.open_error.is_none()
+    }
+
+    fn read_lines(&mut self, up_to: usize, wait: Wait) -> Result<(), String> {
         self.ensure_open()?;
         if self.eof || self.line_ends.len() >= up_to {
             return Ok(());
         }
+        let hold_partial = self.follow;
         let reader = self.reader.as_mut().expect("opened above");
         while self.line_ends.len() < up_to {
             let prev_end = self.data.len();
-            self.data.resize(line_start(prev_end), 0);
-            let n = match reader.read_until(b'\n', &mut self.data) {
-                Ok(n) => n,
+            let start = line_start(prev_end);
+            self.data.resize(start, 0);
+            self.data.append(&mut self.partial);
+            let outcome = match reader {
+                Reader::File { inner, .. } => match inner.read_until(b'\n', &mut self.data) {
+                    Ok(_) if self.data.len() > start => Ok(ReadOutcome::Line),
+                    Ok(_) => Ok(ReadOutcome::Eof),
+                    Err(e) => Err(describe_io_error(&e)),
+                },
+                Reader::Stream(stream) => stream.read_line(&mut self.data, wait),
+            };
+            let outcome = match outcome {
+                Ok(o) => o,
                 Err(e) => {
                     // read_until keeps whatever it read before failing;
                     // drop that partial line, as the per-line buffer used to.
                     self.data.truncate(prev_end);
-                    return Err(describe_io_error(&e));
+                    return Err(e);
                 }
             };
-            if n == 0 {
-                self.data.truncate(prev_end);
-                self.eof = true;
-                break;
+            match outcome {
+                ReadOutcome::Eof => {
+                    self.data.truncate(prev_end);
+                    self.eof = true;
+                    break;
+                }
+                ReadOutcome::Pending => {
+                    self.data.truncate(prev_end);
+                    break;
+                }
+                ReadOutcome::Line => {}
             }
             let had_newline = self.data.last() == Some(&b'\n');
+            if !had_newline && hold_partial && matches!(reader, Reader::File { .. }) {
+                // Still being written: keep it back until its newline comes.
+                self.partial = self.data.split_off(start);
+                self.data.truncate(prev_end);
+                break;
+            }
             if had_newline {
                 self.data.pop();
             }
-            let len = self.data.len() - line_start(prev_end);
+            let len = self.data.len() - start;
             let prev_total = self.byte_totals.last().copied().unwrap_or(0);
             self.byte_totals
                 .push(prev_total + len + if had_newline { 1 } else { 0 });
@@ -149,12 +350,96 @@ impl Buffer {
     /// Reads the entire remaining input. Used only when a true-EOF-dependent
     /// answer is required (absolute goto beyond a known line, `G` with no
     /// count, or window-clamping near the tail) — see §3 item 3 of the spec.
+    /// On a pipe whose producer is idle, and in follow mode, "entire"
+    /// means what has arrived.
     pub fn ensure_full_read(&mut self) -> Result<(), String> {
         self.ensure_open()?;
         while !self.eof {
-            self.ensure_lines_read(self.line_ends.len() + 4096)?;
+            let before = self.line_ends.len();
+            self.ensure_lines_read(before + 4096)?;
+            if self.line_ends.len() == before && !self.eof {
+                break;
+            }
         }
         Ok(())
+    }
+
+    /// Switches follow mode on or off. On: reads never block, and an
+    /// unfinished last line is taken back so its continuation joins it.
+    pub fn set_follow(&mut self, on: bool) {
+        if on == self.follow {
+            return;
+        }
+        self.follow = on;
+        if on {
+            self.take_back_partial_last_line();
+            self.eof = false;
+        } else if !self.partial.is_empty() {
+            // Show the unfinished line again, as a line without newline.
+            let start = line_start(self.data.len());
+            self.data.resize(start, 0);
+            self.data.append(&mut self.partial);
+            let len = self.data.len() - start;
+            let prev_total = self.byte_totals.last().copied().unwrap_or(0);
+            self.byte_totals.push(prev_total + len);
+            self.line_ends.push(self.data.len());
+        }
+    }
+
+    fn take_back_partial_last_line(&mut self) {
+        let n = self.line_ends.len();
+        if n == 0 || !matches!(self.source, Source::File(_)) {
+            return;
+        }
+        let len = self.line(n).map_or(0, <[u8]>::len);
+        let before = if n >= 2 { self.byte_totals[n - 2] } else { 0 };
+        if self.byte_totals[n - 1] - before == len {
+            // No newline: the file's last line may still be growing.
+            let start = if n == 1 {
+                0
+            } else {
+                line_start(self.line_ends[n - 2])
+            };
+            self.partial = self.data.split_off(start);
+            self.data
+                .truncate(if n == 1 { 0 } else { self.line_ends[n - 2] });
+            self.line_ends.pop();
+            self.byte_totals.pop();
+        }
+    }
+
+    /// Follow mode: picks up whatever was appended since the last read. A
+    /// file that shrank or was replaced at its path (log rotation) is
+    /// re-opened and re-read from the start.
+    pub fn poll_growth(&mut self) -> Result<Growth, String> {
+        self.ensure_open()?;
+        let mut reset = false;
+        if let (Source::File(path), Some(Reader::File { identity, .. })) =
+            (&self.source, &self.reader)
+            && let Ok(meta) = std::fs::metadata(path)
+        {
+            let consumed = self.byte_totals.last().copied().unwrap_or(0) + self.partial.len();
+            let replaced = identity.is_some() && metadata_identity(&meta) != *identity;
+            reset = replaced || (meta.len() as usize) < consumed;
+        }
+        if reset {
+            self.reader = None;
+            self.data.clear();
+            self.line_ends.clear();
+            self.byte_totals.clear();
+            self.partial.clear();
+            self.ensure_open()?;
+        }
+        let before = self.line_ends.len();
+        self.eof = false;
+        self.ensure_lines_read(usize::MAX)?;
+        Ok(if reset {
+            Growth::Reset
+        } else if self.line_ends.len() > before {
+            Growth::Appended
+        } else {
+            Growth::None
+        })
     }
 
     pub fn line(&self, n: usize) -> Option<&[u8]> {
@@ -212,6 +497,21 @@ impl Buffer {
         // padding, which can never be ESC.
         Ok(self.data.contains(&0x1b))
     }
+}
+
+#[cfg(unix)]
+fn metadata_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn metadata_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn file_identity(f: &File) -> Option<(u64, u64)> {
+    f.metadata().ok().as_ref().and_then(metadata_identity)
 }
 
 /// Offset at which the line following one that ends at `prev_end` starts.
@@ -375,5 +675,91 @@ mod tests {
         assert_eq!(buf.byte_offset_through(1), 4); // "abc\n"
         assert_eq!(buf.byte_offset_through(2), 7); // "abc\nde\n"
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_mode_holds_an_unfinished_line_and_joins_its_continuation() {
+        let path = temp_file(b"one\ntw");
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        buf.ensure_full_read().unwrap();
+        assert_eq!(buf.line(2), Some(&b"tw"[..]), "shown while not following");
+        buf.set_follow(true);
+        assert_eq!(buf.lines_cached(), 1, "taken back: it may still grow");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"o\nthr").unwrap();
+        f.flush().unwrap();
+        assert_eq!(buf.poll_growth().unwrap(), Growth::Appended);
+        assert_eq!(buf.line(2), Some(&b"two"[..]));
+        assert_eq!(buf.lines_cached(), 2, "\"thr\" waits for its newline");
+        assert_eq!(buf.poll_growth().unwrap(), Growth::None);
+        buf.set_follow(false);
+        assert_eq!(
+            buf.line(3),
+            Some(&b"thr"[..]),
+            "shown again once not following"
+        );
+        assert_eq!(buf.byte_offset_through(3), 11);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_mode_rereads_a_truncated_or_replaced_file() {
+        let path = temp_file(b"a\nb\nc\n");
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        buf.ensure_full_read().unwrap();
+        buf.set_follow(true);
+        std::fs::write(&path, b"x\n").unwrap();
+        assert_eq!(buf.poll_growth().unwrap(), Growth::Reset);
+        assert_eq!(buf.lines_cached(), 1);
+        assert_eq!(buf.line(1), Some(&b"x"[..]));
+        // Replaced by a new file at the same path (rename-style rotation).
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, b"new 1\nnew 2\nnew 3\nnew 4\n").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(buf.poll_growth().unwrap(), Growth::Reset);
+        assert_eq!(buf.lines_cached(), 4);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_reader_waits_for_newlines_and_reports_pending() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let mut stream = StreamReader {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+            scanned: 0,
+            closed: false,
+        };
+        let mut out = Vec::new();
+        tx.send(Ok(b"ab".to_vec())).unwrap();
+        assert!(matches!(
+            stream.read_line(&mut out, Wait::No),
+            Ok(ReadOutcome::Pending)
+        ));
+        assert!(out.is_empty(), "a partial line is not handed out");
+        tx.send(Ok(b"c\nd".to_vec())).unwrap();
+        assert!(matches!(
+            stream.read_line(&mut out, Wait::No),
+            Ok(ReadOutcome::Line)
+        ));
+        assert_eq!(out, b"abc\n");
+        out.clear();
+        drop(tx);
+        assert!(matches!(
+            stream.read_line(&mut out, Wait::WhileFlowing),
+            Ok(ReadOutcome::Line)
+        ));
+        assert_eq!(
+            out, b"d",
+            "the last line needs no newline once the pipe closes"
+        );
+        assert!(matches!(
+            stream.read_line(&mut out, Wait::No),
+            Ok(ReadOutcome::Eof)
+        ));
     }
 }
