@@ -10,9 +10,9 @@
 //! survives, the same choice `-R` makes for the core view.
 
 use crate::buffer::Buffer;
-use crate::screen::LineFilter;
 use crate::simd::{FieldSpan, FieldType, StructuralClassifier};
 use crate::sniffer::DetectedFormat;
+use crate::view::ViewIndex;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -59,11 +59,12 @@ pub struct ProjectionEngine {
     pub columns: Vec<ColumnInfo>,
     pub expanded_lines: HashSet<usize>,
     pub sticky_header: bool,
+    /// Display columns scrolled off to the left (horizontal scroll).
+    pub hscroll: usize,
+    /// (column, descending) the view is sorted by: marked in the header.
+    pub sorted_by: Option<(String, bool)>,
     /// `-R`: keep ESC (ANSI colour) in projected text instead of escaping it.
     pub raw_ansi: bool,
-    /// Horizontal scroll in display columns. In the table, pinned columns
-    /// stay in place and only the columns after them scroll.
-    pub hshift: usize,
     span_pool: ViewportSpanPool,
 }
 
@@ -74,8 +75,9 @@ impl ProjectionEngine {
             columns: Vec::new(),
             expanded_lines: HashSet::new(),
             sticky_header: false,
+            hscroll: 0,
+            sorted_by: None,
             raw_ansi: false,
-            hshift: 0,
             span_pool: ViewportSpanPool::new(),
         }
     }
@@ -104,6 +106,16 @@ impl ProjectionEngine {
                 .filter(move |c| c.pinned == pinned && !c.hidden)
         };
         visible(true).chain(visible(false))
+    }
+
+    /// Display width of the pinned cells at the start of every table row
+    /// (each cell plus its separator); they stay put when the table
+    /// scrolls sideways.
+    pub fn pinned_width(&self) -> usize {
+        self.display_columns()
+            .filter(|c| c.pinned)
+            .map(|c| c.width + 1)
+            .sum()
     }
 
     /// Derives or updates column definitions from a set of lines.
@@ -180,21 +192,21 @@ impl ProjectionEngine {
         }
     }
 
-    /// Index of the column named `name` (CSV/TSV fields are positional).
-    pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name == name)
-    }
-
     /// The sticky header row: column names in display order.
     fn header_text(&self) -> String {
-        let mut pinned = String::new();
-        let mut rest = String::new();
+        let mut header = String::new();
         for col in self.display_columns() {
-            let part = if col.pinned { &mut pinned } else { &mut rest };
-            part.push_str(&pad_or_truncate_cell(&self.escape(&col.name), col.width));
-            part.push('│');
+            let name = self.escape(&col.name);
+            let label = match &self.sorted_by {
+                Some((c, desc)) if *c == col.name => {
+                    Cow::Owned(format!("{name}{}", if *desc { "↓" } else { "↑" }))
+                }
+                _ => name,
+            };
+            header.push_str(&pad_or_truncate_cell(&label, col.width));
+            header.push('│');
         }
-        pinned + &skip_columns(&rest, self.hshift)
+        header
     }
 
     /// Extra display columns `escape` adds to `value`.
@@ -218,10 +230,7 @@ impl ProjectionEngine {
         buffer_line_idx: usize,
         tabular: bool,
     ) -> Vec<String> {
-        let raw_row = |this: &Self| {
-            let text = this.escape(&String::from_utf8_lossy(line)).into_owned();
-            vec![skip_columns(&text, this.hshift)]
-        };
+        let raw_row = |this: &Self| vec![this.escape(&String::from_utf8_lossy(line)).into_owned()];
         if !self.format.is_structured() {
             return raw_row(self);
         }
@@ -253,36 +262,23 @@ impl ProjectionEngine {
                 }
             }
             out_rows.push("}".to_string());
-            return out_rows
-                .into_iter()
-                .map(|row| skip_columns(&row, self.hshift))
-                .collect();
+            return out_rows;
         }
 
         if tabular && !self.columns.is_empty() {
             // The reset after each cell only matters when `-R` lets colour
             // through: it stops a cell's colour bleeding into the next one.
             let separator = if self.raw_ansi { "\x1b[0m│" } else { "│" };
-            let mut pinned = String::new();
-            let mut rest = String::new();
+            let mut row_buf = String::new();
             for col in self.display_columns() {
                 let value = self.find_field_value(&col.name, line);
-                let part = if col.pinned { &mut pinned } else { &mut rest };
-                part.push_str(&pad_or_truncate_cell(&self.escape(&value), col.width));
-                part.push_str(separator);
+                row_buf.push_str(&pad_or_truncate_cell(&self.escape(&value), col.width));
+                row_buf.push_str(separator);
             }
-            return vec![pinned + &skip_columns(&rest, self.hshift)];
+            return vec![row_buf];
         }
 
         raw_row(self)
-    }
-
-    /// The value of column `col_name` in `line`, unquoted (empty when the
-    /// line has no such field).
-    pub fn field_value(&mut self, col_name: &str, line: &[u8]) -> String {
-        self.span_pool.reset();
-        StructuralClassifier::scan_fields(self.format, line, &mut self.span_pool.spans);
-        self.find_field_value(col_name, line)
     }
 
     fn find_field_value(&self, col_name: &str, line: &[u8]) -> String {
@@ -312,21 +308,26 @@ impl ProjectionEngine {
         String::new()
     }
 
-    /// Assembles the window starting at buffer line `top`: the optional
-    /// sticky header, then projected rows of lines that pass `filter`,
-    /// until `content_rows` rows are filled or input ends. Read errors are
+    /// Assembles a window: the optional sticky header, then projected rows
+    /// of the lines `lines` yields (every line from a top line, or the
+    /// lines of a filtered/sorted view from a position), until
+    /// `content_rows` rows are filled or the lines run out. Read errors are
     /// returned, not swallowed, as `screen::render_window` does.
     pub fn render_window(
         &mut self,
         buffer: &mut Buffer,
-        top: usize,
+        mut lines: WindowLines<'_>,
         content_rows: usize,
         width: usize,
-        filter: Option<LineFilter>,
         tabular: bool,
     ) -> Result<ProjectedWindow, String> {
-        let header = (self.sticky_header && !self.columns.is_empty())
-            .then(|| clip_to_width(self.header_text(), width));
+        let frozen = self.pinned_width();
+        let header = (self.sticky_header && !self.columns.is_empty()).then(|| {
+            clip_to_width(
+                scroll_keeping(self.header_text(), frozen, self.hscroll),
+                width,
+            )
+        });
         let capacity = content_rows.saturating_sub(header.is_some() as usize);
         // A CSV/TSV file's first line is the header row the column names
         // came from; under the sticky header it would show twice.
@@ -335,45 +336,41 @@ impl ProjectionEngine {
         .then_some(1);
 
         let mut rows = Vec::new();
-        let mut bottom_line = top;
-        let mut line_no = top.max(1);
+        let mut bottom_line = lines.first_hint();
         let mut at_eof = false;
         let mut cut_short = false;
         while rows.len() < capacity {
-            buffer.ensure_lines_read(line_no)?;
-            let Some(raw) = buffer.line(line_no) else {
+            let Some(line_no) = lines.next(buffer)? else {
                 at_eof = true;
                 break;
             };
-            if Some(line_no) != header_line && filter.is_none_or(|f| f(raw)) {
-                let sub_rows = self.project_line(raw, line_no, tabular);
-                let room = capacity - rows.len();
-                cut_short = sub_rows.len() > room;
-                rows.extend(
-                    sub_rows
-                        .into_iter()
-                        .take(room)
-                        .map(|row| clip_to_width(row, width)),
-                );
-                bottom_line = line_no;
+            if Some(line_no) == header_line {
+                continue;
             }
-            line_no += 1;
+            let raw = buffer.line(line_no).expect("yielded lines are read");
+            let sub_rows = self.project_line(raw, line_no, tabular);
+            let room = capacity - rows.len();
+            cut_short = sub_rows.len() > room;
+            let hscroll = self.hscroll;
+            // Table rows keep their pinned cells in place; an expanded
+            // JSON line is a tree, not table-shaped, so all of it scrolls.
+            let keep = if tabular && !self.expanded_lines.contains(&line_no) {
+                frozen
+            } else {
+                0
+            };
+            rows.extend(
+                sub_rows
+                    .into_iter()
+                    .take(room)
+                    .map(|row| clip_to_width(scroll_keeping(row, keep, hscroll), width)),
+            );
+            bottom_line = line_no;
         }
         if !at_eof && !cut_short {
-            // The window filled exactly: peek ahead to the next line that
-            // would be shown to know whether the input ends here (the same
-            // peek `screen::render_window` does).
-            loop {
-                buffer.ensure_lines_read(line_no)?;
-                match buffer.line(line_no) {
-                    None => {
-                        at_eof = true;
-                        break;
-                    }
-                    Some(raw) if filter.is_none_or(|f| f(raw)) => break,
-                    Some(_) => line_no += 1,
-                }
-            }
+            // The window filled exactly: peek one line to know whether the
+            // input ends here (the same peek `screen::render_window` does).
+            at_eof = lines.peek(buffer)?.is_none();
         }
 
         Ok(ProjectedWindow {
@@ -383,6 +380,135 @@ impl ProjectionEngine {
             at_eof,
         })
     }
+
+    /// The value of column `col_name` in `line` (quotes trimmed), or `None`
+    /// when the line has no such field. `spans` is scratch space.
+    pub fn field_value(
+        &self,
+        col_name: &str,
+        line: &[u8],
+        spans: &mut Vec<FieldSpan>,
+    ) -> Option<String> {
+        StructuralClassifier::scan_fields(self.format, line, spans);
+        let positional = matches!(self.format, DetectedFormat::Csv | DetectedFormat::Tsv);
+        let index = if positional {
+            Some(self.columns.iter().position(|c| c.name == col_name)?)
+        } else {
+            None
+        };
+        let span = match index {
+            Some(i) => spans.get(i)?,
+            None => spans
+                .iter()
+                .find(|s| String::from_utf8_lossy(s.key(line)).trim_matches('"') == col_name)?,
+        };
+        if span.val_type == FieldType::Null && span.value(line).is_empty() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(span.value(line))
+                .trim_matches('"')
+                .to_string(),
+        )
+    }
+}
+
+/// The lines a projected window draws, in order.
+pub enum WindowLines<'a> {
+    /// Every buffer line from this one on.
+    From(usize),
+    /// The lines of a filtered or sorted view, from this position on.
+    View(&'a mut ViewIndex, usize),
+}
+
+impl WindowLines<'_> {
+    /// Bottom line reported for a window that shows nothing.
+    fn first_hint(&self) -> usize {
+        match self {
+            WindowLines::From(top) => *top,
+            WindowLines::View(..) => 0,
+        }
+    }
+
+    fn peek(&mut self, buffer: &mut Buffer) -> Result<Option<usize>, String> {
+        match self {
+            WindowLines::From(n) => {
+                let n = (*n).max(1);
+                buffer.ensure_lines_read(n)?;
+                Ok(buffer.line(n).map(|_| n))
+            }
+            WindowLines::View(view, pos) => view.line_at(buffer, *pos),
+        }
+    }
+
+    fn next(&mut self, buffer: &mut Buffer) -> Result<Option<usize>, String> {
+        let line = self.peek(buffer)?;
+        if line.is_some() {
+            match self {
+                WindowLines::From(n) => *n = (*n).max(1) + 1,
+                WindowLines::View(_, pos) => *pos += 1,
+            }
+        }
+        Ok(line)
+    }
+}
+
+/// Sideways scroll that leaves the first `keep` display columns (the
+/// pinned cells of a table row) in place and scrolls only what follows.
+fn scroll_keeping(text: String, keep: usize, cols: usize) -> String {
+    if keep == 0 || cols == 0 {
+        return skip_columns(text, cols);
+    }
+    let mut used = 0;
+    let mut in_esc = false;
+    let mut split = text.len();
+    for (i, ch) in text.char_indices() {
+        if ch == '\x1b' {
+            in_esc = true;
+        } else if in_esc {
+            in_esc = !ch.is_ascii_alphabetic();
+        } else {
+            if used >= keep {
+                split = i;
+                break;
+            }
+            used += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    let rest = text[split..].to_string();
+    let mut out = text[..split].to_string();
+    out.push_str(&skip_columns(rest, cols));
+    out
+}
+
+/// Drops the first `cols` display columns of projected text (horizontal
+/// scroll). Escape sequences (only present with `-R`) are kept so colour
+/// state survives the cut.
+pub fn skip_columns(text: String, cols: usize) -> String {
+    if cols == 0 {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut used = 0;
+    let mut in_esc = false;
+    for ch in text.chars() {
+        if ch == '\x1b' {
+            in_esc = true;
+            out.push(ch);
+            continue;
+        }
+        if in_esc {
+            out.push(ch);
+            in_esc = !ch.is_ascii_alphabetic();
+            continue;
+        }
+        if used >= cols {
+            out.push(ch);
+        } else {
+            used += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    out
 }
 
 /// Replaces control characters with caret notation (`\x07` → `^G`,
@@ -455,83 +581,6 @@ pub fn clip_to_width(text: String, width: usize) -> String {
         out.push('>');
     }
     out
-}
-
-/// Drops the first `cols` display columns of already-escaped text (the
-/// horizontal scroll). Escape sequences (only present with `-R`) are kept
-/// so colour still applies; a wide character cut by the edge becomes a
-/// blank.
-pub fn skip_columns(text: &str, cols: usize) -> String {
-    if cols == 0 {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut used = 0;
-    let mut in_esc = false;
-    for ch in text.chars() {
-        if ch == '\x1b' {
-            in_esc = true;
-            out.push(ch);
-            continue;
-        }
-        if in_esc {
-            out.push(ch);
-            in_esc = !ch.is_ascii_alphabetic();
-            continue;
-        }
-        if used >= cols {
-            out.push(ch);
-            continue;
-        }
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        used += w;
-        if used > cols {
-            out.extend(std::iter::repeat_n(' ', used - cols));
-        }
-    }
-    out
-}
-
-/// How table rows compare when sorted by a column: numbers (and durations
-/// such as `250ms`) by value, before text; text in byte order; a missing
-/// or empty value last whichever the direction.
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
-pub enum SortKey {
-    Number(f64),
-    Text(String),
-}
-
-impl SortKey {
-    /// `None` for an empty value (sorts last).
-    pub fn of(value: &str) -> Option<SortKey> {
-        let v = value.trim();
-        if v.is_empty() || v == "null" {
-            return None;
-        }
-        if let Ok(n) = v.parse::<f64>()
-            && n.is_finite()
-        {
-            return Some(SortKey::Number(n));
-        }
-        Some(SortKey::Text(v.to_string()))
-    }
-
-    pub fn compare(
-        a: &Option<SortKey>,
-        b: &Option<SortKey>,
-        descending: bool,
-    ) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match (a, b) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(x), Some(y)) => {
-                let ord = x.partial_cmp(y).unwrap_or(Ordering::Equal);
-                if descending { ord.reverse() } else { ord }
-            }
-        }
-    }
 }
 
 /// Display width of already-escaped projected text (no control characters
@@ -759,11 +808,15 @@ mod tests {
         let mut buf = Buffer::new(crate::buffer::Source::File(path.clone()));
         let mut proj = ProjectionEngine::new(DetectedFormat::Csv);
         proj.update_columns_from_lines(&[b"name,age", b"alice,30"]);
-        let win = proj.render_window(&mut buf, 1, 5, 80, None, true).unwrap();
+        let win = proj
+            .render_window(&mut buf, WindowLines::From(1), 5, 80, true)
+            .unwrap();
         assert_eq!(win.header, None);
         assert_eq!(win.rows[0], "name │age │", "no sticky header: line 1 stays");
         proj.sticky_header = true;
-        let win = proj.render_window(&mut buf, 1, 5, 80, None, true).unwrap();
+        let win = proj
+            .render_window(&mut buf, WindowLines::From(1), 5, 80, true)
+            .unwrap();
         assert_eq!(win.header.as_deref(), Some("name │age │"));
         assert_eq!(win.rows, ["alice│30  │", "bob  │25  │"]);
         let _ = std::fs::remove_file(path);
@@ -788,20 +841,28 @@ mod tests {
         proj.update_columns_from_lines(&[br#"{"n":1}"#]);
         proj.sticky_header = true;
 
-        let win = proj.render_window(&mut buf, 1, 5, 80, None, true).unwrap();
+        let win = proj
+            .render_window(&mut buf, WindowLines::From(1), 5, 80, true)
+            .unwrap();
         assert!(win.header.is_some());
         assert_eq!(win.rows.len(), 4, "header takes one of the 5 rows");
         assert_eq!(win.bottom_line, 4);
         assert!(!win.at_eof);
 
-        let win = proj.render_window(&mut buf, 7, 5, 80, None, true).unwrap();
+        let win = proj
+            .render_window(&mut buf, WindowLines::From(7), 5, 80, true)
+            .unwrap();
         assert_eq!(win.bottom_line, 10);
         assert!(win.at_eof, "the window ends exactly at the last line");
 
-        let only_even = crate::selector::Query::parse(".n >= 9");
-        let keep = |raw: &[u8]| only_even.matches_line(raw, DetectedFormat::JsonLines);
+        let mut only_even = crate::view::ViewIndex::filtered(
+            crate::view::LineFilter::new(".n >= 9", false),
+            DetectedFormat::JsonLines,
+            Vec::new(),
+            false,
+        );
         let win = proj
-            .render_window(&mut buf, 1, 5, 80, Some(&keep), true)
+            .render_window(&mut buf, WindowLines::View(&mut only_even, 0), 5, 80, true)
             .unwrap();
         assert_eq!(win.rows.len(), 2);
         assert_eq!(win.bottom_line, 10);
@@ -810,42 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn skip_columns_keeps_escapes_and_blanks_a_cut_wide_char() {
-        assert_eq!(skip_columns("abcdef", 2), "cdef");
-        assert_eq!(skip_columns("abc", 9), "");
-        assert_eq!(skip_columns("\u{6f22}x", 1), " x");
-        assert_eq!(skip_columns("\x1b[31mabc", 1), "\x1b[31mbc");
-    }
-
-    #[test]
-    fn horizontal_scroll_keeps_pinned_columns_in_place() {
-        let mut proj = ProjectionEngine::new(DetectedFormat::JsonLines);
-        let line = br#"{"id":1,"aaaa":"wxyz","bbbb":"long-value"}"#;
-        proj.update_columns_from_lines(&[&line[..]]);
-        proj.columns[0].pinned = true;
-        let full = proj.project_line(line, 1, true)[0].clone();
-        proj.hshift = 5;
-        let shifted = proj.project_line(line, 1, true)[0].clone();
-        let pinned_cell = "1   │";
-        assert!(full.starts_with(pinned_cell), "{full}");
-        assert!(shifted.starts_with(pinned_cell), "{shifted}");
+    fn sideways_scroll_keeps_pinned_cells_in_place() {
+        assert_eq!(scroll_keeping("ab|cdefgh".to_string(), 3, 2), "ab|efgh");
+        assert_eq!(scroll_keeping("ab|cdefgh".to_string(), 0, 2), "|cdefgh");
+        assert_eq!(scroll_keeping("ab|cd".to_string(), 3, 0), "ab|cd");
+        // Escapes before the cut stay with the pinned part.
         assert_eq!(
-            &shifted[pinned_cell.len()..],
-            &full[pinned_cell.len() + 5..]
+            scroll_keeping("\x1b[1mab|cdef".to_string(), 3, 1),
+            "\x1b[1mab|def"
         );
-    }
-
-    #[test]
-    fn sort_keys_put_numbers_first_and_blanks_last() {
-        use std::cmp::Ordering;
-        let k = |s: &str| SortKey::of(s);
-        assert_eq!(SortKey::compare(&k("9"), &k("10"), false), Ordering::Less);
-        assert_eq!(SortKey::compare(&k("9"), &k("10"), true), Ordering::Greater);
-        assert_eq!(SortKey::compare(&k("10"), &k("abc"), false), Ordering::Less);
-        assert_eq!(
-            SortKey::compare(&k(""), &k("abc"), false),
-            Ordering::Greater
-        );
-        assert_eq!(SortKey::compare(&k(""), &k("abc"), true), Ordering::Greater);
     }
 }

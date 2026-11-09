@@ -4,54 +4,53 @@ use clap::Parser;
 use std::path::PathBuf;
 
 /// Interactive keys, shown after the options in `--help` and on the
-/// in-pager help page (`h`).
-const KEYS_HELP: &str = "\
-Keys (N = optional number typed first):
+/// in-pager help screen (`h`). The text is this project's own.
+pub const KEYS_HELP: &str = "\
+Moving (as in less; N is an optional count typed first):
   j k Enter Down Up      forward / backward one line (N j: N lines)
   f b Space PgDn PgUp    forward / backward one window
   d u                    half window (N d sets the default)
   g G                    first / last line (N g: line N)
-  N% Np                  N percent into the file
-  Right Left             scroll sideways half a screen (N: N columns)
+  N% Np                  N percent into the file (or the filtered view)
+  Right Left  ESC-) ESC-( scroll sideways (with -S; tables keep pinned columns)
   ESC-{ ESC-}            first column / end of the longest line
+  m<a-z>  '<a-z>  ''     set a mark, go to a mark, go back to where you were
+  F                      follow: keep reading as the file grows (any key stops)
+
+Searching and filtering:
   /pat ?pat n N          search forward / backward, repeat, repeat reversed
-  &pat &!pat &           show only matching / non-matching lines; & clears
-  m<a-z>  '<a-z>         set a mark / go to it ('' back, '^ start, '$ end)
-  -N -S -i -I            toggle line numbers, chopping, case-insensitive search
-  =  ^G  :f              file information (position, size, filter, sort)
-  F                      follow: show new input as it arrives (any key stops)
-  R                      reload the file;   r ^L  repaint
-  v                      edit the file at this line ($VISUAL, $EDITOR or vi)
-  :n :p  N:x  :e file    next / previous / Nth file, open another file
-  h                      this help;   q Q :q ZZ  quit
+  &pat                   show only lines matching pat (&!pat: hide them;
+                         empty: clear). Works on any file.
+
+Files, options, output:
+  :n :p  N:x             next / previous / Nth file (each keeps its place)
+  h                      this help
+  q Q :q ZZ              quit
+  :e file                open another file
+  = ^G :f                file information (position, size, filter, sort)
+  R  v  r ^L             reload; edit at this line ($VISUAL/$EDITOR/vi); repaint
+  :w file                save the current view (filtered / sorted) to file
+                         (:w! file overwrites)
+  -N -S -i -I            toggle line numbers, chopping, smart / full case folding
 
 Structured input (JSON lines, CSV, TSV, logfmt; detected automatically):
   c                      table view on / off
   s                      cycle the format (plain, jsonl, csv, tsv, logfmt)
   z                      expand the top JSON line
   H                      sticky header row on / off
-  x                      column mode: h/l move, p pin (stays in place when
-                         scrolling sideways), . hide, s sort asc/desc/off, q done
-  /.field OP value       selector search, also in &: OP is == != > >= < <= =~
-                         e.g. /.status >= 500   &.level == \"ERROR\"   &.ms > 250ms
-  A && B   A || B        combine selectors (&& binds tighter); .a.b reaches into
-                         nested JSON; CSV/TSV fields are named by the header row";
-
-/// The text of the in-pager help page.
-pub fn help_page() -> String {
-    format!(
-        "rless {} - help\n\n{}\n\n\
-Startup options worth knowing: -N -S -R -i -I -F -X -m -M, -p PATTERN,\n\
---filter EXPR, and +cmd (e.g. +G, +/error, +150). See rless --help.\n",
-        env!("CARGO_PKG_VERSION"),
-        KEYS_HELP
-    )
-}
+  x                      column mode: h/l move, p pin, . hide,
+                         s sort (ascending, descending, off), i statistics, q done
+  /expr  &expr           selector search and filter:
+     .field OP value     OP is == != > >= < <= =~ (regex)
+     .a.b                nested JSON field; a bare path tests that it exists
+     && || ! ( )         combine: &.level == \"ERROR\" && .ms > 250ms
+                         values: \"text\", 42, 1.5s, 250ms, true, false, null";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rless",
-    about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668",
+    about = "A clean-room Rust reimplementation of the core-pager subset of GNU less 668, \
+             with structured-log views",
     after_help = KEYS_HELP
 )]
 struct Cli {
@@ -95,23 +94,20 @@ struct Cli {
     #[arg(short = 'I', long = "IGNORE-CASE")]
     ignore_case_always: bool,
 
-    /// Print the input and exit if it fits on one screen (no pager needed).
+    /// Quit at once (printing the input) if it fits on one screen.
     #[arg(short = 'F', long = "quit-if-one-screen")]
     quit_if_one_screen: bool,
 
-    /// Do not use the alternate screen: the last page stays in the terminal after quitting.
+    /// Do not use the alternate screen: the last page stays visible after quitting.
     #[arg(short = 'X', long = "no-init")]
     no_init: bool,
 
-    /// Start at the first line matching PATTERN (same as +/PATTERN).
+    /// Start at the first line matching PATTERN (like +/PATTERN).
     #[arg(short = 'p', long = "pattern", value_name = "PATTERN")]
     pattern: Option<String>,
 
-    /// Show only the lines matching EXPR (same as typing &EXPR at startup).
-    #[arg(long = "filter", value_name = "EXPR")]
-    filter: Option<String>,
-
-    /// Input files. When empty, input is read from stdin.
+    /// Input files, read from stdin when empty. An argument +CMD runs CMD at
+    /// startup: +G (end), +50 (line 50), +/pat, +?pat, +&pat (filter), +F (follow).
     files: Vec<PathBuf>,
 }
 
@@ -129,21 +125,18 @@ pub enum BellMode {
     VeryQuiet,
 }
 
-/// How `/`, `?` and `&` patterns treat letter case (`-i`, `-I`, or the
-/// `-i`/`-I` toggles typed inside the pager).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Case folding for searches and filters (`-i`, `-I`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseMode {
-    #[default]
     Sensitive,
-    /// `-i`: ignore case unless the pattern contains an uppercase letter.
+    /// `-i`: fold case unless the pattern contains an uppercase letter.
     Smart,
-    /// `-I`: always ignore case.
+    /// `-I`: always fold case.
     Always,
 }
 
 impl CaseMode {
-    /// Whether `pattern` should be matched case-insensitively.
-    pub fn ignores_case(self, pattern: &str) -> bool {
+    pub fn folds(self, pattern: &str) -> bool {
         match self {
             CaseMode::Sensitive => false,
             CaseMode::Smart => !pattern.chars().any(char::is_uppercase),
@@ -162,15 +155,15 @@ pub struct Options {
     pub case: CaseMode,
     pub quit_if_one_screen: bool,
     pub no_init: bool,
-    /// Commands run, in order, once the first file is shown (`+cmd`,
-    /// `-p`, `--filter`), as the keys a user would type. A command left
-    /// waiting for input (`/err`) is submitted as if Enter followed.
+    /// Commands run before the first screen (`+CMD`, `-p`), in order.
     pub initial_commands: Vec<String>,
     pub files: Vec<PathBuf>,
 }
 
-impl Default for Options {
-    fn default() -> Self {
+impl Options {
+    /// Defaults for everything (no flags, no files): what tests start from.
+    #[cfg(test)]
+    pub fn for_files(files: Vec<PathBuf>) -> Options {
         Options {
             line_numbers: false,
             chop_long_lines: false,
@@ -181,28 +174,45 @@ impl Default for Options {
             quit_if_one_screen: false,
             no_init: false,
             initial_commands: Vec::new(),
-            files: Vec::new(),
+            files,
         }
     }
 }
 
-/// Splits `+cmd` arguments (less's initial commands, e.g. `+G`, `+/error`,
-/// `+150`) out of argv before clap sees them: clap would otherwise take
-/// them for file names. A lone `+` and everything after `--` are left
-/// alone. A purely numeric command means "go to that line" (`+150` is
-/// `150g`), the common `vi +N` habit.
+/// Single-letter flags rless understands, as they may appear in `LESS`.
+const ENV_FLAGS: &str = "NnSRmMqQiIFX";
+
+/// The flags of a `LESS` value rless supports, as one `-...` argument.
+/// Anything else (options rless lacks, option values such as `-x4`, long
+/// options) is skipped, so a `LESS` written for GNU less never makes rless
+/// refuse to start.
+pub fn flags_from_less_env(value: &str) -> Option<String> {
+    let mut flags = String::new();
+    for token in value.split_whitespace() {
+        if token.starts_with("--") || token.starts_with('+') {
+            continue;
+        }
+        for c in token.trim_start_matches('-').chars() {
+            if ENV_FLAGS.contains(c) {
+                flags.push(c);
+            } else {
+                // Unknown flag: what follows may be its value.
+                break;
+            }
+        }
+    }
+    (!flags.is_empty()).then(|| format!("-{flags}"))
+}
+
+/// Splits `+CMD` arguments off argv (they are commands, not file names);
+/// everything after `--` is left alone.
 fn split_plus_commands(args: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut rest = Vec::with_capacity(args.len());
+    let mut rest = Vec::new();
     let mut commands = Vec::new();
     let mut after_dashdash = false;
     for (i, arg) in args.into_iter().enumerate() {
         if i > 0 && !after_dashdash && arg.len() > 1 && arg.starts_with('+') {
-            let cmd = &arg[1..];
-            if cmd.chars().all(|c| c.is_ascii_digit()) {
-                commands.push(format!("{cmd}g"));
-            } else {
-                commands.push(cmd.to_string());
-            }
+            commands.push(arg[1..].to_string());
             continue;
         }
         if arg == "--" {
@@ -214,25 +224,20 @@ fn split_plus_commands(args: Vec<String>) -> (Vec<String>, Vec<String>) {
 }
 
 pub fn parse() -> Options {
-    parse_from(std::env::args().collect())
+    let mut args: Vec<String> = std::env::args().collect();
+    if let Some(flags) = std::env::var("LESS")
+        .ok()
+        .as_deref()
+        .and_then(flags_from_less_env)
+    {
+        args.insert(1.min(args.len()), flags);
+    }
+    parse_from(args)
 }
 
 fn parse_from(args: Vec<String>) -> Options {
     let (args, mut initial_commands) = split_plus_commands(args);
     let cli = Cli::parse_from(args);
-    if let Some(p) = &cli.pattern {
-        initial_commands.push(format!("/{p}"));
-    }
-    if let Some(f) = &cli.filter {
-        initial_commands.push(format!("&{f}"));
-    }
-    let case = if cli.ignore_case_always {
-        CaseMode::Always
-    } else if cli.ignore_case_smart {
-        CaseMode::Smart
-    } else {
-        CaseMode::Sensitive
-    };
     let prompt_mode = if cli.long_prompt {
         PromptMode::Long
     } else if cli.medium_prompt {
@@ -247,6 +252,16 @@ fn parse_from(args: Vec<String>) -> Options {
     } else {
         BellMode::Normal
     };
+    let case = if cli.ignore_case_always {
+        CaseMode::Always
+    } else if cli.ignore_case_smart {
+        CaseMode::Smart
+    } else {
+        CaseMode::Sensitive
+    };
+    if let Some(p) = cli.pattern {
+        initial_commands.insert(0, format!("/{p}"));
+    }
     Options {
         line_numbers: cli.line_numbers_on && !cli.line_numbers_off,
         chop_long_lines: cli.chop_long_lines,
@@ -265,50 +280,44 @@ fn parse_from(args: Vec<String>) -> Options {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
     }
 
     #[test]
-    fn plus_commands_are_split_from_file_names() {
-        let o = parse_from(args(&["rless", "+G", "a.txt", "+/err", "+150", "b.txt"]));
-        assert_eq!(o.initial_commands, vec!["G", "/err", "150g"]);
+    fn less_env_keeps_only_supported_flags() {
+        assert_eq!(flags_from_less_env("-FRX").as_deref(), Some("-FRX"));
+        assert_eq!(flags_from_less_env("FRSX").as_deref(), Some("-FRSX"));
+        // -x4 has a value; -j is unknown; long options are skipped.
+        assert_eq!(
+            flags_from_less_env("-R -x4 -j5 --mouse -i").as_deref(),
+            Some("-Ri")
+        );
+        assert_eq!(flags_from_less_env("-Rx4S").as_deref(), Some("-R"));
+        assert_eq!(flags_from_less_env("--use-color"), None);
+        assert_eq!(flags_from_less_env(""), None);
+    }
+
+    #[test]
+    fn plus_commands_and_pattern_become_initial_commands() {
+        let o = parse_from(argv("rless +G -i a.log +/ERROR -p start b.log -- +literal"));
+        assert_eq!(o.initial_commands, ["/start", "G", "/ERROR"]);
+        assert_eq!(o.case, CaseMode::Smart);
         assert_eq!(
             o.files,
-            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+            [
+                PathBuf::from("a.log"),
+                PathBuf::from("b.log"),
+                PathBuf::from("+literal")
+            ]
         );
     }
 
     #[test]
-    fn plus_after_double_dash_is_a_file_name() {
-        let o = parse_from(args(&["rless", "--", "+notcmd"]));
-        assert!(o.initial_commands.is_empty());
-        assert_eq!(o.files, vec![PathBuf::from("+notcmd")]);
-    }
-
-    #[test]
-    fn pattern_and_filter_become_initial_commands_after_plus_commands() {
-        let o = parse_from(args(&[
-            "rless", "-p", "ERROR", "--filter", ".ms > 5", "+G", "f",
-        ]));
-        assert_eq!(o.initial_commands, vec!["G", "/ERROR", "&.ms > 5"]);
-    }
-
-    #[test]
-    fn case_flags_pick_the_strongest_mode() {
-        assert_eq!(parse_from(args(&["rless", "-i"])).case, CaseMode::Smart);
-        assert_eq!(
-            parse_from(args(&["rless", "-i", "-I"])).case,
-            CaseMode::Always
-        );
-        assert_eq!(parse_from(args(&["rless"])).case, CaseMode::Sensitive);
-    }
-
-    #[test]
-    fn smart_case_respects_uppercase_in_the_pattern() {
-        assert!(CaseMode::Smart.ignores_case("error"));
-        assert!(!CaseMode::Smart.ignores_case("Error"));
-        assert!(CaseMode::Always.ignores_case("Error"));
-        assert!(!CaseMode::Sensitive.ignores_case("error"));
+    fn smart_case_folds_only_lowercase_patterns() {
+        assert!(CaseMode::Smart.folds("error"));
+        assert!(!CaseMode::Smart.folds("Error"));
+        assert!(CaseMode::Always.folds("Error"));
+        assert!(!CaseMode::Sensitive.folds("error"));
     }
 }

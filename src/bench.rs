@@ -98,10 +98,7 @@ fn run(name: &str, iters: usize, mut f: impl FnMut()) {
 }
 
 fn opts(files: Vec<PathBuf>) -> Options {
-    Options {
-        files,
-        ..Options::default()
-    }
+    Options::for_files(files)
 }
 
 /// Counts `write` calls reaching the underlying sink, as a stand-in for
@@ -145,7 +142,7 @@ fn bench_render_window_plain() {
         line_numbers: true,
         chop: false,
         raw_ansi: false,
-        hshift: 0,
+        hscroll: 0,
     };
     let mut top = 1;
     run("render_window_plain_x1000", 20, || {
@@ -171,7 +168,7 @@ fn bench_render_window_huge_single_line() {
         line_numbers: false,
         chop: false,
         raw_ansi: false,
-        hshift: 0,
+        hscroll: 0,
     };
     run("render_window_4mb_line", 10, || {
         let w = screen::render_window(&mut b, 1, 23, &o, None).unwrap();

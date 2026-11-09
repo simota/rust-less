@@ -1,73 +1,92 @@
 # rless
 
-A clean-room Rust pager. Its core reproduces GNU less 668 cell for cell
-(40/40 captured parity scenarios, `make parity`); on top of that it reads
-structured logs and tables (JSON lines, CSV, TSV, logfmt) as tables you can
-filter, search by field, sort and scroll sideways.
+A terminal pager for logs and data, in Rust. Its core is a clean-room clone of
+GNU less 668 (checked byte for byte against captured less screens with
+`make parity`); on top of that it reads JSON lines, CSV, TSV and logfmt as
+tables you can filter, sort and summarise, and it follows growing files and
+pipes.
 
 ```sh
 make release            # target/release/rless
-make install            # into ~/.cargo/bin
+make install            # ~/.cargo/bin/rless
 ```
 
 ## Everyday use
 
 ```sh
-rless app.log                       # page a file
-kubectl logs -f api | rless         # page a pipe; press F to follow it live
-rless +G app.log                    # start at the end (+/err, +150 work too)
-rless -p 'panic|fatal' app.log      # start at the first match
-rless -i app.log                    # searches ignore case unless they have capitals
-rless --filter '.status >= 500' access.jsonl   # open already filtered
-git log | rless -FX                 # print and exit if it fits one screen
+rless app.log                     # page a file (or several: :n / :p)
+kubectl logs -f api | rless       # page a pipe; F follows it
+rless +F /var/log/app.log         # start following (like tail -f)
+rless -p 'request 42' app.log     # start at the first match (+/pat, +G, +120 too)
+rless -iS app.log                 # smart-case search, chop long lines
+git config --global core.pager 'rless -FRX'   # rless as git's pager
 ```
 
-Press `h` inside the pager for the full key list. The keys less users
-expect work as in less: `j k f b d u g G / ? n N :n :p q`.
+When stdout is not a terminal, rless copies its input through like `cat`.
+Flags it understands are also taken from `$LESS` (others are ignored).
 
-| Task | Keys |
+## Narrowing a log down
+
+| Keys | What it does |
 |---|---|
-| Show only matching lines / hide matching lines / clear | `&pattern` / `&!pattern` / `&` |
-| Follow a growing file or a still-open pipe | `F` (any key stops) |
-| Set a mark / go back to it / back to before the last jump | `ma` / `'a` / `''` |
-| Jump to a percentage | `50%` or `50p` |
-| Scroll long lines sideways (best with `-S`) | `Right` / `Left`, `ESC-{` / `ESC-}` |
-| Toggle line numbers, chopping, case-insensitive search | `-N`, `-S`, `-i`, `-I` |
-| Where am I (lines, bytes, %, filter, sort) | `=` or `^G` |
-| Re-read a file that changed / open it in `$EDITOR` | `R` / `v` |
-| Open another file / go to the Nth file | `:e path` / `N:x` |
+| `/pat` `?pat` `n` `N` | search forward / backward, repeat |
+| `&ERROR` | show only matching lines (any file) |
+| `&!DEBUG` | hide matching lines |
+| `&` + Enter | clear the filter |
+| `F` | follow: keep reading as the input grows (any key stops); a filter stays live |
+| `:w file` / `:w! file` | save what the view shows (filtered, sorted) to a file |
 
-Each file remembers its own position, filter and table settings when you
-switch away with `:n`/`:p` and come back.
+While a filter or sort is active the prompt says so, e.g. `[&ERROR, 42 lines]`,
+and every movement key moves over the lines shown, never hidden ones.
 
-## Structured input
+## Structured logs and tables
 
-JSON lines, CSV, TSV and logfmt are detected from the first lines (`s`
-cycles the format if detection guessed wrong).
+The format is detected from the first lines (`s` cycles it by hand).
 
-| Task | Keys |
+| Keys | What it does |
 |---|---|
-| Table view / sticky header row | `c` / `H` |
-| Expand the JSON line at the top | `z` |
-| Column mode: move, pin, hide, sort asc → desc → off | `x`, then `h l`, `p`, `.`, `s`; `q` leaves |
-| Search or filter by field | `/.status >= 500`, `&.level == "ERROR"`, `&.ms > 250ms` |
-| Combine conditions | `&.level == "ERROR" && .ms > 250 \|\| .status >= 500` |
-| Nested JSON fields / CSV columns by header name | `&.user.id == 42` / `&.status >= 500` |
+| `c` | table view; `H` sticky header; `z` expand a JSON line |
+| `x` | column mode: `h`/`l` move, `p` pin, `.` hide, `s` sort (asc, desc, off), `i` statistics |
+| `Right` `Left` | scroll a wide table (or a `-S` view) sideways |
 
-Operators: `== != > >= < <= =~` (`=~` is "contains"). Durations (`250ms`,
-`2s`, `1m`, `1h`) compare as milliseconds. A pinned column stays in place
-while the rest of the table scrolls sideways. Sorting builds a sorted
-snapshot of the whole input (a CSV header row stays on top); `F` and `R`
-return to file order.
+Selector queries work in `/` and `&` on structured files:
 
-## Verification
+```text
+&.status >= 500
+&.level == "ERROR" && .service != "auth"
+&.ms > 250ms || .dur >= 1.5s
+&.user.id == 7                 nested JSON
+&!.trace_id                    field missing (a bare path tests that it exists)
+&.msg =~ "timeout|refused"     regex on the value
+&(.level == "WARN" || .level == "ERROR") && .ts >= "2026-08-23T00:30"
+```
 
-* `make check` — rustfmt, clippy (warnings are errors), unit and
-  integration tests, scenario validation.
-* `make parity` — replays 40 scenarios in tmux and diffs every captured
-  cell grid against the GNU less 668 baseline. This is the gate for the
-  less-compatible core and must stay 40/40.
-* The features beyond that core (everything in the tables above that less
-  also has, and all structured views) have no less baseline in
-  `parity/baseline/`; they are covered by tests in `src/` and were checked
-  by hand in tmux. See `docs/RECONSTRUCTION_SPEC.md` for the parity scope.
+Anything that is not a selector is a regular expression, as in less.
+
+## More keys
+
+`m a` / `' a` set and jump to a mark, `''` returns to where the last jump
+started; `50%` goes halfway; `-N` `-S` `-i` `-I` toggle options inside the
+pager; `h` shows every key. `rless --help` lists the options and keys.
+
+| Keys | What it does |
+|---|---|
+| `=` (`^G`, `:f`) | where you are: lines, bytes, percent, format, filter, sort |
+| `R` / `v` | read a changed file again / edit it at this line in `$VISUAL`, `$EDITOR` or `vi` |
+| `:e file` / `N:x` | open another file / go to the Nth file |
+| `ESC-{` / `ESC-}` | first column / end of the longest line |
+
+Each file keeps its place, format, table and sort when you switch away with
+`:n`/`:p` and come back. In the table view, pinned columns (`x`, `p`) stay in
+place while the rest scrolls sideways.
+
+## Development
+
+```sh
+make check      # fmt, clippy -D warnings, tests, scenario validation
+make parity     # 40 screen scenarios against captured GNU less output (needs tmux)
+make probe      # scripted end-to-end tasks, docs/fvi (needs tmux)
+make bench      # opt-in hot-path benchmarks
+```
+
+Design notes, the parity contract and quality reports live in `docs/`.

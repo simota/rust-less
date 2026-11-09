@@ -1,7 +1,21 @@
-//! JQ-style polymorphic dot-selector bytecode compiler and evaluator.
+//! Dot-selector query language for the `/` (search) and `&` (filter)
+//! prompts on structured input, with a plain-regex fallback.
 //!
-//! Enables zero-copy queries directly in `/` (search) and `&` (filter) prompts:
-//! e.g., `/.status >= 500`, `&.level == "error"`, `&dur > 500ms`, `/.user.id != null`.
+//! Grammar (whitespace is free between tokens):
+//!
+//! ```text
+//! expr   := and ( "||" and )*
+//! and    := unary ( "&&" unary )*
+//! unary  := "!" unary | "(" expr ")" | atom
+//! atom   := path [ OP value ]          -- a bare path tests that the field exists
+//! path   := ("." | "@") name ( "." name )*   -- nested JSON objects: .user.id
+//! OP     := == != > >= < <= =~        -- =~ is a regex match on the value
+//! value  := "string" | number | duration (250ms 2s 1m 1h 1.5s) | true | false | null | bare
+//! ```
+//!
+//! e.g. `/.status >= 500`, `&.level == "error" && .service != "auth"`,
+//! `&.ms > 250ms || .status >= 500`, `&!.user.id`, `&.msg =~ "timeout|refused"`.
+//! Anything that does not parse as such an expression is a plain regex.
 
 use crate::simd::{FieldSpan, FieldType, StructuralClassifier};
 use crate::sniffer::DetectedFormat;
@@ -14,7 +28,8 @@ pub enum Operator {
     GreaterThanOrEqual,
     LessThan,
     LessThanOrEqual,
-    Contains,
+    /// `=~`: the value matches a regex.
+    Matches,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,62 +38,81 @@ pub enum Operand {
     Number(f64),
     Boolean(bool),
     Null,
-    DurationMillis(u64),
+    DurationMillis(f64),
+    /// `=~` operand, compiled once at parse time.
+    Regex(RegexQuery),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectorPredicate {
+    /// Dotted field path without the leading `.`/`@` (`user.id`).
     pub field_path: String,
     pub op: Operator,
     pub operand: Operand,
 }
 
+/// A boolean combination of field predicates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Pred(SelectorPredicate),
+    /// A bare path: true when the field is present and not `null`.
+    Exists(String),
+    Not(Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     Regex(RegexQuery),
-    /// Alternatives joined by `||`, each a list of predicates joined by
-    /// `&&`: a line matches when every predicate of any one group holds.
-    Structured(Vec<Vec<SelectorPredicate>>),
+    Structured(Expr),
 }
 
 /// A plain-regex query: the source pattern plus its compiled form, built
 /// lazily on first use and then reused for every line it is matched against
 /// (a filter is evaluated per line on every redraw, so recompiling per line
 /// dominated filtered draws). An invalid pattern caches `None` and matches
-/// nothing, exactly as before.
+/// nothing.
 #[derive(Debug, Clone)]
 pub struct RegexQuery {
     pub source: String,
-    ignore_case: bool,
+    case_insensitive: bool,
     compiled: std::cell::OnceCell<Option<regex::Regex>>,
 }
 
 impl RegexQuery {
-    pub fn new(source: String, ignore_case: bool) -> Self {
+    pub fn with_case(source: String, case_insensitive: bool) -> Self {
         RegexQuery {
             source,
-            ignore_case,
+            case_insensitive,
             compiled: std::cell::OnceCell::new(),
         }
     }
 
-    fn regex(&self) -> Option<&regex::Regex> {
+    pub fn regex(&self) -> Option<&regex::Regex> {
         self.compiled
             .get_or_init(|| {
                 regex::RegexBuilder::new(&self.source)
-                    .case_insensitive(self.ignore_case)
+                    .case_insensitive(self.case_insensitive)
                     .build()
                     .ok()
             })
             .as_ref()
     }
+
+    pub fn is_match_bytes(&self, line: &[u8]) -> bool {
+        match (self.regex(), std::str::from_utf8(line)) {
+            (Some(re), Ok(s)) => re.is_match(s),
+            _ => false,
+        }
+    }
 }
 
-/// Equality is defined by the source pattern and case rule alone; the
+/// Equality is defined by the source pattern and case mode alone; the
 /// compiled cache is derived state.
 impl PartialEq for RegexQuery {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source && self.ignore_case == other.ignore_case
+        self.source == other.source && self.case_insensitive == other.case_insensitive
     }
 }
 
@@ -88,105 +122,219 @@ thread_local! {
     static SPAN_SCRATCH: std::cell::RefCell<Vec<FieldSpan>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Maps a field name to its position for formats whose fields are
-/// positional (CSV/TSV: the header row names the columns).
-pub type ColumnLookup<'a> = &'a dyn Fn(&str) -> Option<usize>;
-
-#[cfg(test)]
-fn no_columns(_: &str) -> Option<usize> {
-    None
-}
-
 impl Query {
-    /// Parses a raw search or filter prompt string into either a JQ
-    /// dot-selector Query or a plain (case-sensitive) regex.
+    /// Parses a raw search or filter prompt string into either a selector
+    /// expression or a plain (case-sensitive) regex.
+    #[cfg(test)]
     pub fn parse(input: &str) -> Self {
         Self::parse_with_case(input, false)
     }
 
-    /// Like `parse`; a plain-regex query ignores letter case when
-    /// `ignore_case` is set (`-i`/`-I`).
-    pub fn parse_with_case(input: &str, ignore_case: bool) -> Self {
+    /// As `parse`; a regex (the fallback, or an `=~` operand) folds case
+    /// when `case_insensitive`.
+    pub fn parse_with_case(input: &str, case_insensitive: bool) -> Self {
         let trimmed = input.trim();
         let body = trimmed
             .trim_start_matches('/')
             .trim_start_matches('&')
             .trim();
-        if let Some(groups) = parse_predicate_groups(body) {
-            return Query::Structured(groups);
+        if let Some(expr) = parse_expression(body, case_insensitive) {
+            return Query::Structured(expr);
         }
-        Query::Regex(RegexQuery::new(input.to_string(), ignore_case))
-    }
-
-    /// `input` as a plain regex, even when it looks like a selector (on
-    /// plain text, `.status >= 500` is text to find, as in less).
-    pub fn regex(input: &str, ignore_case: bool) -> Self {
-        Query::Regex(RegexQuery::new(input.to_string(), ignore_case))
-    }
-
-    /// False for a plain-regex query whose pattern does not compile (such a
-    /// query matches nothing, so applying it as a filter would blank the
-    /// view without saying why).
-    pub fn is_valid(&self) -> bool {
-        match self {
-            Query::Regex(q) => q.regex().is_some(),
-            Query::Structured(_) => true,
-        }
+        Query::Regex(RegexQuery::with_case(input.to_string(), case_insensitive))
     }
 
     /// Evaluates the query against a raw line and its format.
     #[cfg(test)]
     pub fn matches_line(&self, line: &[u8], format: DetectedFormat) -> bool {
-        self.matches_line_with(line, format, &no_columns)
+        self.matches_fields(line, format, &[])
     }
 
-    /// `matches_line`, resolving CSV/TSV field names through `columns`
-    /// (those formats have no keys in the line itself).
-    pub fn matches_line_with(
-        &self,
-        line: &[u8],
-        format: DetectedFormat,
-        columns: ColumnLookup,
-    ) -> bool {
+    /// As `matches_line`; `columns` names the positional fields of a
+    /// CSV/TSV line (its header row), so `.score > 90` works there too.
+    pub fn matches_fields(&self, line: &[u8], format: DetectedFormat, columns: &[String]) -> bool {
         match self {
-            Query::Regex(q) => {
-                if let Some(re) = q.regex()
-                    && let Ok(s) = std::str::from_utf8(line)
-                {
-                    return re.is_match(s);
-                }
-                false
-            }
-            Query::Structured(groups) => {
+            Query::Regex(q) => q.is_match_bytes(line),
+            Query::Structured(expr) => {
                 if !format.is_structured() {
                     return false;
                 }
                 SPAN_SCRATCH.with(|scratch| {
                     let spans = &mut *scratch.borrow_mut();
                     StructuralClassifier::scan_fields(format, line, spans);
-                    groups.iter().any(|preds| {
-                        preds
-                            .iter()
-                            .all(|pred| evaluate_predicate(pred, line, spans, format, columns))
-                    })
+                    let ctx = Fields { format, columns };
+                    evaluate(expr, line, spans, &ctx)
                 })
             }
         }
     }
 }
 
-/// Splits `s` on the two-character `sep` wherever it is outside a quoted
-/// string.
-fn split_unquoted<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+// ------------------------------------------------------------------ parser
+
+struct Parser<'a> {
+    s: &'a str,
+    pos: usize,
+    case_insensitive: bool,
+}
+
+/// Parses `body` as a complete selector expression, or `None` when it is
+/// not one (the caller then treats the input as a regex).
+fn parse_expression(body: &str, case_insensitive: bool) -> Option<Expr> {
+    let first = body.chars().next()?;
+    // Only inputs that start like a selector are tried: a regex such as
+    // `ERROR|WARN` must never be reinterpreted.
+    if !matches!(first, '.' | '@' | '!' | '(') && !body.starts_with("dur") {
+        return None;
+    }
+    let mut p = Parser {
+        s: body,
+        pos: 0,
+        case_insensitive,
+    };
+    let expr = p.parse_or()?;
+    p.skip_ws();
+    (p.pos == p.s.len()).then_some(expr)
+}
+
+impl Parser<'_> {
+    fn rest(&self) -> &str {
+        &self.s[self.pos..]
+    }
+
+    fn skip_ws(&mut self) {
+        let trimmed = self.rest().trim_start();
+        self.pos = self.s.len() - trimmed.len();
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        self.skip_ws();
+        if self.rest().starts_with(token) {
+            self.pos += token.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_or(&mut self) -> Option<Expr> {
+        let mut terms = vec![self.parse_and()?];
+        while self.eat("||") {
+            terms.push(self.parse_and()?);
+        }
+        Some(if terms.len() == 1 {
+            terms.pop().expect("one term")
+        } else {
+            Expr::Or(terms)
+        })
+    }
+
+    fn parse_and(&mut self) -> Option<Expr> {
+        let mut terms = vec![self.parse_unary()?];
+        while self.eat("&&") {
+            terms.push(self.parse_unary()?);
+        }
+        Some(if terms.len() == 1 {
+            terms.pop().expect("one term")
+        } else {
+            Expr::And(terms)
+        })
+    }
+
+    fn parse_unary(&mut self) -> Option<Expr> {
+        self.skip_ws();
+        if self.rest().starts_with('!') && !self.rest().starts_with("!=") {
+            self.pos += 1;
+            return Some(Expr::Not(Box::new(self.parse_unary()?)));
+        }
+        if self.eat("(") {
+            let inner = self.parse_or()?;
+            return self.eat(")").then_some(inner);
+        }
+        self.parse_atom()
+    }
+
+    /// One predicate: the text up to the next top-level `&&`, `||` or `)`,
+    /// quotes respected.
+    fn parse_atom(&mut self) -> Option<Expr> {
+        self.skip_ws();
+        let rest = self.rest();
+        let bytes = rest.as_bytes();
+        let mut in_quote = false;
+        let mut escaped = false;
+        let mut end = bytes.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_quote {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_quote = false;
+                }
+            } else if b == b'"' {
+                in_quote = true;
+            } else if b == b')' || rest[i..].starts_with("&&") || rest[i..].starts_with("||") {
+                end = i;
+                break;
+            }
+            i += 1;
+        }
+        let text = rest[..end].trim();
+        let expr = parse_atom_text(text, self.case_insensitive)?;
+        self.pos += end;
+        Some(expr)
+    }
+}
+
+fn parse_atom_text(text: &str, case_insensitive: bool) -> Option<Expr> {
+    if !(text.starts_with('.') || text.starts_with('@') || text.starts_with("dur")) {
+        return None;
+    }
+    match find_operator(text) {
+        Some((idx, len, op)) => {
+            let field_path = normalize_path(text[..idx].trim())?;
+            let raw_val = text[idx + len..].trim();
+            let operand = if op == Operator::Matches {
+                let src = unquote(raw_val).unwrap_or(raw_val).to_string();
+                let re = RegexQuery::with_case(src, case_insensitive);
+                re.regex()?;
+                Operand::Regex(re)
+            } else {
+                parse_operand(raw_val)?
+            };
+            Some(Expr::Pred(SelectorPredicate {
+                field_path,
+                op,
+                operand,
+            }))
+        }
+        None => Some(Expr::Exists(normalize_path(text)?)),
+    }
+}
+
+/// `.user.id` / `@user.id` / `dur` → `user.id`; `None` unless every
+/// segment is a plain name (so a regex like `.*error` is not a path).
+fn normalize_path(raw: &str) -> Option<String> {
+    let path = raw.trim_start_matches('.').trim_start_matches('@');
+    let valid = !path.is_empty()
+        && path.split('.').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '$' | ':'))
+        });
+    valid.then(|| path.to_string())
+}
+
+/// The first comparison operator outside quotes: `(index, length, op)`.
+fn find_operator(s: &str) -> Option<(usize, usize, Operator)> {
     let bytes = s.as_bytes();
-    let sep = sep.as_bytes();
-    let mut parts = Vec::new();
     let mut in_quote = false;
     let mut escaped = false;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
+    for (i, &b) in bytes.iter().enumerate() {
         if in_quote {
             if escaped {
                 escaped = false;
@@ -195,299 +343,222 @@ fn split_unquoted<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
             } else if b == b'"' {
                 in_quote = false;
             }
-        } else if b == b'"' {
+            continue;
+        }
+        if b == b'"' {
             in_quote = true;
-        } else if bytes[i..].starts_with(sep) {
-            parts.push(&s[start..i]);
-            i += sep.len();
-            start = i;
             continue;
         }
-        i += 1;
+        let two = s.get(i..i + 2).unwrap_or("");
+        let op = match two {
+            ">=" => Some(Operator::GreaterThanOrEqual),
+            "<=" => Some(Operator::LessThanOrEqual),
+            "==" => Some(Operator::Equal),
+            "!=" => Some(Operator::NotEqual),
+            "=~" => Some(Operator::Matches),
+            _ => None,
+        };
+        if let Some(op) = op {
+            return Some((i, 2, op));
+        }
+        match b {
+            b'>' => return Some((i, 1, Operator::GreaterThan)),
+            b'<' => return Some((i, 1, Operator::LessThan)),
+            _ => {}
+        }
     }
-    parts.push(&s[start..]);
-    parts
+    None
 }
 
-/// `.a == 1 && .b > 2 || .c == "x"`: `&&` binds tighter than `||`. Every
-/// operand must be a field predicate, or the whole input is not a selector
-/// (it is then searched as a regex, as in less).
-fn parse_predicate_groups(body: &str) -> Option<Vec<Vec<SelectorPredicate>>> {
-    let looks_like_selector =
-        |p: &str| p.starts_with('.') || p.starts_with('@') || p.starts_with("dur");
-    let mut groups = Vec::new();
-    for alt in split_unquoted(body, "||") {
-        let mut group = Vec::new();
-        for part in split_unquoted(alt, "&&") {
-            let part = part.trim();
-            if !looks_like_selector(part) {
-                return None;
-            }
-            group.push(parse_single_predicate(part)?);
-        }
-        groups.push(group);
-    }
-    Some(groups)
-}
-
-fn parse_single_predicate(s: &str) -> Option<SelectorPredicate> {
-    let s = s.trim();
-
-    let mut in_quote = false;
-    let mut escaped = false;
-    let mut found_op: Option<(usize, usize, Operator)> = None;
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
-        if b == b'"' && !escaped {
-            in_quote = !in_quote;
-        } else if b == b'\\' && in_quote {
-            escaped = !escaped;
-            i += 1;
-            continue;
-        }
-
-        if escaped {
-            escaped = false;
-        }
-
-        if !in_quote {
-            // Check 2-char operators first
-            if i + 1 < len {
-                let two = &s[i..i + 2];
-                let op = match two {
-                    ">=" => Some(Operator::GreaterThanOrEqual),
-                    "<=" => Some(Operator::LessThanOrEqual),
-                    "==" => Some(Operator::Equal),
-                    "!=" => Some(Operator::NotEqual),
-                    "=~" => Some(Operator::Contains),
-                    _ => None,
-                };
-                if let Some(op) = op {
-                    found_op = Some((i, 2, op));
-                    break;
-                }
-            }
-
-            // Check 1-char operators
-            let one = match b {
-                b'>' => Some(Operator::GreaterThan),
-                b'<' => Some(Operator::LessThan),
-                _ => None,
-            };
-            if let Some(op) = one {
-                found_op = Some((i, 1, op));
-                break;
-            }
-        }
-        i += 1;
-    }
-
-    let (op_idx, op_len, op) = found_op?;
-    let raw_field = s[..op_idx].trim();
-    let raw_val = s[op_idx + op_len..].trim();
-
-    let field_path = raw_field
-        .trim_start_matches('.')
-        .trim_start_matches('@')
-        .to_string();
-    let operand = parse_operand(raw_val)?;
-
-    Some(SelectorPredicate {
-        field_path,
-        op,
-        operand,
-    })
+fn unquote(s: &str) -> Option<&str> {
+    (s.len() >= 2 && s.starts_with('"') && s.ends_with('"')).then(|| &s[1..s.len() - 1])
 }
 
 fn parse_operand(s: &str) -> Option<Operand> {
     let s = s.trim();
-    if s == "null" {
-        return Some(Operand::Null);
+    if s.is_empty() {
+        return None;
     }
-    if s == "true" {
-        return Some(Operand::Boolean(true));
+    match s {
+        "null" => return Some(Operand::Null),
+        "true" => return Some(Operand::Boolean(true)),
+        "false" => return Some(Operand::Boolean(false)),
+        _ => {}
     }
-    if s == "false" {
-        return Some(Operand::Boolean(false));
+    if let Some(inner) = unquote(s) {
+        return Some(Operand::String(inner.replace("\\\"", "\"")));
     }
-
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        return Some(Operand::String(s[1..s.len() - 1].to_string()));
-    }
-
-    // Check duration literals: e.g. 500ms, 2s, 1m, 1h
-    if let Some(ms) = parse_duration_literal(s) {
+    if let Some(ms) = parse_duration_millis(s) {
         return Some(Operand::DurationMillis(ms));
     }
-
-    // Try float/integer
     if let Ok(num) = s.parse::<f64>() {
         return Some(Operand::Number(num));
     }
-
     // Bare string literal fallback
     Some(Operand::String(s.to_string()))
 }
 
-fn parse_duration_literal(s: &str) -> Option<u64> {
-    if let Some(stripped) = s.strip_suffix("ms") {
-        let num = stripped.parse::<u64>().ok()?;
-        Some(num)
-    } else if let Some(stripped) = s.strip_suffix('s') {
-        let num = stripped.parse::<u64>().ok()?;
-        Some(num * 1000)
-    } else if let Some(stripped) = s.strip_suffix('m') {
-        let num = stripped.parse::<u64>().ok()?;
-        Some(num * 60 * 1000)
-    } else if let Some(stripped) = s.strip_suffix('h') {
-        let num = stripped.parse::<u64>().ok()?;
-        Some(num * 3600 * 1000)
+/// `250ms`, `2s`, `1.5s`, `1m`, `1h`, `300us` → milliseconds. A bare
+/// number is not a duration here (see `value_as_millis`).
+pub fn parse_duration_millis(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (num, factor) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix("us").or_else(|| s.strip_suffix("µs")) {
+        (n, 0.001)
+    } else if let Some(n) = s.strip_suffix("ns") {
+        (n, 0.000_001)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000.0)
     } else {
-        None
-    }
+        (s.strip_suffix('h')?, 3_600_000.0)
+    };
+    let value: f64 = num.trim().parse().ok()?;
+    value.is_finite().then_some(value * factor)
 }
 
-/// The value of `path` in `line`: a top-level key (JSON lines, logfmt),
-/// a header-named column (CSV/TSV, via `columns`), or a dotted path into
-/// nested JSON objects (`user.id`).
-#[inline]
-fn lookup_field<'l>(
-    path: &str,
-    line: &'l [u8],
-    spans: &[FieldSpan],
+/// A field value as milliseconds: a bare number is taken as milliseconds,
+/// a duration literal (`"1.5s"`) is converted.
+fn value_as_millis(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok().or_else(|| parse_duration_millis(s))
+}
+
+// --------------------------------------------------------------- evaluator
+
+/// How field names resolve on one line.
+struct Fields<'a> {
     format: DetectedFormat,
-    columns: ColumnLookup,
-) -> Option<(&'l [u8], FieldType)> {
-    if matches!(format, DetectedFormat::Csv | DetectedFormat::Tsv) {
-        let idx = columns(path).or_else(|| {
-            // `col_3` names the third column of a header-less file.
-            path.strip_prefix("col_")?
-                .parse::<usize>()
-                .ok()?
-                .checked_sub(1)
-        })?;
-        let span = spans.get(idx)?;
-        return Some((span.value(line), span.val_type));
-    }
-    match spans.iter().find(|span| key_is(span, line, path)) {
-        Some(span) => Some((span.value(line), span.val_type)),
-        None if format == DetectedFormat::JsonLines && path.contains('.') => {
-            lookup_nested(path, line, spans)
-        }
-        None => None,
+    /// Header names of a positional (CSV/TSV) line.
+    columns: &'a [String],
+}
+
+fn evaluate(expr: &Expr, line: &[u8], spans: &[FieldSpan], ctx: &Fields) -> bool {
+    match expr {
+        Expr::Pred(pred) => evaluate_predicate(pred, line, spans, ctx),
+        Expr::Exists(path) => lookup(path, line, spans, ctx, &mut |_, span| {
+            span.val_type != FieldType::Null
+        }),
+        Expr::Not(inner) => !evaluate(inner, line, spans, ctx),
+        Expr::And(terms) => terms.iter().all(|t| evaluate(t, line, spans, ctx)),
+        Expr::Or(terms) => terms.iter().any(|t| evaluate(t, line, spans, ctx)),
     }
 }
 
-#[inline]
-fn key_is(span: &FieldSpan, line: &[u8], key: &str) -> bool {
-    std::str::from_utf8(span.key(line)).is_ok_and(|k| k.trim_matches('"') == key)
-}
-
-/// `a.b.c` in a JSON line: the value of `b.c` inside the object at `a`.
-#[cold]
-fn lookup_nested<'l>(
+/// Finds the field at `path` and applies `f(bytes, span)` to it; false when
+/// the field is absent. A dotted path is first tried as a literal key (logfmt
+/// keys such as `http.status`), then walked through nested JSON objects.
+fn lookup(
     path: &str,
-    line: &'l [u8],
+    line: &[u8],
     spans: &[FieldSpan],
-) -> Option<(&'l [u8], FieldType)> {
-    let (head, rest) = path.split_once('.')?;
-    let span = spans
+    ctx: &Fields,
+    f: &mut dyn FnMut(&[u8], &FieldSpan) -> bool,
+) -> bool {
+    if matches!(ctx.format, DetectedFormat::Csv | DetectedFormat::Tsv) {
+        return match ctx.columns.iter().position(|c| c == path) {
+            Some(i) => spans.get(i).is_some_and(|span| f(line, span)),
+            None => false,
+        };
+    }
+    let format = ctx.format;
+    let key_of = |span: &FieldSpan| -> &[u8] {
+        let k = span.key(line);
+        k.strip_prefix(b"\"")
+            .and_then(|k| k.strip_suffix(b"\""))
+            .unwrap_or(k)
+    };
+    if let Some(span) = spans.iter().find(|s| key_of(s) == path.as_bytes()) {
+        return f(line, span);
+    }
+    if format != DetectedFormat::JsonLines {
+        return false;
+    }
+    let Some((head, tail)) = path.split_once('.') else {
+        return false;
+    };
+    let Some(span) = spans
         .iter()
-        .find(|span| span.val_type == FieldType::Object && key_is(span, line, head))?;
-    let start = span.val_offset as usize;
-    let inner = &line[start..start + span.val_len as usize];
+        .find(|s| key_of(s) == head.as_bytes() && s.val_type == FieldType::Object)
+    else {
+        return false;
+    };
+    let inner = span.value(line);
     let mut inner_spans = Vec::new();
     StructuralClassifier::scan_json_line(inner, &mut inner_spans);
-    if let Some(span) = inner_spans.iter().find(|span| key_is(span, inner, rest)) {
-        return Some((span.value(inner), span.val_type));
-    }
-    lookup_nested(rest, inner, &inner_spans)
+    lookup(tail, inner, &inner_spans, ctx, f)
 }
 
 fn evaluate_predicate(
     pred: &SelectorPredicate,
     line: &[u8],
     spans: &[FieldSpan],
-    format: DetectedFormat,
-    columns: ColumnLookup,
+    ctx: &Fields,
 ) -> bool {
-    let target = lookup_field(&pred.field_path, line, spans, format, columns);
+    let mut found = false;
+    let mut result = false;
+    lookup(&pred.field_path, line, spans, ctx, &mut |line, span| {
+        found = true;
+        result = compare(pred, span, span.value(line));
+        result
+    });
+    if !found {
+        // A missing field only satisfies `== null`: a line without the
+        // field is not evidence for any comparison (`.level != "INFO"`
+        // keeps lines that *have* another level).
+        return pred.op == Operator::Equal && pred.operand == Operand::Null;
+    }
+    result
+}
 
+fn compare(pred: &SelectorPredicate, span: &FieldSpan, raw_val: &[u8]) -> bool {
+    let lossy = String::from_utf8_lossy(raw_val);
+    let val_str = lossy.trim_matches('"');
+    let ord = |a: f64, b: f64| match pred.op {
+        Operator::Equal => (a - b).abs() < f64::EPSILON,
+        Operator::NotEqual => (a - b).abs() >= f64::EPSILON,
+        Operator::GreaterThan => a > b,
+        Operator::GreaterThanOrEqual => a >= b,
+        Operator::LessThan => a < b,
+        Operator::LessThanOrEqual => a <= b,
+        Operator::Matches => false,
+    };
     match &pred.operand {
         Operand::Null => {
-            let exists = target.is_some_and(|(_, ty)| ty != FieldType::Null);
+            let is_null = span.val_type == FieldType::Null;
             match pred.op {
-                Operator::Equal => !exists,
-                Operator::NotEqual => exists,
+                Operator::Equal => is_null,
+                Operator::NotEqual => !is_null,
                 _ => false,
             }
         }
-        Operand::String(target_s) => {
-            if let Some((raw_val, _)) = target {
-                let lossy = String::from_utf8_lossy(raw_val);
-                let val_str = lossy.trim_matches('"');
-                match pred.op {
-                    Operator::Equal => val_str == target_s,
-                    Operator::NotEqual => val_str != target_s,
-                    Operator::Contains => val_str.contains(target_s),
-                    _ => false,
-                }
-            } else {
-                false
+        Operand::String(target) => match pred.op {
+            Operator::Equal => val_str == target,
+            Operator::NotEqual => val_str != target,
+            Operator::GreaterThan => val_str > target.as_str(),
+            Operator::GreaterThanOrEqual => val_str >= target.as_str(),
+            Operator::LessThan => val_str < target.as_str(),
+            Operator::LessThanOrEqual => val_str <= target.as_str(),
+            Operator::Matches => false,
+        },
+        Operand::Regex(re) => re.regex().is_some_and(|r| r.is_match(val_str)),
+        Operand::Number(target) => match val_str.parse::<f64>() {
+            Ok(num) => ord(num, *target),
+            Err(_) => false,
+        },
+        Operand::Boolean(target) => {
+            let b = raw_val == b"true";
+            match pred.op {
+                Operator::Equal => b == *target,
+                Operator::NotEqual => b != *target,
+                _ => false,
             }
         }
-        Operand::Number(target_n) => {
-            if let Some((raw_val, _)) = target
-                && let Ok(s) = std::str::from_utf8(raw_val)
-                && let Ok(num) = s.trim_matches('"').parse::<f64>()
-            {
-                return match pred.op {
-                    Operator::Equal => (num - target_n).abs() < f64::EPSILON,
-                    Operator::NotEqual => (num - target_n).abs() >= f64::EPSILON,
-                    Operator::GreaterThan => num > *target_n,
-                    Operator::GreaterThanOrEqual => num >= *target_n,
-                    Operator::LessThan => num < *target_n,
-                    Operator::LessThanOrEqual => num <= *target_n,
-                    _ => false,
-                };
-            }
-            false
-        }
-        Operand::Boolean(target_b) => {
-            if let Some((raw_val, _)) = target {
-                let b_val = raw_val == b"true";
-                match pred.op {
-                    Operator::Equal => b_val == *target_b,
-                    Operator::NotEqual => b_val != *target_b,
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        }
-        Operand::DurationMillis(target_ms) => {
-            if let Some((raw_val, _)) = target
-                && let Ok(s) = std::str::from_utf8(raw_val)
-                && let Ok(num) = s.trim_matches('"').parse::<f64>()
-            {
-                let ms = num as u64;
-                return match pred.op {
-                    Operator::Equal => ms == *target_ms,
-                    Operator::NotEqual => ms != *target_ms,
-                    Operator::GreaterThan => ms > *target_ms,
-                    Operator::GreaterThanOrEqual => ms >= *target_ms,
-                    Operator::LessThan => ms < *target_ms,
-                    Operator::LessThanOrEqual => ms <= *target_ms,
-                    _ => false,
-                };
-            }
-            false
-        }
+        Operand::DurationMillis(target) => match value_as_millis(val_str) {
+            Some(ms) => ord(ms, *target),
+            None => false,
+        },
     }
 }
 
@@ -571,67 +642,84 @@ mod tests {
         assert!(!q.matches_line(line_mismatch, DetectedFormat::JsonLines));
     }
 
-    #[test]
-    fn and_or_combine_predicates_with_and_binding_tighter() {
-        let q = Query::parse(r#"&.level == "ERROR" && .ms > 250 || .status >= 500"#);
-        let Query::Structured(groups) = &q else {
-            panic!("expected a selector query");
-        };
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].len(), 2);
-        let f = DetectedFormat::JsonLines;
-        assert!(q.matches_line(br#"{"level":"ERROR","ms":300}"#, f));
-        assert!(!q.matches_line(br#"{"level":"ERROR","ms":100}"#, f));
-        assert!(q.matches_line(br#"{"level":"INFO","status":503}"#, f));
-        assert!(!q.matches_line(br#"{"level":"INFO","status":200}"#, f));
+    fn jl(q: &str, line: &str) -> bool {
+        Query::parse(q).matches_line(line.as_bytes(), DetectedFormat::JsonLines)
     }
 
     #[test]
-    fn operators_inside_quotes_do_not_split_predicates() {
-        let q = Query::parse(r#".msg == "a && b || c""#);
-        let Query::Structured(groups) = &q else {
-            panic!("expected a selector query");
-        };
-        assert_eq!(groups.len(), 1);
-        assert!(q.matches_line(br#"{"msg":"a && b || c"}"#, DetectedFormat::JsonLines));
+    fn boolean_operators_with_precedence_and_parentheses() {
+        let line = r#"{"level":"ERROR","service":"auth","ms":320}"#;
+        assert!(jl(r#".level == "ERROR" && .service == "auth""#, line));
+        assert!(!jl(r#".level == "ERROR" && .service == "cart""#, line));
+        assert!(jl(r#".level == "INFO" || .ms > 300"#, line));
+        // && binds tighter than ||.
+        assert!(jl(
+            r#".level == "INFO" && .ms > 0 || .service == "auth""#,
+            line
+        ));
+        assert!(!jl(
+            r#".level == "INFO" && (.ms > 0 || .service == "auth")"#,
+            line
+        ));
+        assert!(jl(r#"!(.level == "INFO")"#, line));
+        assert!(!jl(r#"!.level == "ERROR""#, line));
+        // Operators inside quotes are text.
+        assert!(!jl(r#".service == "a && b""#, line));
     }
 
     #[test]
-    fn a_non_selector_operand_makes_the_whole_input_a_regex() {
-        assert!(matches!(Query::parse(".a == 1 && plain"), Query::Regex(_)));
+    fn nested_paths_and_existence_tests() {
+        let line = r#"{"user":{"id":7,"geo":{"cc":"JP"}},"trace":null}"#;
+        assert!(jl(".user.id == 7", line));
+        assert!(jl(r#".user.geo.cc == "JP""#, line));
+        assert!(!jl(".user.id == 8", line));
+        assert!(jl(".user.geo", line), "a bare path tests existence");
+        assert!(!jl(".user.missing", line));
+        assert!(!jl(".trace", line), "null does not count as present");
+        assert!(jl("!.trace", line));
+        // A logfmt key may itself contain dots.
+        let q = Query::parse(".http.status >= 500");
+        assert!(q.matches_line(b"http.status=502 path=/x", DetectedFormat::Logfmt));
     }
 
     #[test]
-    fn dotted_paths_reach_into_nested_json_objects() {
-        let q = Query::parse(".user.id == 42");
-        let f = DetectedFormat::JsonLines;
-        assert!(q.matches_line(br#"{"user":{"id":42,"name":"a"},"x":1}"#, f));
-        assert!(!q.matches_line(br#"{"user":{"id":7},"x":1}"#, f));
-        assert!(!q.matches_line(br#"{"user":"42"}"#, f));
-        let deep = Query::parse(r#".a.b.c == "z""#);
-        assert!(deep.matches_line(br#"{"a":{"b":{"c":"z"}}}"#, f));
-        // A literal dotted key still wins over a nested lookup.
-        let literal = Query::parse(".a.b == 1");
-        assert!(literal.matches_line(br#"{"a.b":1}"#, f));
+    fn regex_match_strings_and_durations() {
+        let line = r#"{"msg":"connection Refused by db","ts":"2026-08-23T00:10:00Z","dur":"1.5s","ms":1500}"#;
+        assert!(
+            !jl(r#".msg =~ "timeout|refused""#, line),
+            "case-sensitive by default"
+        );
+        assert!(
+            Query::parse_with_case(r#".msg =~ "timeout|refused""#, true)
+                .matches_line(line.as_bytes(), DetectedFormat::JsonLines)
+        );
+        assert!(jl(".msg =~ ^connection", line));
+        assert!(
+            jl(r#".ts >= "2026-08-23T00:05""#, line),
+            "text compares in order"
+        );
+        assert!(!jl(r#".ts < "2026-08-23T00:05""#, line));
+        assert!(jl(".dur > 1s", line), "a duration value converts");
+        assert!(
+            jl(".ms == 1.5s", line),
+            "a bare number counts as milliseconds"
+        );
+        assert!(!jl(".dur > 2s", line));
     }
 
     #[test]
-    fn csv_fields_are_found_by_header_name_or_position() {
-        let names = ["id", "status", "path"];
-        let lookup = |name: &str| names.iter().position(|n| *n == name);
-        let q = Query::parse(".status >= 500");
-        assert!(q.matches_line_with(b"1,503,/a", DetectedFormat::Csv, &lookup));
-        assert!(!q.matches_line_with(b"2,200,/b", DetectedFormat::Csv, &lookup));
-        let by_pos = Query::parse(".col_3 == /b");
-        assert!(by_pos.matches_line(b"2,200,/b", DetectedFormat::Csv));
-        assert!(by_pos.matches_line(b"2\t200\t/b", DetectedFormat::Tsv));
-    }
-
-    #[test]
-    fn regex_queries_can_ignore_case() {
-        let q = Query::parse_with_case("error", true);
-        assert!(q.matches_line(b"an ERROR here", DetectedFormat::PlainText));
-        assert_ne!(q, Query::parse("error"));
-        assert!(!Query::parse("error").matches_line(b"ERROR", DetectedFormat::PlainText));
+    fn non_selector_input_stays_a_regex() {
+        for src in [
+            "(ERROR|WARN)",
+            ".*timeout",
+            "!DEBUG",
+            "ERROR && WARN",
+            ".",
+            "(.a == 1",
+        ] {
+            assert!(matches!(Query::parse(src), Query::Regex(_)), "{src}");
+        }
+        // An invalid `=~` regex does not make a selector.
+        assert!(matches!(Query::parse(".msg =~ \"(\""), Query::Regex(_)));
     }
 }

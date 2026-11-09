@@ -44,31 +44,38 @@ pub enum Action {
     PinColumn,
     HideColumn,
     SortColumn,
-    /// (explicit column count, rightward?)
-    ScrollHorizontal(Option<u64>, bool),
-    /// `ESC-{`: back to the first column.
-    HorizontalHome,
-    /// `ESC-}`: far enough right to show the end of the longest line.
-    HorizontalEnd,
-    /// `N%` / `Np`: go to N percent into the file.
-    GotoPercent(Option<u64>),
-    /// `m<letter>`
+    /// Column mode `i`: value statistics of the focused column.
+    ColumnStats,
+    /// `F`: keep reading as the input grows.
+    Follow,
+    /// `m<c>`.
     SetMark(char),
-    /// `'<letter>`; `''` returns to the position before the last jump.
+    /// `'<c>`; `''` (the `'` character) goes back to the previous position.
     GotoMark(char),
-    /// `-<letter>`: toggle an option while paging.
+    /// `h`.
+    Help,
+    /// `-<c>`: toggle option `c` (`N`, `S`, `i`, `I`).
     ToggleOption(char),
-    /// `=` / `^G` / `:f`
+    /// (explicit count, rightward?): Right/Left, ESC-) / ESC-(.
+    HScroll(Option<u64>, bool),
+    /// `:w path` (`force` for `:w!`).
+    SaveView {
+        path: String,
+        force: bool,
+    },
+    /// `ESC-{`: back to the first column.
+    HScrollHome,
+    /// `ESC-}`: far enough right to show the end of the longest line.
+    HScrollEnd,
+    /// `N%` / `Np`: N percent into the file (or the view).
+    GotoPercent(Option<u64>),
+    /// `=` / `^G` / `:f`: where the view is and what is applied to it.
     FileInfo,
     /// `R`: discard what was read and read the file again.
     Reload,
-    /// `F`: go to the end and keep reading as the input grows.
-    Follow,
-    /// `h`: the key reference.
-    Help,
     /// `v`: open the file in the editor at the top line.
     Edit,
-    /// `:e name`: open another file.
+    /// `:e path`: open another file.
     Examine(String),
     /// `N:x`: go to file N (the first file without N).
     GotoFile(Option<u64>),
@@ -100,19 +107,23 @@ enum Mode {
     FilterPattern {
         buf: String,
     },
+    /// `:w` typed: reading the file name.
+    SavePath {
+        buf: String,
+    },
+    /// `:e` typed: reading the file name.
+    ExaminePath {
+        buf: String,
+    },
+    /// `m` typed: the next letter names the mark.
+    MarkSet,
+    /// `'` typed: the next letter names the mark.
+    MarkGoto,
+    /// `-` typed: the next letter names the option.
+    Dash,
     /// Column mode (`x`). The focused column itself lives in `command`,
     /// which knows how many columns exist.
     Column,
-    /// After `m`: the next key names the mark to set.
-    Mark,
-    /// After `'`: the next key names the mark to go to.
-    GotoMark,
-    /// After `-`: the next key names the option to toggle.
-    OptionPrefix,
-    /// `:e` file name being typed.
-    Examine {
-        buf: String,
-    },
 }
 
 pub struct Decoder {
@@ -146,11 +157,12 @@ impl Decoder {
                 Some(format!("{}{}", lead, buf))
             }
             Mode::FilterPattern { buf } => Some(format!("&{}", buf)),
-            Mode::Examine { buf } => Some(format!("Examine: {}", buf)),
+            Mode::SavePath { buf } => Some(format!(":w{}", buf)),
+            Mode::ExaminePath { buf } => Some(format!("Examine: {}", buf)),
+            Mode::MarkSet => Some("mark: ".to_string()),
+            Mode::MarkGoto => Some("goto mark: ".to_string()),
+            Mode::Dash => Some("-".to_string()),
             Mode::Colon => Some(format!("{}:", self.prefix)),
-            Mode::Mark => Some("mark: ".to_string()),
-            Mode::GotoMark => Some("goto mark: ".to_string()),
-            Mode::OptionPrefix => Some("-".to_string()),
             Mode::Normal if !self.prefix.is_empty() => Some(self.prefix.clone()),
             _ => None,
         }
@@ -159,20 +171,6 @@ impl Decoder {
     /// True while column mode (`x`) is active; `command` draws its status.
     pub fn in_column_mode(&self) -> bool {
         self.mode == Mode::Column
-    }
-
-    /// True while a text prompt (`/`, `?`, `&`, `:e`) is being typed.
-    pub fn in_text_entry(&self) -> bool {
-        matches!(
-            self.mode,
-            Mode::Pattern { .. } | Mode::FilterPattern { .. } | Mode::Examine { .. }
-        )
-    }
-
-    /// Abandons any half-typed command (prefix, prompt, pending key).
-    pub fn reset(&mut self) {
-        self.prefix.clear();
-        self.mode = Mode::Normal;
     }
 
     /// Resolves the prefix to a concrete count, default `1` when absent or
@@ -202,7 +200,10 @@ impl Decoder {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         match &mut self.mode {
-            Mode::Pattern { buf, .. } | Mode::FilterPattern { buf } | Mode::Examine { buf } => {
+            Mode::Pattern { buf, .. }
+            | Mode::FilterPattern { buf }
+            | Mode::SavePath { buf }
+            | Mode::ExaminePath { buf } => {
                 return match edit_line(buf, code) {
                     LineEdit::Editing => Decoded::Redraw,
                     LineEdit::Cancel => {
@@ -214,7 +215,19 @@ impl Decoder {
                             Decoded::Action(Action::SearchInput(buf, dir, count))
                         }
                         Mode::FilterPattern { buf } => Decoded::Action(Action::FilterInput(buf)),
-                        Mode::Examine { buf } => Decoded::Action(Action::Examine(buf)),
+                        Mode::SavePath { buf } => {
+                            let (force, path) = match buf.strip_prefix('!') {
+                                Some(rest) => (true, rest),
+                                None => (false, buf.as_str()),
+                            };
+                            Decoded::Action(Action::SaveView {
+                                path: path.trim().to_string(),
+                                force,
+                            })
+                        }
+                        Mode::ExaminePath { buf } => {
+                            Decoded::Action(Action::Examine(buf.trim().to_string()))
+                        }
                         _ => unreachable!("matched a text-entry mode above"),
                     },
                 };
@@ -229,19 +242,23 @@ impl Decoder {
                 KeyCode::Char('p') => return Decoded::Action(Action::PinColumn),
                 KeyCode::Char('.') => return Decoded::Action(Action::HideColumn),
                 KeyCode::Char('s') => return Decoded::Action(Action::SortColumn),
+                KeyCode::Char('i') => return Decoded::Action(Action::ColumnStats),
                 _ => return Decoded::Redraw,
             },
-            Mode::Mark | Mode::GotoMark | Mode::OptionPrefix => {
+            Mode::MarkSet | Mode::MarkGoto | Mode::Dash => {
                 let mode = std::mem::replace(&mut self.mode, Mode::Normal);
                 self.prefix.clear();
                 let KeyCode::Char(c) = code else {
-                    return Decoded::Redraw; // Esc (or any non-character) cancels
+                    return Decoded::Redraw;
                 };
-                return Decoded::Action(match mode {
-                    Mode::Mark => Action::SetMark(c),
-                    Mode::GotoMark => Action::GotoMark(c),
-                    _ => Action::ToggleOption(c),
-                });
+                return match mode {
+                    Mode::MarkSet if c.is_ascii_lowercase() => Decoded::Action(Action::SetMark(c)),
+                    Mode::MarkGoto if c.is_ascii_lowercase() || c == '\'' => {
+                        Decoded::Action(Action::GotoMark(c))
+                    }
+                    Mode::Dash => Decoded::Action(Action::ToggleOption(c)),
+                    _ => Decoded::Redraw,
+                };
             }
             Mode::Colon => {
                 self.mode = Mode::Normal;
@@ -250,14 +267,18 @@ impl Decoder {
                 }
                 let count = self.take_count();
                 return match code {
-                    KeyCode::Char('n') => Decoded::Action(Action::NextFile(count)),
-                    KeyCode::Char('p') => Decoded::Action(Action::PrevFile(count)),
                     KeyCode::Char('f') => Decoded::Action(Action::FileInfo),
                     KeyCode::Char('e') => {
-                        self.mode = Mode::Examine { buf: String::new() };
+                        self.mode = Mode::ExaminePath { buf: String::new() };
                         Decoded::Redraw
                     }
+                    KeyCode::Char('n') => Decoded::Action(Action::NextFile(count)),
+                    KeyCode::Char('p') => Decoded::Action(Action::PrevFile(count)),
                     KeyCode::Char('q') | KeyCode::Char('Q') => Decoded::Action(Action::Quit),
+                    KeyCode::Char('w') => {
+                        self.mode = Mode::SavePath { buf: String::new() };
+                        Decoded::Redraw
+                    }
                     _ => Decoded::Redraw,
                 };
             }
@@ -274,13 +295,13 @@ impl Decoder {
                         Decoded::Action(Action::GotoLast(self.take_optional_count()))
                     }
                     KeyCode::Char(')') => {
-                        Decoded::Action(Action::ScrollHorizontal(self.take_optional_count(), true))
+                        Decoded::Action(Action::HScroll(self.take_optional_count(), true))
                     }
                     KeyCode::Char('(') => {
-                        Decoded::Action(Action::ScrollHorizontal(self.take_optional_count(), false))
+                        Decoded::Action(Action::HScroll(self.take_optional_count(), false))
                     }
-                    KeyCode::Char('{') => Decoded::Action(Action::HorizontalHome),
-                    KeyCode::Char('}') => Decoded::Action(Action::HorizontalEnd),
+                    KeyCode::Char('{') => Decoded::Action(Action::HScrollHome),
+                    KeyCode::Char('}') => Decoded::Action(Action::HScrollEnd),
                     _ => Decoded::Redraw,
                 };
             }
@@ -359,20 +380,26 @@ impl Decoder {
                 self.mode = Mode::Column;
                 Some(Action::ToggleColumnMode)
             }
-            KeyCode::Right => Some(Action::ScrollHorizontal(self.take_optional_count(), true)),
-            KeyCode::Left => Some(Action::ScrollHorizontal(self.take_optional_count(), false)),
+            KeyCode::Char('F') => {
+                self.prefix.clear();
+                Some(Action::Follow)
+            }
+            KeyCode::Char('h') => {
+                self.prefix.clear();
+                Some(Action::Help)
+            }
             KeyCode::Char('p') | KeyCode::Char('%') => {
                 Some(Action::GotoPercent(self.take_optional_count()))
             }
             KeyCode::Char('=') => Some(Action::FileInfo),
             KeyCode::Char('R') => Some(Action::Reload),
-            KeyCode::Char('F') => Some(Action::Follow),
-            KeyCode::Char('h') => Some(Action::Help),
             KeyCode::Char('v') => Some(Action::Edit),
             KeyCode::Char('r') => {
                 self.prefix.clear();
                 return Decoded::Redraw; // repaint
             }
+            KeyCode::Right => Some(Action::HScroll(self.take_optional_count(), true)),
+            KeyCode::Left => Some(Action::HScroll(self.take_optional_count(), false)),
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
             _ => None,
         };
@@ -408,15 +435,15 @@ impl Decoder {
                 Decoded::Redraw
             }
             KeyCode::Char('m') => {
-                self.mode = Mode::Mark;
+                self.mode = Mode::MarkSet;
                 Decoded::Redraw
             }
             KeyCode::Char('\'') => {
-                self.mode = Mode::GotoMark;
+                self.mode = Mode::MarkGoto;
                 Decoded::Redraw
             }
             KeyCode::Char('-') => {
-                self.mode = Mode::OptionPrefix;
+                self.mode = Mode::Dash;
                 Decoded::Redraw
             }
             KeyCode::Char('Z') => {
@@ -665,94 +692,126 @@ mod tests {
 
     fn feed_all(d: &mut Decoder, keys: &str) -> Decoded {
         let mut last = Decoded::Nothing;
-        for ch in keys.chars() {
-            let (c, m) = key(ch);
-            last = d.feed(c, m);
+        for c in keys.chars() {
+            let code = if c == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(c)
+            };
+            last = d.feed(code, KeyModifiers::NONE);
         }
         last
     }
 
     #[test]
-    fn marks_options_and_percent_take_their_argument_key() {
+    fn new_commands_decode() {
         let mut d = Decoder::new();
+        assert_eq!(feed_all(&mut d, "F"), Decoded::Action(Action::Follow));
+        assert_eq!(feed_all(&mut d, "h"), Decoded::Action(Action::Help));
         assert_eq!(
             feed_all(&mut d, "ma"),
             Decoded::Action(Action::SetMark('a'))
         );
         assert_eq!(
-            feed_all(&mut d, "'a"),
-            Decoded::Action(Action::GotoMark('a'))
+            feed_all(&mut d, "'b"),
+            Decoded::Action(Action::GotoMark('b'))
         );
         assert_eq!(
             feed_all(&mut d, "''"),
             Decoded::Action(Action::GotoMark('\''))
         );
+        assert_eq!(feed_all(&mut d, "mZ"), Decoded::Redraw, "marks are a-z");
         assert_eq!(
-            feed_all(&mut d, "-N"),
-            Decoded::Action(Action::ToggleOption('N'))
+            feed_all(&mut d, "-S"),
+            Decoded::Action(Action::ToggleOption('S'))
         );
         assert_eq!(
-            feed_all(&mut d, "50%"),
+            feed_all(&mut d, ":w out.log\n"),
+            Decoded::Action(Action::SaveView {
+                path: "out.log".to_string(),
+                force: false
+            })
+        );
+        assert_eq!(
+            feed_all(&mut d, ":w! out.log\n"),
+            Decoded::Action(Action::SaveView {
+                path: "out.log".to_string(),
+                force: true
+            })
+        );
+        assert_eq!(
+            d.feed(KeyCode::Right, KeyModifiers::NONE),
+            Decoded::Action(Action::HScroll(None, true))
+        );
+        feed_all(&mut d, "8");
+        assert_eq!(
+            d.feed(KeyCode::Left, KeyModifiers::NONE),
+            Decoded::Action(Action::HScroll(Some(8), false))
+        );
+        d.feed(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            feed_all(&mut d, ")"),
+            Decoded::Action(Action::HScroll(None, true))
+        );
+        feed_all(&mut d, "x");
+        assert_eq!(feed_all(&mut d, "i"), Decoded::Action(Action::ColumnStats));
+        assert_eq!(feed_all(&mut d, "s"), Decoded::Action(Action::SortColumn));
+    }
+
+    fn feed_keys(d: &mut Decoder, keys: &str) -> Decoded {
+        let mut last = Decoded::Nothing;
+        for ch in keys.chars() {
+            last = d.feed(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        last
+    }
+
+    #[test]
+    fn percent_info_reload_edit_and_repaint_keys() {
+        let mut d = Decoder::new();
+        assert_eq!(
+            feed_keys(&mut d, "50%"),
             Decoded::Action(Action::GotoPercent(Some(50)))
         );
         assert_eq!(
-            feed_all(&mut d, "p"),
+            feed_keys(&mut d, "p"),
             Decoded::Action(Action::GotoPercent(None))
         );
-        let (c, m) = key('m');
-        d.feed(c, m);
-        assert_eq!(d.preview(), Some("mark: ".to_string()));
-        assert_eq!(d.feed(KeyCode::Esc, KeyModifiers::NONE), Decoded::Redraw);
-        assert_eq!(d.preview(), None, "Esc cancels a pending mark");
+        assert_eq!(feed_keys(&mut d, "="), Decoded::Action(Action::FileInfo));
+        assert_eq!(
+            d.feed(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            Decoded::Action(Action::FileInfo)
+        );
+        assert_eq!(feed_keys(&mut d, "R"), Decoded::Action(Action::Reload));
+        assert_eq!(feed_keys(&mut d, "v"), Decoded::Action(Action::Edit));
+        assert_eq!(feed_keys(&mut d, "r"), Decoded::Redraw);
+        assert_eq!(
+            d.feed(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            Decoded::Redraw
+        );
+        d.feed(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(feed_keys(&mut d, "{"), Decoded::Action(Action::HScrollHome));
+        d.feed(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(feed_keys(&mut d, "}"), Decoded::Action(Action::HScrollEnd));
     }
 
     #[test]
-    fn horizontal_scroll_keys() {
+    fn colon_examine_first_file_and_info() {
         let mut d = Decoder::new();
         assert_eq!(
-            d.feed(KeyCode::Right, KeyModifiers::NONE),
-            Decoded::Action(Action::ScrollHorizontal(None, true))
-        );
-        assert_eq!(feed_all(&mut d, "8"), Decoded::Redraw);
-        assert_eq!(
-            d.feed(KeyCode::Left, KeyModifiers::NONE),
-            Decoded::Action(Action::ScrollHorizontal(Some(8), false))
-        );
-        d.feed(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(
-            feed_all(&mut d, "}"),
-            Decoded::Action(Action::HorizontalEnd)
-        );
-        d.feed(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(
-            feed_all(&mut d, "{"),
-            Decoded::Action(Action::HorizontalHome)
-        );
-    }
-
-    #[test]
-    fn colon_commands_examine_first_file_and_info() {
-        let mut d = Decoder::new();
-        assert_eq!(
-            feed_all(&mut d, ":x"),
+            feed_keys(&mut d, ":x"),
             Decoded::Action(Action::GotoFile(None))
         );
         assert_eq!(
-            feed_all(&mut d, "3:x"),
+            feed_keys(&mut d, "3:x"),
             Decoded::Action(Action::GotoFile(Some(3)))
         );
-        assert_eq!(feed_all(&mut d, ":f"), Decoded::Action(Action::FileInfo));
-        feed_all(&mut d, ":eother.log");
-        assert!(d.in_text_entry());
+        assert_eq!(feed_keys(&mut d, ":f"), Decoded::Action(Action::FileInfo));
+        feed_keys(&mut d, ":eother.log");
         assert_eq!(d.preview(), Some("Examine: other.log".to_string()));
         assert_eq!(
             d.feed(KeyCode::Enter, KeyModifiers::NONE),
             Decoded::Action(Action::Examine("other.log".to_string()))
-        );
-        assert_eq!(feed_all(&mut d, "="), Decoded::Action(Action::FileInfo));
-        assert_eq!(
-            d.feed(KeyCode::Char('g'), KeyModifiers::CONTROL),
-            Decoded::Action(Action::FileInfo)
         );
     }
 }
