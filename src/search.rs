@@ -79,7 +79,12 @@ pub fn find_by(
             }
         }
         Direction::Backward => {
-            buffer.ensure_full_read()?;
+            // Only lines at or above `start_line` are visited, so only those
+            // need reading: if fewer exist, reading stops at EOF and `total`
+            // is the true line count; otherwise `start` is the same for any
+            // `total >= start_line`. A `?` near the top of a large file (or
+            // a pipe still open) no longer waits for the whole input.
+            buffer.ensure_lines_read(start_line)?;
             let total = buffer.lines_cached();
             if total == 0 {
                 return Ok(None);
@@ -227,6 +232,63 @@ mod tests {
         assert!(line_matches(b"a\xffb", &dot));
         assert!(line_matches("a\u{6f22}b".as_bytes(), &dot));
         assert!(!line_matches(b"a\xff\xfeb", &dot));
+    }
+
+    #[test]
+    fn backward_search_reads_only_through_its_start_line() {
+        let path = temp_file(&lines_fixture());
+        let re = Regex::new("ALPHA_TOKEN").unwrap();
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 100, true, 1).unwrap(),
+            Some(80)
+        );
+        assert_eq!(buf.lines_cached(), 100, "lines below the start unread");
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 100, true, 2).unwrap(),
+            Some(20)
+        );
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 80, false, 1).unwrap(),
+            Some(20)
+        );
+        // A start past EOF is clamped to the last line, as before.
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 10_000, true, 1).unwrap(),
+            Some(140)
+        );
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 10_000, false, 1).unwrap(),
+            Some(140)
+        );
+        assert_eq!(
+            find(&mut buf, &re, Direction::Backward, 0, false, 1).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn backward_search_on_a_partly_read_buffer_matches_a_fully_read_one() {
+        // The fully read buffer is what backward search used to start from.
+        let path = temp_file(&lines_fixture());
+        let re = Regex::new("ALPHA_TOKEN").unwrap();
+        let mut full = Buffer::new(Source::File(path.clone()));
+        full.ensure_full_read().unwrap();
+        for start in 0..=205 {
+            for inclusive in [true, false] {
+                for count in 0..=4 {
+                    let mut lazy = Buffer::new(Source::File(path.clone()));
+                    assert_eq!(
+                        find(&mut lazy, &re, Direction::Backward, start, inclusive, count),
+                        find(&mut full, &re, Direction::Backward, start, inclusive, count),
+                        "start {start} inclusive {inclusive} count {count}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

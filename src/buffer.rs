@@ -277,7 +277,16 @@ impl Buffer {
     /// Reads lines until at least `up_to` lines are cached, or EOF. A pipe
     /// may stop short of both when its producer is idle (see
     /// `STREAM_IDLE`); in follow mode nothing waits at all.
+    #[inline]
     pub fn ensure_lines_read(&mut self, up_to: usize) -> Result<(), String> {
+        // Fast path for line-by-line scans over cached lines (search,
+        // filters, rendering): a cached line implies the source opened (a
+        // follow-mode reset clears the lines along with the reader), so
+        // this returns exactly what `read_lines` would. `up_to == 0` takes
+        // the full path, which still reports an open error.
+        if up_to > 0 && self.line_ends.len() >= up_to {
+            return Ok(());
+        }
         let wait = if self.follow {
             Wait::No
         } else {
@@ -589,6 +598,7 @@ mod tests {
             "/nonexistent/does-not-exist-rust-less",
         )));
         assert!(buf.ensure_lines_read(1).is_err());
+        assert!(buf.ensure_lines_read(0).is_err());
     }
 
     #[test]
