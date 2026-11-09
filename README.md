@@ -66,8 +66,19 @@ Anything that is not a selector is a regular expression, as in less.
 ## More keys
 
 `m a` / `' a` set and jump to a mark, `''` returns to where the last jump
-started; `-N` `-S` `-i` `-I` toggle options inside the pager; `h` shows every
-key. `rless --help` lists the options and keys.
+started; `50%` goes halfway; `-N` `-S` `-i` `-I` toggle options inside the
+pager; `h` shows every key. `rless --help` lists the options and keys.
+
+| Keys | What it does |
+|---|---|
+| `=` (`^G`, `:f`) | where you are: lines, bytes, percent, format, filter, sort |
+| `R` / `v` | read a changed file again / edit it at this line in `$VISUAL`, `$EDITOR` or `vi` |
+| `:e file` / `N:x` | open another file / go to the Nth file |
+| `ESC-{` / `ESC-}` | first column / end of the longest line |
+
+Each file keeps its place, format, table and sort when you switch away with
+`:n`/`:p` and come back. In the table view, pinned columns (`x`, `p`) stay in
+place while the rest scrolls sideways.
 
 ## Development
 

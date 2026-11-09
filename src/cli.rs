@@ -11,7 +11,9 @@ Moving (as in less; N is an optional count typed first):
   f b Space PgDn PgUp    forward / backward one window
   d u                    half window (N d sets the default)
   g G                    first / last line (N g: line N)
-  Right Left  ESC-) ESC-( scroll sideways (with -S, and in the table view)
+  N% Np                  N percent into the file (or the filtered view)
+  Right Left  ESC-) ESC-( scroll sideways (with -S; tables keep pinned columns)
+  ESC-{ ESC-}            first column / end of the longest line
   m<a-z>  '<a-z>  ''     set a mark, go to a mark, go back to where you were
   F                      follow: keep reading as the file grows (any key stops)
 
@@ -21,12 +23,15 @@ Searching and filtering:
                          empty: clear). Works on any file.
 
 Files, options, output:
-  :n :p                  next / previous file
+  :n :p  N:x             next / previous / Nth file (each keeps its place)
+  h                      this help
+  q Q :q ZZ              quit
+  :e file                open another file
+  = ^G :f                file information (position, size, filter, sort)
+  R  v  r ^L             reload; edit at this line ($VISUAL/$EDITOR/vi); repaint
   :w file                save the current view (filtered / sorted) to file
                          (:w! file overwrites)
   -N -S -i -I            toggle line numbers, chopping, smart / full case folding
-  h                      this help
-  q Q :q ZZ              quit
 
 Structured input (JSON lines, CSV, TSV, logfmt; detected automatically):
   c                      table view on / off

@@ -68,6 +68,12 @@ fn main() {
     if !stdout().is_terminal() {
         std::process::exit(copy_through(&opts));
     }
+    // With no file and nothing piped in there is nothing to page (and the
+    // keyboard and the input would both be the terminal), as in less.
+    if opts.files.is_empty() && std::io::stdin().is_terminal() {
+        eprintln!("Missing filename (\"rless --help\" for help)");
+        std::process::exit(1);
+    }
     let alternate_screen = !opts.no_init;
     let quit_if_one_screen = opts.quit_if_one_screen;
     let mut app = App::new(opts);

@@ -108,6 +108,16 @@ impl ProjectionEngine {
         visible(true).chain(visible(false))
     }
 
+    /// Display width of the pinned cells at the start of every table row
+    /// (each cell plus its separator); they stay put when the table
+    /// scrolls sideways.
+    pub fn pinned_width(&self) -> usize {
+        self.display_columns()
+            .filter(|c| c.pinned)
+            .map(|c| c.width + 1)
+            .sum()
+    }
+
     /// Derives or updates column definitions from a set of lines.
     ///
     /// CSV/TSV: the first sampled line names the columns when no columns
@@ -311,8 +321,13 @@ impl ProjectionEngine {
         width: usize,
         tabular: bool,
     ) -> Result<ProjectedWindow, String> {
-        let header = (self.sticky_header && !self.columns.is_empty())
-            .then(|| clip_to_width(skip_columns(self.header_text(), self.hscroll), width));
+        let frozen = self.pinned_width();
+        let header = (self.sticky_header && !self.columns.is_empty()).then(|| {
+            clip_to_width(
+                scroll_keeping(self.header_text(), frozen, self.hscroll),
+                width,
+            )
+        });
         let capacity = content_rows.saturating_sub(header.is_some() as usize);
         // A CSV/TSV file's first line is the header row the column names
         // came from; under the sticky header it would show twice.
@@ -337,11 +352,18 @@ impl ProjectionEngine {
             let room = capacity - rows.len();
             cut_short = sub_rows.len() > room;
             let hscroll = self.hscroll;
+            // Table rows keep their pinned cells in place; an expanded
+            // JSON line is a tree, not table-shaped, so all of it scrolls.
+            let keep = if tabular && !self.expanded_lines.contains(&line_no) {
+                frozen
+            } else {
+                0
+            };
             rows.extend(
                 sub_rows
                     .into_iter()
                     .take(room)
-                    .map(|row| clip_to_width(skip_columns(row, hscroll), width)),
+                    .map(|row| clip_to_width(scroll_keeping(row, keep, hscroll), width)),
             );
             bottom_line = line_no;
         }
@@ -429,6 +451,34 @@ impl WindowLines<'_> {
         }
         Ok(line)
     }
+}
+
+/// Sideways scroll that leaves the first `keep` display columns (the
+/// pinned cells of a table row) in place and scrolls only what follows.
+fn scroll_keeping(text: String, keep: usize, cols: usize) -> String {
+    if keep == 0 || cols == 0 {
+        return skip_columns(text, cols);
+    }
+    let mut used = 0;
+    let mut in_esc = false;
+    let mut split = text.len();
+    for (i, ch) in text.char_indices() {
+        if ch == '\x1b' {
+            in_esc = true;
+        } else if in_esc {
+            in_esc = !ch.is_ascii_alphabetic();
+        } else {
+            if used >= keep {
+                split = i;
+                break;
+            }
+            used += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    let rest = text[split..].to_string();
+    let mut out = text[..split].to_string();
+    out.push_str(&skip_columns(rest, cols));
+    out
 }
 
 /// Drops the first `cols` display columns of projected text (horizontal
@@ -818,5 +868,17 @@ mod tests {
         assert_eq!(win.bottom_line, 10);
         assert!(win.at_eof);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sideways_scroll_keeps_pinned_cells_in_place() {
+        assert_eq!(scroll_keeping("ab|cdefgh".to_string(), 3, 2), "ab|efgh");
+        assert_eq!(scroll_keeping("ab|cdefgh".to_string(), 0, 2), "|cdefgh");
+        assert_eq!(scroll_keeping("ab|cd".to_string(), 3, 0), "ab|cd");
+        // Escapes before the cut stay with the pinned part.
+        assert_eq!(
+            scroll_keeping("\x1b[1mab|cdef".to_string(), 3, 1),
+            "\x1b[1mab|def"
+        );
     }
 }

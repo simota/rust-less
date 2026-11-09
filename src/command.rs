@@ -34,6 +34,30 @@ use crate::view::{LineFilter, SortKey, ViewIndex};
 
 struct FileEntry {
     buffer: Buffer,
+    /// How this file was being viewed when another file was switched to,
+    /// so `:p`/`:n` back returns to the same place (as less does).
+    saved: Option<SavedView>,
+}
+
+impl FileEntry {
+    fn new(source: Source) -> Self {
+        FileEntry {
+            buffer: Buffer::new(source),
+            saved: None,
+        }
+    }
+}
+
+/// The per-file part of the view, kept across file switches. The filter is
+/// not part of it: it applies to every file, as in less.
+struct SavedView {
+    top: usize,
+    projection: ProjectionEngine,
+    tabular_view: bool,
+    sort: Option<SortSpec>,
+    focused_column: usize,
+    sniffer_checked: bool,
+    hscroll: usize,
 }
 
 impl FileEntry {
@@ -141,6 +165,11 @@ pub struct App {
     hscroll: usize,
     following: bool,
     overlay: Option<Overlay>,
+    /// The last frame's bottom line and end-of-input state (for `=`).
+    last_bottom: (usize, bool),
+    /// `v` asked to open this file at this line in the editor; the main
+    /// loop, which owns the terminal, runs it.
+    pending_edit: Option<(PathBuf, usize)>,
     /// Reused frame buffer for `draw` (kept to avoid regrowing it per frame).
     frame_buf: Vec<u8>,
 }
@@ -148,15 +177,11 @@ pub struct App {
 impl App {
     pub fn new(opts: Options) -> Self {
         let files: Vec<FileEntry> = if opts.files.is_empty() {
-            vec![FileEntry {
-                buffer: Buffer::new(Source::Stdin),
-            }]
+            vec![FileEntry::new(Source::Stdin)]
         } else {
             opts.files
                 .iter()
-                .map(|p: &PathBuf| FileEntry {
-                    buffer: Buffer::new(Source::File(p.clone())),
-                })
+                .map(|p: &PathBuf| FileEntry::new(Source::File(p.clone())))
                 .collect()
         };
         let mut projection = ProjectionEngine::new(DetectedFormat::PlainText);
@@ -188,6 +213,8 @@ impl App {
             hscroll: 0,
             following: false,
             overlay: None,
+            last_bottom: (1, false),
+            pending_edit: None,
             frame_buf: Vec::new(),
         }
     }
@@ -375,6 +402,9 @@ impl App {
                         KeyOutcome::Quit => return Ok(0),
                         KeyOutcome::Continue => {}
                     }
+                    if let Some((path, line)) = self.pending_edit.take() {
+                        self.run_editor(out, &path, line)?;
+                    }
                 }
                 _ => {}
             }
@@ -482,6 +512,9 @@ impl App {
                 | Action::RepeatSearch(_)
                 | Action::RepeatSearchReverse(_)
                 | Action::GotoMark(_)
+                | Action::GotoPercent(_)
+                | Action::GotoFile(_)
+                | Action::Examine(_)
         );
         let before = self.position();
         let result = self.apply_inner(action);
@@ -644,6 +677,42 @@ impl App {
             Action::ToggleOption(c) => self.toggle_option(c)?,
             Action::HScroll(n, right) => self.horizontal_scroll(n, right),
             Action::SaveView { path, force } => self.save_view(&path, force)?,
+            Action::GotoPercent(n) => self.goto_percent(n.unwrap_or(0))?,
+            Action::FileInfo => {
+                // Cut on the right: the name and position come first and
+                // matter most (a prompt would lose them to a left cut).
+                let info = self.file_info()?;
+                self.pending_message = Some(clip_to_width(info, self.width as usize));
+            }
+            Action::Reload => self.reload()?,
+            Action::Edit => {
+                let entry = &self.files[self.file_index];
+                let Some(path) = entry.buffer.path() else {
+                    return Err("Cannot edit standard input".to_string());
+                };
+                self.pending_edit = Some((path.clone(), self.top));
+            }
+            Action::Examine(name) => self.examine(&name)?,
+            Action::GotoFile(n) => {
+                let target = n.unwrap_or(1).saturating_sub(1) as usize;
+                if target >= self.files.len() {
+                    return Err("No such file".to_string());
+                }
+                self.switch_file(target as i64 - self.file_index as i64)?;
+            }
+            Action::HScrollHome => {
+                self.hscroll = 0;
+                self.projection.hscroll = 0;
+            }
+            Action::HScrollEnd => {
+                if !self.opts.chop_long_lines && !self.table_shown() {
+                    self.pending_message =
+                        Some("Nothing to scroll: lines wrap (try -S)".to_string());
+                } else {
+                    self.hscroll = self.max_hscroll()?;
+                    self.projection.hscroll = self.hscroll;
+                }
+            }
             Action::Quit => unreachable!("handled by caller"),
         }
         Ok(())
@@ -1296,21 +1365,209 @@ impl App {
         if focused.hidden {
             return;
         }
+        if focused.pinned {
+            return; // pinned cells never scroll
+        }
+        // Only the cells after the pinned ones scroll, in the room they
+        // leave.
         let mut start = 0;
-        for col in self.projection.display_columns() {
+        for col in self.projection.display_columns().filter(|c| !c.pinned) {
             if std::ptr::eq(col, focused) {
                 break;
             }
             start += col.width + 1;
         }
         let end = start + focused.width + 1;
-        let width = self.width as usize;
+        let width = (self.width as usize)
+            .saturating_sub(self.projection.pinned_width())
+            .max(1);
         if start < self.hscroll {
             self.hscroll = start;
         } else if end > self.hscroll + width {
             self.hscroll = end.saturating_sub(width).min(start);
         }
         self.projection.hscroll = self.hscroll;
+    }
+
+    /// `N%`: N percent into the view (rows of a filtered or sorted view,
+    /// else lines), never past the last full page.
+    fn goto_percent(&mut self, percent: u64) -> Result<(), String> {
+        let percent = percent.min(100) as usize;
+        self.ensure_view()?;
+        if self.view.is_some() {
+            let rows = self.content_rows();
+            let (view, buffer) = self.view_and_buffer();
+            let total = view.total(buffer)?;
+            let pos = (total * percent / 100).min(total.saturating_sub(rows));
+            return self.view_move_to(pos);
+        }
+        let total = self.current().buffer.total_lines()?;
+        let rows = self.content_rows();
+        let last_page = total.saturating_sub(rows) + 1;
+        self.top = (total * percent / 100).clamp(1, last_page.max(1));
+        Ok(())
+    }
+
+    /// `=`: where the view is and what is applied to it.
+    fn file_info(&mut self) -> Result<String, String> {
+        let (bottom, at_eof) = self.last_bottom;
+        let top = self.top;
+        let tag = self.view_tag();
+        let mut parts = vec![
+            self.files[self.file_index]
+                .display()
+                .unwrap_or_else(|| "Standard input".to_string()),
+        ];
+        if self.files.len() > 1 {
+            parts.push(format!(
+                "(file {} of {})",
+                self.file_index + 1,
+                self.files.len()
+            ));
+        }
+        let buffer = &mut self.files[self.file_index].buffer;
+        if buffer.is_open_stream() {
+            // Totals would wait for a pipe that has not ended.
+            parts.push(format!("lines {top}-{bottom}/{}+", buffer.lines_cached()));
+        } else {
+            let total = buffer.total_lines()?;
+            let bytes = buffer.total_bytes()?;
+            let offset = buffer.byte_offset_through(bottom);
+            let percent = (bottom.min(total) * 100).checked_div(total).unwrap_or(100);
+            parts.push(format!("lines {top}-{bottom}/{total}"));
+            parts.push(format!("byte {offset}/{bytes}"));
+            parts.push(format!("{percent}%"));
+        }
+        if at_eof {
+            parts.push("(END)".to_string());
+        }
+        if self.projection.format.is_structured() {
+            parts.push(format!("[{}]", self.projection.format.name()));
+        }
+        parts.extend(tag);
+        Ok(parts.join(" "))
+    }
+
+    /// `R`: reads the file again (it changed on disk), keeping the place
+    /// when it still exists.
+    fn reload(&mut self) -> Result<(), String> {
+        if !self.current().buffer.reload() {
+            return Err("Cannot reload standard input".to_string());
+        }
+        self.view = None;
+        self.projection.expanded_lines.clear();
+        // Columns may have changed: derive them again on the next draw.
+        let format = self.projection.format;
+        if format.is_structured() {
+            let sample = self.sample_lines();
+            let sticky = self.projection.sticky_header;
+            self.projection.set_format(format);
+            self.projection.sticky_header = sticky;
+            self.projection.update_columns_from_lines(&sample);
+        } else {
+            self.sniffer_checked = false;
+        }
+        let top = self.top;
+        let buffer = &mut self.current().buffer;
+        buffer.ensure_lines_read(top)?;
+        if top > buffer.lines_cached() {
+            self.apply_inner(Action::GotoLast(None))?;
+        }
+        self.pending_message = Some("Reloaded".to_string());
+        Ok(())
+    }
+
+    /// `:e name`: shows `name`, adding it to the file list after the
+    /// current file (or switching to it when it is already listed).
+    fn examine(&mut self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("Usage: :e file".to_string());
+        }
+        let path = PathBuf::from(name);
+        if let Some(i) = self
+            .files
+            .iter()
+            .position(|f| f.buffer.path().is_some_and(|p| same_file(p, &path)))
+        {
+            return self.switch_file(i as i64 - self.file_index as i64);
+        }
+        let mut entry = FileEntry::new(Source::File(path));
+        entry.buffer.ensure_lines_read(1)?;
+        let at = self.file_index + 1;
+        self.files.insert(at, entry);
+        // Marks and `''` name files by index: shift those after `at`.
+        for m in self.marks.values_mut() {
+            if m.file >= at {
+                m.file += 1;
+            }
+        }
+        if let Some(p) = &mut self.previous_position
+            && p.file >= at
+        {
+            p.file += 1;
+        }
+        self.switch_file(1)
+    }
+
+    /// `v`: hands the terminal to the editor (`$VISUAL`, else `$EDITOR`,
+    /// else `vi`) at `line`, then takes it back and re-reads the file.
+    fn run_editor<W: Write>(&mut self, out: &mut W, path: &Path, line: usize) -> io::Result<()> {
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+        let argv = editor_command(
+            std::env::var("VISUAL").ok().as_deref(),
+            std::env::var("EDITOR").ok().as_deref(),
+            path,
+            line,
+        );
+        let alternate = !self.opts.no_init;
+        if alternate {
+            execute!(out, LeaveAlternateScreen)?;
+        }
+        disable_raw_mode()?;
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status();
+        enable_raw_mode()?;
+        if alternate {
+            execute!(out, EnterAlternateScreen)?;
+        }
+        self.pending_message = match status {
+            Ok(s) if s.success() => self.reload().err().map(|e| format!("{e}  (press RETURN)")),
+            Ok(s) => Some(format!("Editor exited with {s}  (press RETURN)")),
+            Err(e) => Some(format!("Cannot run {}: {e}  (press RETURN)", argv[0])),
+        };
+        self.draw(out)
+    }
+
+    /// How far right `ESC-}` scrolls: until the end of the widest table
+    /// row, or of the longest line in the window, reaches the right edge.
+    fn max_hscroll(&mut self) -> Result<usize, String> {
+        let width = self.width as usize;
+        if self.table_shown() {
+            let pinned = self.projection.pinned_width();
+            let scrolling: usize = self
+                .projection
+                .display_columns()
+                .filter(|c| !c.pinned)
+                .map(|c| c.width + 1)
+                .sum();
+            return Ok(scrolling.saturating_sub(width.saturating_sub(pinned)));
+        }
+        let number_width = if self.opts.line_numbers { 8 } else { 0 };
+        let room = width.saturating_sub(number_width).max(1);
+        let raw_ansi = self.opts.raw_control_chars;
+        let rows = self.content_rows();
+        let top = self.top;
+        let buffer = &mut self.files[self.file_index].buffer;
+        buffer.ensure_lines_read(top + rows)?;
+        let widest = (top..top + rows)
+            .filter_map(|n| buffer.line(n))
+            .map(|raw| screen::line_display_width(raw, raw_ansi))
+            .max()
+            .unwrap_or(0);
+        Ok(widest.saturating_sub(room))
     }
 
     /// `:w path`: writes the lines the view shows (all lines without a
@@ -1486,21 +1743,37 @@ impl App {
             return Err("No next file".to_string());
         }
         self.stop_follow();
+        // Keep how this file was being viewed, for coming back to it.
+        let mut fresh = ProjectionEngine::new(DetectedFormat::PlainText);
+        fresh.raw_ansi = self.opts.raw_control_chars;
+        let saved = SavedView {
+            top: self.top,
+            projection: std::mem::replace(&mut self.projection, fresh),
+            tabular_view: std::mem::take(&mut self.tabular_view),
+            sort: self.sort.take(),
+            focused_column: std::mem::take(&mut self.focused_column),
+            sniffer_checked: std::mem::take(&mut self.sniffer_checked),
+            hscroll: std::mem::take(&mut self.hscroll),
+        };
+        self.files[self.file_index].saved = Some(saved);
         self.file_index = target as usize;
         self.top = 1;
         self.filename_shown = true;
         self.last_search = None;
-        // Structured-view state belongs to one file: the next file gets its
-        // own format sniff and columns on its first draw. The filter is
-        // kept (as in less) and re-read for the new file's format.
-        self.projection.set_format(DetectedFormat::PlainText);
-        self.projection.sorted_by = None;
-        self.sniffer_checked = false;
-        self.focused_column = 0;
-        self.sort = None;
         self.view = None;
-        self.hscroll = 0;
-        self.projection.hscroll = 0;
+        // A file seen before comes back as it was left (position, format,
+        // table, sort); a new one gets its own format sniff and columns on
+        // its first draw. The filter is kept (as in less) and re-read for
+        // the new file's format.
+        if let Some(v) = self.files[self.file_index].saved.take() {
+            self.top = v.top;
+            self.projection = v.projection;
+            self.tabular_view = v.tabular_view;
+            self.sort = v.sort;
+            self.focused_column = v.focused_column;
+            self.sniffer_checked = v.sniffer_checked;
+            self.hscroll = v.hscroll;
+        }
         // A file switch always leaves the fresh-process bottom-anchor
         // window (§3 item 1), regardless of whether `top` numerically
         // changed (a fresh file also starts at line 1).
@@ -1570,6 +1843,7 @@ impl App {
         };
         // A pipe that is still open has no end yet, whatever has arrived.
         let at_eof = at_eof && !self.files[self.file_index].buffer.is_open_stream();
+        self.last_bottom = (bottom_line, at_eof);
 
         // While a multi-key command (numeric prefix, `:x`, `/pattern`) is
         // still being typed, echo it in place of the computed prompt; not
@@ -1916,6 +2190,25 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }
+}
+
+/// The editor command line for `v`: `$VISUAL`, else `$EDITOR`, else `vi`
+/// (split on whitespace, so `code --wait` works), then `+LINE` and the file.
+fn editor_command(
+    visual: Option<&str>,
+    editor: Option<&str>,
+    path: &Path,
+    line: usize,
+) -> Vec<String> {
+    let chosen = [visual, editor]
+        .into_iter()
+        .flatten()
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or("vi");
+    let mut argv: Vec<String> = chosen.split_whitespace().map(str::to_string).collect();
+    argv.push(format!("+{line}"));
+    argv.push(path.display().to_string());
+    argv
 }
 
 /// A statistic without needless decimals: `200`, `12.5`, `0.333`.
@@ -3179,6 +3472,202 @@ mod tests {
         let rows = drawn_rows(&mut app);
         // q dismissed the sort message, so Enter moved one row down.
         assert!(rows[&3].contains("lines 2-4/6 66%"), "{}", rows[&3]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- Ported: %, =, R, v, :e, N:x, ESC-{ ESC-}, per-file views, pins --
+
+    fn app_on(path: &Path, w: u16, h: u16) -> App {
+        let mut app = App::new(test_opts(vec![path.to_path_buf()]));
+        app.set_size(w, h);
+        drawn_rows(&mut app);
+        app
+    }
+
+    #[test]
+    fn percent_goes_proportionally_and_never_past_the_last_page() {
+        let path = lines_fixture(200);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoPercent(Some(50))).unwrap();
+        assert_eq!(app.top, 100);
+        app.apply(Action::GotoPercent(Some(100))).unwrap();
+        assert_eq!(app.top, 178);
+        app.apply(Action::GotoPercent(None)).unwrap();
+        assert_eq!(app.top, 1);
+        app.apply(Action::GotoMark('\'')).unwrap();
+        assert_eq!(app.top, 178, "a percent jump is a jump for ''");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn percent_counts_rows_of_a_filtered_view() {
+        // Lines 10, 20, ..., 200 match: 20 rows; 50% is row 10 = line 100.
+        let mut content = String::new();
+        for n in 1..=200 {
+            let tag = if n % 10 == 0 { " TEN" } else { "" };
+            content.push_str(&format!("line {n}{tag}\n"));
+        }
+        let path = temp_file(&content);
+        let mut app = app_on(&path, 40, 6);
+        app.apply(Action::FilterInput("TEN".into())).unwrap();
+        app.apply(Action::GotoPercent(Some(50))).unwrap();
+        assert_eq!(app.top, 110);
+        app.apply(Action::GotoPercent(Some(100))).unwrap();
+        assert_eq!(app.top, 160, "last page of 5 rows: lines 160..200");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_info_reports_position_size_and_view_state() {
+        let path = jsonl_fixture();
+        let mut app = app_on(&path, 200, 24);
+        app.apply(Action::FilterInput(".status >= 500".into()))
+            .unwrap();
+        drawn_rows(&mut app);
+        app.apply(Action::FileInfo).unwrap();
+        let info = app.pending_message.clone().unwrap();
+        assert!(info.starts_with(&path.display().to_string()), "{info}");
+        assert!(info.contains("/60 byte "), "{info}");
+        assert!(info.contains("[jsonl] [&.status >= 500"), "{info}");
+        // On a narrow screen the start (name, position) is what remains.
+        let mut narrow = app_on(&path, 30, 24);
+        narrow.apply(Action::FileInfo).unwrap();
+        let info = narrow.pending_message.clone().unwrap();
+        assert!(info.starts_with("/"), "{info}");
+        assert!(info.ends_with('>'), "{info}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_picks_up_a_rewritten_file_and_stdin_cannot() {
+        let path = temp_file("old 1\nold 2\n");
+        let mut app = app_on(&path, 80, 24);
+        std::fs::write(&path, "new 1\n").unwrap();
+        app.apply(Action::Reload).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(rows.values().any(|r| r == "new 1"), "{rows:?}");
+        let mut stdin_app = App::new(test_opts(vec![]));
+        assert_eq!(
+            stdin_app.apply(Action::Reload).unwrap_err(),
+            "Cannot reload standard input"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn edit_is_queued_for_a_file_and_refused_for_stdin() {
+        let path = lines_fixture(30);
+        let mut app = app_on(&path, 80, 24);
+        app.apply(Action::GotoLine(Some(9))).unwrap();
+        app.apply(Action::Edit).unwrap();
+        assert_eq!(app.pending_edit, Some((path.clone(), 9)));
+        let mut stdin_app = App::new(test_opts(vec![]));
+        assert_eq!(
+            stdin_app.apply(Action::Edit).unwrap_err(),
+            "Cannot edit standard input"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_command_prefers_visual_then_editor_then_vi() {
+        let p = Path::new("/tmp/f.log");
+        assert_eq!(
+            editor_command(Some("code --wait"), Some("nano"), p, 42),
+            ["code", "--wait", "+42", "/tmp/f.log"]
+        );
+        assert_eq!(
+            editor_command(Some(" "), Some("nano"), p, 1),
+            ["nano", "+1", "/tmp/f.log"]
+        );
+        assert_eq!(editor_command(None, None, p, 7), ["vi", "+7", "/tmp/f.log"]);
+    }
+
+    #[test]
+    fn examine_opens_a_file_after_the_current_one_and_goto_file_jumps() {
+        let a = lines_fixture(10);
+        let b = temp_file("other file\n");
+        let mut app = app_on(&a, 80, 24);
+        app.apply(Action::SetMark('a')).unwrap();
+        app.apply(Action::Examine(b.display().to_string())).unwrap();
+        assert_eq!((app.file_index, app.files.len()), (1, 2));
+        let rows = drawn_rows(&mut app);
+        assert_eq!(rows[&0], "other file");
+        // Examining a listed file switches to it.
+        app.apply(Action::Examine(a.display().to_string())).unwrap();
+        assert_eq!((app.file_index, app.files.len()), (0, 2));
+        let err = app
+            .apply(Action::Examine("/nonexistent/rless-x".into()))
+            .unwrap_err();
+        assert!(err.contains("No such file"), "{err}");
+        assert_eq!(app.files.len(), 2, "a missing file is not added");
+        app.apply(Action::GotoFile(Some(2))).unwrap();
+        assert_eq!(app.file_index, 1);
+        app.apply(Action::GotoFile(None)).unwrap();
+        assert_eq!(app.file_index, 0);
+        assert_eq!(
+            app.apply(Action::GotoFile(Some(9))).unwrap_err(),
+            "No such file"
+        );
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
+    fn a_file_switched_back_to_keeps_its_place_and_table() {
+        let a = jsonl_fixture();
+        let b = lines_fixture(100);
+        let mut app = App::new(test_opts(vec![a.clone(), b.clone()]));
+        app.set_size(80, 24);
+        drawn_rows(&mut app);
+        app.apply(Action::ToggleTabular).unwrap();
+        app.apply(Action::GotoLine(Some(30))).unwrap();
+        app.apply(Action::NextFile(1)).unwrap();
+        assert_eq!(app.top, 1);
+        assert!(!app.tabular_view, "the next file starts in its own view");
+        app.apply(Action::GotoLine(Some(40))).unwrap();
+        app.apply(Action::PrevFile(1)).unwrap();
+        assert_eq!(app.top, 30);
+        assert!(app.tabular_view);
+        assert_eq!(app.projection.format, DetectedFormat::JsonLines);
+        app.apply(Action::NextFile(1)).unwrap();
+        assert_eq!(app.top, 40);
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    #[test]
+    fn esc_braces_scroll_to_the_end_of_the_longest_line_and_back() {
+        let line = format!("start{}end", "-".repeat(100));
+        let path = temp_file(&format!("{line}\nshort\n"));
+        let mut opts = test_opts(vec![path.clone()]);
+        opts.chop_long_lines = true;
+        let mut app = App::new(opts);
+        app.set_size(40, 6);
+        app.apply(Action::HScrollEnd).unwrap();
+        assert_eq!(app.hscroll, 108 - 40);
+        let rows = drawn_rows(&mut app);
+        assert!(rows.values().any(|r| r.ends_with("end")), "{rows:?}");
+        app.apply(Action::HScrollHome).unwrap();
+        assert_eq!(app.hscroll, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pinned_columns_stay_put_while_the_table_scrolls() {
+        let path = jsonl_fixture();
+        let mut app = app_on(&path, 30, 8);
+        app.apply(Action::ToggleTabular).unwrap();
+        // Columns: level, status, msg. Pin the first.
+        app.apply(Action::PinColumn).unwrap();
+        app.apply(Action::HScroll(Some(4), true)).unwrap();
+        let rows = drawn_rows(&mut app);
+        assert!(
+            rows[&0].starts_with("DEBUG  │"),
+            "pinned cell kept: {:?}",
+            rows[&0]
+        );
+        assert!(!rows[&0].contains("200"), "status scrolled: {:?}", rows[&0]);
         let _ = std::fs::remove_file(path);
     }
 }

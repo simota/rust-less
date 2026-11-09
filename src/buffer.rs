@@ -228,6 +228,27 @@ impl Buffer {
         matches!(self.source, Source::Stdin)
     }
 
+    /// The file this buffer reads, if it reads one.
+    pub fn path(&self) -> Option<&PathBuf> {
+        match &self.source {
+            Source::File(p) => Some(p),
+            Source::Stdin => None,
+        }
+    }
+
+    /// Discards everything read so far, so the file is read afresh (`R`,
+    /// and after `v` edited it). Only a file can be read again: returns
+    /// false for stdin.
+    pub fn reload(&mut self) -> bool {
+        if !matches!(self.source, Source::File(_)) {
+            return false;
+        }
+        let follow = self.follow;
+        *self = Buffer::new(std::mem::replace(&mut self.source, Source::Stdin));
+        self.follow = follow;
+        true
+    }
+
     fn ensure_open(&mut self) -> Result<(), String> {
         if self.reader.is_some() || self.open_error.is_some() {
             return match &self.open_error {
@@ -751,5 +772,19 @@ mod tests {
             stream.read_line(&mut out, Wait::No),
             Ok(ReadOutcome::Eof)
         ));
+    }
+
+    #[test]
+    fn reload_reads_a_changed_file_afresh_and_stdin_cannot() {
+        let path = temp_file(b"a\nb\n");
+        let mut buf = Buffer::new(Source::File(path.clone()));
+        assert_eq!(buf.total_lines().unwrap(), 2);
+        std::fs::write(&path, b"x\n").unwrap();
+        assert!(buf.reload());
+        assert_eq!(buf.path(), Some(&path));
+        assert_eq!(buf.total_lines().unwrap(), 1);
+        assert_eq!(buf.line(1), Some(&b"x"[..]));
+        assert!(!Buffer::new(Source::Stdin).reload());
+        let _ = std::fs::remove_file(path);
     }
 }

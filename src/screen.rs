@@ -392,6 +392,58 @@ fn highlight_matches(row: DisplayRow, pattern: &Regex) -> DisplayRow {
     out
 }
 
+/// Display width of a whole logical line as the core view draws it (tabs
+/// expanded, control characters in caret notation, escape sequences free
+/// under `-R`). Used to find how far right `ESC-}` scrolls.
+pub fn line_display_width(bytes: &[u8], raw_ansi: bool) -> usize {
+    let mut col = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if raw_ansi
+            && bytes[i] == 0x1b
+            && let Some((next_i, _)) = scan_escape(bytes, i)
+        {
+            i = next_i;
+            continue;
+        }
+        let (width, consumed) = piece_width(bytes, i, col);
+        i += consumed;
+        col += width;
+    }
+    col
+}
+
+/// The display width and byte length of the piece `decode_piece` would
+/// decode at `bytes[i]`, without building it. Written out separately so the
+/// renderer's per-character loop stays the only caller of `decode_piece`
+/// and `decode_utf8_char` (a second caller stopped the compiler inlining
+/// them there, costing a few percent of every frame).
+fn piece_width(bytes: &[u8], i: usize, col: usize) -> (usize, usize) {
+    if bytes[i] == b'\t' {
+        return (8 - (col % 8), 1);
+    }
+    let b0 = bytes[i];
+    let len = match b0 {
+        0x00..=0x7f => 1,
+        _ if b0 & 0xE0 == 0xC0 => 2,
+        _ if b0 & 0xF0 == 0xE0 => 3,
+        _ if b0 & 0xF8 == 0xF0 => 4,
+        _ => return (4, 1),
+    };
+    let Some(ch) = bytes
+        .get(i..i + len)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|t| t.chars().next())
+    else {
+        return (4, 1); // malformed: shown as a 4-column <XX> token
+    };
+    if (ch as u32) < 0x20 || ch as u32 == 0x7f {
+        (2, len)
+    } else {
+        (UnicodeWidthChar::width(ch).unwrap_or(1), len)
+    }
+}
+
 pub struct WindowRender {
     pub rows: Vec<DisplayRow>,
     /// Logical line number of the last line represented in `rows` (the one
@@ -792,5 +844,27 @@ mod tests {
         assert_eq!(win.bottom_line, 23);
         assert!(!win.at_eof);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn piece_width_agrees_with_decode_piece() {
+        let mut bytes = "a\tb\u{1}\u{7f}\u{6f22}\u{301}e\u{1F600}"
+            .as_bytes()
+            .to_vec();
+        bytes.extend_from_slice(b"\xff\xe4\x80x");
+        let mut i = 0;
+        let mut col = 0;
+        while i < bytes.len() {
+            let (piece, consumed) = decode_piece(&bytes, i, col);
+            assert_eq!(
+                piece_width(&bytes, i, col),
+                (piece.width, consumed),
+                "at byte {i}"
+            );
+            i += consumed;
+            col += piece.width;
+        }
+        assert_eq!(line_display_width(b"a\tb", false), 9);
+        assert_eq!(line_display_width(b"\x1b[31mred", true), 3);
     }
 }
